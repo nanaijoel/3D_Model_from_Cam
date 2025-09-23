@@ -26,7 +26,7 @@ class PipelineRunner:
         kps, descs, shapes = sift_extract(imgs, paths.features, log, prog)
 
         # 3) Matching (Paare & Matches)
-        pairs, matches = build_pairs(descs, log, prog)
+        pairs, matches = build_pairs(descs, log, prog, save_dir=paths.matches, keypoints=kps)
 
         # 4) Intrinsics (grob)
         h,w = shapes[0]

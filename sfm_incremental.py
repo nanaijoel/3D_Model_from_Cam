@@ -25,40 +25,94 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
     log(f"[sfm] size={W}x{H}")
 
     # ---------- 1) Initialpaar automatisch wählen ----------
+    # Schwellen für mutual+F-RANSAC -> etwas milder
+    MIN_MATCHES_INIT = 60  # vorher 150
+    MIN_FLOW_PX = 8.0  # vorher 20
+    MIN_INLIERS_INIT = 40  # vorher 80
+
+    def cheirality_count(R, t, pts1, pts2):
+        # zählt, wie viele triangulierte Punkte vor beiden Kameras liegen
+        def triangulate(R1, t1, R2, t2, p1, p2):
+            P1 = K @ np.hstack((R1, t1));
+            P2 = K @ np.hstack((R2, t2))
+            X = cv.triangulatePoints(P1, P2, p1.T, p2.T)
+            X = (X[:3] / X[3]).T
+            return X
+
+        def in_front(R, t, X):
+            Xc = (R @ X.T + t).T
+            return Xc[:, 2] > 0
+
+        X = triangulate(np.eye(3), np.zeros((3, 1)), R, t, pts1, pts2)
+        front = in_front(np.eye(3), np.zeros((3, 1)), X) & in_front(R, t, X)
+        return int(front.sum())
+
     best = dict(score=-1.0, pair=None, R=None, t=None, mask=None)
+    stats = []
+
+    # 1. PASS: mit milden Grenzwerten
     for (i, j) in pairs:
         m = matches.get((i, j), [])
-        if len(m) < 150:
+        if len(m) < MIN_MATCHES_INIT:
             continue
         p1, p2 = _idx2pts(m, keypoints[i], keypoints[j])
-        flow = np.median(np.linalg.norm(p2 - p1, axis=1))
-        if flow < 20:  # Mindestbewegung
+        flow = float(np.median(np.linalg.norm(p2 - p1, axis=1)))
+        if flow < MIN_FLOW_PX:
             continue
 
-        # KORREKT: (p1, p2), nicht (p2, p1)
-        E, maskE = cv.findEssentialMat(p1, p2, K, method=cv.RANSAC, prob=0.999, threshold=1.2)
+        E, maskE = cv.findEssentialMat(p1, p2, K, method=cv.RANSAC, prob=0.999, threshold=1.5)
         if E is None:
             continue
         _, R, t, maskP = cv.recoverPose(E, p1, p2, K)
         inl_mask = (maskP.ravel().astype(bool)) & (maskE.ravel().astype(bool)[:len(maskP)])
         inliers = int(inl_mask.sum())
-        if inliers < 80:
+        if inliers < MIN_INLIERS_INIT:
             continue
 
-        score = inliers + 10.0  # simple scoring
+        # Score = Inlier + cheirale Punkte (stärker gewichtet)
+        ch = cheirality_count(R, t, p1[inl_mask], p2[inl_mask]) if inliers > 0 else 0
+        score = inliers + 2.0 * ch
+        stats.append((i, j, len(m), flow, inliers, ch, score))
+
         if score > best["score"]:
             best.update(score=score, pair=(i, j), R=R, t=t, mask=inl_mask)
 
+    # 2. PASS (Fallback): wähle bestes Paar nach Cheirality auch ohne Schwellen
     if best["pair"] is None:
+        for (i, j) in pairs:
+            m = matches.get((i, j), [])
+            if len(m) < 40:
+                continue
+            p1, p2 = _idx2pts(m, keypoints[i], keypoints[j])
+            flow = float(np.median(np.linalg.norm(p2 - p1, axis=1)))
+            E, maskE = cv.findEssentialMat(p1, p2, K, method=cv.RANSAC, prob=0.999, threshold=2.0)
+            if E is None:
+                continue
+            _, R, t, maskP = cv.recoverPose(E, p1, p2, K)
+            inl_mask = (maskP.ravel().astype(bool)) & (maskE.ravel().astype(bool)[:len(maskP)])
+            inliers = int(inl_mask.sum())
+            ch = cheirality_count(R, t, p1[inl_mask], p2[inl_mask]) if inliers > 0 else 0
+            score = inliers + 2.0 * ch
+            stats.append((i, j, len(m), flow, inliers, ch, score))
+            if ch > 0 and score > best["score"]:
+                best.update(score=score, pair=(i, j), R=R, t=t, mask=inl_mask)
+
+    if best["pair"] is None:
+        # ein paar Zahlen ins Log helfen beim Diagnostizieren
+        if stats:
+            stats.sort(key=lambda x: x[-1], reverse=True)
+            top = "\n".join([f"   cand ({a},{b}): matches={mm}, flow={fl:.1f}px, inl={ii}, cheiral={ch}, score={sc:.1f}"
+                             for (a, b, mm, fl, ii, ch, sc) in stats[:5]])
+            log("[sfm] Init-Kandidaten TOP5:\n" + top)
         raise RuntimeError("[sfm] Initialisierung fehlgeschlagen (keine Basis).")
 
     i0, j0 = best["pair"]
-    log(f"[sfm] init pair = ({i0},{j0})")
+    log(f"[sfm] init pair = ({i0},{j0}) score={best['score']:.1f}")
     kps0, kps1 = keypoints[i0], keypoints[j0]
     m01 = matches[(i0, j0)]
     p1, p2 = _idx2pts(m01, kps0, kps1)
-    R = best["R"]
-    t = best["t"]
+    R = best["R"];
+    t = best["t"];
     mask = best["mask"]
 
     # ---------- 2) Triangulation Init ----------
@@ -76,7 +130,8 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
         Xc = (R @ X.T + t).T
         return Xc[:, 2] > 0
 
-    p1_in = p1[mask]; p2_in = p2[mask]
+    p1_in = p1[mask];
+    p2_in = p2[mask]
     X_init = triangulate(poses_R[i0], poses_t[i0], poses_R[j0], poses_t[j0], p1_in, p2_in)
     front = in_front(poses_R[i0], poses_t[i0], X_init) & in_front(poses_R[j0], poses_t[j0], X_init)
 
@@ -142,6 +197,8 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
 
         obj_pts = np.array(obj_pts, dtype=float)
         img_pts = np.array(img_pts, dtype=float)
+
+        # --- PnP (RANSAC) ---
         ok, rvec, tvec, inl = cv.solvePnPRansac(
             obj_pts, img_pts, K, None,
             reprojectionError=2.5, iterationsCount=3000, confidence=0.999
@@ -149,8 +206,26 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
         if not ok or inl is None or len(inl) < min_inliers_pnp:
             continue
 
+        # --- Pose-Refinement (LM) ---
+        try:
+            rvec, tvec = cv.solvePnPRefineLM(
+                objectPoints=obj_pts[inl.ravel()],
+                imagePoints=img_pts[inl.ravel()],
+                cameraMatrix=K, distCoeffs=None,
+                rvec=rvec, tvec=tvec,
+                criteria=(cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_COUNT, 20, 1e-6)
+            )
+        except Exception:
+            pass
+
         Rfi, _ = cv.Rodrigues(rvec)
         tfi = tvec.reshape(3, 1)
+
+        # Reprojektion-Fehler loggen (Ø in Pixel)
+        proj, _ = cv.projectPoints(obj_pts[inl.ravel()], rvec, tvec, K, None)
+        err = np.mean(np.linalg.norm(proj.squeeze() - img_pts[inl.ravel()], axis=1))
+        log(f"[sfm] pose {fi}: inliers={len(inl)} repro={err:.2f}px")
+
         poses_R[fi] = Rfi
         poses_t[fi] = tfi
         visited.add(fi)
