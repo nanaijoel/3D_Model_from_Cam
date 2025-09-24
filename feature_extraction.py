@@ -6,7 +6,7 @@ def _preprocess_gray(img_gray: np.ndarray) -> np.ndarray:
     clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     return clahe.apply(img_gray)
 
-def _center_mask(h, w, ratio=0.85):
+def _center_mask(h, w, ratio=0.95):
     # optional: Ellipsen-ROI (ignoriert Rand/Hintergrund)
     mh, mw = int(h*ratio/2), int(w*ratio/2)
     mask = np.zeros((h,w), np.uint8)
