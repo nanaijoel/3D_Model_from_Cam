@@ -59,7 +59,7 @@ class PipelineRunner:
                 log(f"[pipeline] WARN: camera pose plot failed: {e}")
 
         # 6) Depth (stub)
-        run_depth_mvs(paths.raw_frames, pts, paths.depth, log, prog)
+        #run_depth_mvs(paths.raw_frames, pts, paths.depth, log, prog)
 
         # 7) Save / Mesh
         ply_path = os.path.join(paths.mesh, "reconstruction_sparse.ply")

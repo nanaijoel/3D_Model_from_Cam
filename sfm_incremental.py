@@ -1,14 +1,14 @@
+# sfm_incremental.py
 import os
 import numpy as np
 import cv2 as cv
 from typing import Callable, List, Dict, Tuple, Optional
 
-
+# --------------------------- helpers ---------------------------------
 def _idx2pts(matches, kps1, kps2):
     pts1 = np.float32([kps1[m.queryIdx].pt for m in matches])
     pts2 = np.float32([kps2[m.trainIdx].pt for m in matches])
     return pts1, pts2
-
 
 def _save_camera_poses_npz_csv(poses_R: Dict[int, np.ndarray],
                                poses_t: Dict[int, np.ndarray],
@@ -17,24 +17,21 @@ def _save_camera_poses_npz_csv(poses_R: Dict[int, np.ndarray],
     def log(m):
         if on_log:
             on_log(m)
-
     os.makedirs(out_dir, exist_ok=True)
     order = sorted(poses_R.keys())
     Rs, ts, idxs, Cs = [], [], [], []
     for i in order:
         R = poses_R[i]
         t = poses_t[i]
-        C = -R.T @ t  # Kamera-Zentrum in Weltkoordinaten
+        C = -R.T @ t  # camera center in world
         Rs.append(R); ts.append(t); idxs.append(i); Cs.append(C.reshape(3))
     Rs = np.stack(Rs, axis=0) if len(Rs) else np.zeros((0, 3, 3))
     ts = np.stack(ts, axis=0) if len(ts) else np.zeros((0, 3, 1))
     Cs = np.stack(Cs, axis=0) if len(Cs) else np.zeros((0, 3))
     idxs = np.array(idxs, dtype=int)
-
     npz_path = os.path.join(out_dir, "camera_poses.npz")
     np.savez_compressed(npz_path, frame_idx=idxs, R=Rs, t=ts, C=Cs)
     log(f"[sfm] camera poses saved -> {npz_path}")
-
     try:
         import csv
         csv_path = os.path.join(out_dir, "camera_poses.csv")
@@ -47,7 +44,30 @@ def _save_camera_poses_npz_csv(poses_R: Dict[int, np.ndarray],
     except Exception as e:
         log(f"[sfm] WARN: CSV write failed: {e}")
 
+# --------------------------- core geometry ----------------------------
+def _triangulate(K, R1, t1, R2, t2, pts1, pts2):
+    P1 = K @ np.hstack((R1, t1))
+    P2 = K @ np.hstack((R2, t2))
+    X = cv.triangulatePoints(P1, P2, pts1.T, pts2.T)
+    X = (X[:3] / X[3]).T
+    return X
 
+def _in_front(R, t, X):
+    Xc = (R @ X.T + t).T
+    return Xc[:, 2] > 0
+
+def _cheirality_count(K, R, t, pts1, pts2):
+    X = _triangulate(K, np.eye(3), np.zeros((3, 1)), R, t, pts1, pts2)
+    front = _in_front(np.eye(3), np.zeros((3, 1)), X) & _in_front(R, t, X)
+    return int(front.sum())
+
+def _reproj_err(K, R, t, X, pts2d):
+    rvec, _ = cv.Rodrigues(R)
+    proj, _ = cv.projectPoints(X, rvec, t, K, None)
+    proj = proj.squeeze()
+    return np.linalg.norm(proj - pts2d, axis=1)
+
+# --------------------------- main ------------------------------------
 def run_sfm(keypoints: List[List[cv.KeyPoint]],
             descriptors: List[np.ndarray],
             shapes: List[Tuple[int, int]],
@@ -66,31 +86,43 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
     H, W = shapes[0]
     log(f"[sfm] size={W}x{H}")
 
-    # 1) Choose initial pair automatically
-    MIN_MATCHES_INIT = 60
-    MIN_FLOW_PX = 8.0
-    MIN_INLIERS_INIT = 40
+    # --------- Parameter (robust ggü. N) ------------------------------
+    # Init
+    MIN_MATCHES_INIT = 50
+    MIN_FLOW_PX = 6.0
+    MIN_INLIERS_INIT = 35
+    INIT_WINDOW_FRAMES = 80         # Fenster um Sequenzmitte für Init-Paare
+    INIT_MAX_SPAN = 6               # nur lokale Nachbarschaft als Basis
 
-    def triangulate(R1, t1, R2, t2, pts1, pts2):
-        P1 = K @ np.hstack((R1, t1))
-        P2 = K @ np.hstack((R2, t2))
-        X = cv.triangulatePoints(P1, P2, pts1.T, pts2.T)
-        X = (X[:3] / X[3]).T
-        return X
+    # PnP
+    MIN_INLIERS_PNP = 28
+    PNP_ITERS = 8000
+    PNP_ERR_PX = 3.0
+    PNP_REPROJ_ACCEPT = 2.0
 
-    def in_front(R, t, X):
-        Xc = (R @ X.T + t).T
-        return Xc[:, 2] > 0
+    # Triangulation
+    TRI_MIN_CORR = 14               # globale Schwelle (kombiniert über alle Anker)
+    TRI_REPROJ_MAX = 2.5
+    TRI_MIN_PARALLAX_DEG = 2.0
 
-    def cheirality_count(R, t, pts1, pts2):
-        X = triangulate(np.eye(3), np.zeros((3, 1)), R, t, pts1, pts2)
-        front = in_front(np.eye(3), np.zeros((3, 1)), X) & in_front(R, t, X)
-        return int(front.sum())
+    # Local stereo seeding
+    SEED_SPAN = 3                   # fi±1..±3
+    SEED_MIN_INL = 40               # pro Nachbarpaar
+    SEED_REPROJ = 2.0
+
+    # --------- Init-Paar lokal um die Mitte ---------------------------
+    N = len(shapes)
+    mid = N // 4
+    w = min(INIT_WINDOW_FRAMES, max(10, N // 3))
+    def in_init_window(i, j):
+        return (abs(j - i) <= INIT_MAX_SPAN) and (min(i, j) >= mid - w) and (max(i, j) <= mid + w)
 
     best = dict(score=-1.0, pair=None, R=None, t=None, mask=None)
     stats = []
 
     for (i, j) in pairs:
+        if not in_init_window(i, j):
+            continue
         m = matches.get((i, j), [])
         if len(m) < MIN_MATCHES_INIT:
             continue
@@ -98,7 +130,6 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
         flow = float(np.median(np.linalg.norm(p2 - p1, axis=1)))
         if flow < MIN_FLOW_PX:
             continue
-
         E, maskE = cv.findEssentialMat(p1, p2, K, method=cv.RANSAC, prob=0.999, threshold=1.5)
         if E is None:
             continue
@@ -107,8 +138,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
         inliers = int(inl_mask.sum())
         if inliers < MIN_INLIERS_INIT:
             continue
-
-        ch = cheirality_count(R, t, p1[inl_mask], p2[inl_mask]) if inliers > 0 else 0
+        ch = _cheirality_count(K, R, t, p1[inl_mask], p2[inl_mask]) if inliers > 0 else 0
         score = inliers + 2.0 * ch
         stats.append((i, j, len(m), flow, inliers, ch, score))
         if score > best["score"]:
@@ -116,51 +146,52 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
 
     if best["pair"] is None:
         for (i, j) in pairs:
+            if not in_init_window(i, j):
+                continue
             m = matches.get((i, j), [])
             if len(m) < 40:
                 continue
             p1, p2 = _idx2pts(m, keypoints[i], keypoints[j])
-            flow = float(np.median(np.linalg.norm(p2 - p1, axis=1)))
             E, maskE = cv.findEssentialMat(p1, p2, K, method=cv.RANSAC, prob=0.999, threshold=2.0)
             if E is None:
                 continue
             _, R, t, maskP = cv.recoverPose(E, p1, p2, K)
             inl_mask = (maskP.ravel().astype(bool)) & (maskE.ravel().astype(bool)[:len(maskP)])
             inliers = int(inl_mask.sum())
-            ch = cheirality_count(R, t, p1[inl_mask], p2[inl_mask]) if inliers > 0 else 0
+            ch = _cheirality_count(K, R, t, p1[inl_mask], p2[inl_mask]) if inliers > 0 else 0
             score = inliers + 2.0 * ch
-            stats.append((i, j, len(m), flow, inliers, ch, score))
+            stats.append((i, j, len(m), 0.0, inliers, ch, score))
             if ch > 0 and score > best["score"]:
                 best.update(score=score, pair=(i, j), R=R, t=t, mask=inl_mask)
 
     if best["pair"] is None:
         if stats:
             stats.sort(key=lambda x: x[-1], reverse=True)
-            top = "\n".join([f"   cand ({a},{b}): matches={mm}, flow={fl:.1f}px, inl={ii}, cheiral={ch}, score={sc:.1f}"
-                             for (a, b, mm, fl, ii, ch, sc) in stats[:5]])
-            log("[sfm] Init-Kandidaten TOP5:\n" + top)
-        raise RuntimeError("[sfm] Initialisierung fehlgeschlagen (keine Basis).")
+            top = "\n".join([f"   cand ({a},{b}): matches={mm}, inl={ii}, cheiral={ch}, score={sc:.1f}"
+                             for (a, b, mm, _, ii, ch, sc) in stats[:8]])
+            log("[sfm] Init-Kandidaten TOP:\n" + top)
+        raise RuntimeError("[sfm] Initialisierung fehlgeschlagen.")
 
     i0, j0 = best["pair"]
     log(f"[sfm] init pair = ({i0},{j0}) score={best['score']:.1f}")
     kps0, kps1 = keypoints[i0], keypoints[j0]
     m01 = matches[(i0, j0)]
-    p1, p2 = _idx2pts(m01, kps0, kps1)
+    p1_all, p2_all = _idx2pts(m01, kps0, kps1)
     R = best["R"]; t = best["t"]; mask = best["mask"]
 
-    # 2) Triangulation Init
+    # --------- init triangulation ------------------------------------
     poses_R = {i0: np.eye(3), j0: R}
     poses_t = {i0: np.zeros((3, 1)), j0: t}
 
-    p1_in = p1[mask]; p2_in = p2[mask]
-    X_init = triangulate(poses_R[i0], poses_t[i0], poses_R[j0], poses_t[j0], p1_in, p2_in)
-    front = in_front(poses_R[i0], poses_t[i0], X_init) & in_front(poses_R[j0], poses_t[j0], X_init)
+    p1_in = p1_all[mask]; p2_in = p2_all[mask]
+    X_init = _triangulate(K, poses_R[i0], poses_t[i0], poses_R[j0], poses_t[j0], p1_in, p2_in)
+    front = _in_front(poses_R[i0], poses_t[i0], X_init) & _in_front(poses_R[j0], poses_t[j0], X_init)
 
     if not np.any(front):
         R_inv = R.T
         t_inv = -R_inv @ t
-        X_try = triangulate(poses_R[i0], poses_t[i0], R_inv, t_inv, p1_in, p2_in)
-        front2 = in_front(poses_R[i0], poses_t[i0], X_try) & in_front(R_inv, t_inv, X_try)
+        X_try = _triangulate(K, poses_R[i0], poses_t[i0], R_inv, t_inv, p1_in, p2_in)
+        front2 = _in_front(poses_R[i0], poses_t[i0], X_try) & _in_front(R_inv, t_inv, X_try)
         if np.any(front2):
             R, t = R_inv, t_inv
             poses_R[j0], poses_t[j0] = R, t
@@ -171,7 +202,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
     log(f"[sfm] X_init={len(X_init)}")
     prog(60, "SfM – Initialisierung")
 
-    # Track-Map (2D-Observation -> global 3D-Index)
+    # Track-Map
     track3d: Dict[Tuple[int, int], int] = {}
     points3d: List[np.ndarray] = []
 
@@ -185,29 +216,34 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
         track3d[qb] = gi
         points3d.append(X_init[k])
 
-    # Incremental
-    order = sorted(set([i for ij in pairs for i in ij]))
+    # --------- best-first expansion -----------------------------------
+    all_frames = sorted(set([i for ij in pairs for i in ij]))
     visited = {i0, j0}
 
-    min_inliers_pnp = 40
-    pnp_reproj_accept = 1.6
-    pnp_iters = 6000
-    pnp_err = 3.0
-    tri_min_corresp = 25
+    def count_corr(fi: int) -> int:
+        c = 0
+        for a in visited:
+            if (a, fi) not in matches:
+                continue
+            for mm in matches[(a, fi)]:
+                if (a, mm.queryIdx) in track3d:
+                    c += 1
+        return c
 
-    for step, fi in enumerate(order, start=1):
-        if fi in visited:
-            continue
+    remaining = [f for f in all_frames if f not in visited]
+
+    while remaining:
+        fi = max(remaining, key=count_corr)
         anchors = [a for a in visited if (a, fi) in matches]
         if not anchors:
+            remaining.remove(fi)
             continue
 
-        # 3.1 Farm 2D–3D points
+        # ---------- 2D-3D farming ------------------------------------
         obj_pts, img_pts = [], []
         used_g = set()
         for a in anchors:
-            mlist = matches[(a, fi)]
-            for mm in mlist:
+            for mm in matches[(a, fi)]:
                 qa = (a, mm.queryIdx); qb = (fi, mm.trainIdx)
                 if qa in track3d:
                     gi = track3d[qa]
@@ -220,8 +256,9 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
                         track3d[qb] = gi
                         used_g.add(gi)
 
-        if len(obj_pts) < min_inliers_pnp:
-            log(f"[sfm] try PnP frame {fi}: 2D-3D={len(obj_pts)} need≥{min_inliers_pnp}")
+        if len(obj_pts) < MIN_INLIERS_PNP:
+            log(f"[sfm] try PnP frame {fi}: 2D-3D={len(obj_pts)} need≥{MIN_INLIERS_PNP}")
+            remaining.remove(fi)
             continue
 
         obj_pts = np.array(obj_pts, dtype=float)
@@ -229,26 +266,35 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
 
         ok, rvec, tvec, inl = cv.solvePnPRansac(
             obj_pts, img_pts, K, None,
-            reprojectionError=float(pnp_err),
-            iterationsCount=int(pnp_iters),
+            reprojectionError=float(PNP_ERR_PX),
+            iterationsCount=int(PNP_ITERS),
             confidence=0.999
         )
         inliers = int(len(inl)) if (inl is not None) else 0
-        accept = bool(ok and inliers >= min_inliers_pnp)
+        accept = bool(ok and inliers >= MIN_INLIERS_PNP)
         repro = None
 
-        if not accept and ok and inliers >= 25 and inl is not None:
+        if ok and inl is not None:
             proj, _ = cv.projectPoints(obj_pts[inl.ravel()], rvec, tvec, K, None)
             repro = float(np.mean(np.linalg.norm(proj.squeeze() - img_pts[inl.ravel()], axis=1)))
-            accept = (repro <= pnp_reproj_accept)
+            if not accept:
+                accept = (repro <= PNP_REPROJ_ACCEPT)
+
+        if accept:
+            Rfi, _ = cv.Rodrigues(rvec); tfi = tvec.reshape(3, 1)
+            front = _in_front(Rfi, tfi, obj_pts[inl.ravel()]) if inl is not None else np.ones(len(obj_pts), bool)
+            if np.mean(front.astype(np.float32)) < 0.6:
+                accept = False
 
         if not accept:
-            if repro is None:
-                log(f"[sfm] reject frame {fi}: inliers={inliers} (<{min_inliers_pnp})")
-            else:
-                log(f"[sfm] reject frame {fi}: inliers={inliers}, repro≈{repro:.2f}px")
+            msg = f"[sfm] reject frame {fi}: inliers={inliers}"
+            if repro is not None:
+                msg += f", repro≈{repro:.2f}px"
+            log(msg)
+            remaining.remove(fi)
             continue
 
+        # refine
         try:
             rvec, tvec = cv.solvePnPRefineLM(
                 objectPoints=obj_pts[inl.ravel()],
@@ -262,7 +308,6 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
 
         Rfi, _ = cv.Rodrigues(rvec)
         tfi = tvec.reshape(3, 1)
-
         if repro is None:
             proj, _ = cv.projectPoints(obj_pts[inl.ravel()], rvec, tvec, K, None)
             repro = float(np.mean(np.linalg.norm(proj.squeeze() - img_pts[inl.ravel()], axis=1)))
@@ -271,47 +316,104 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
         poses_R[fi] = Rfi
         poses_t[fi] = tfi
         visited.add(fi)
+        remaining.remove(fi)
+        prog(int(60 + 30 * len(visited) / len(all_frames)), f"SfM – Pose {fi}")
 
-        prog(int(60 + 30 * len(visited) / len(order)), f"SfM – Pose {fi}")
-
-        # Triangulate new points
-        for a in anchors:
-            mlist = matches[(a, fi)]
-            pts_a, pts_f, pairs_af = [], [], []
-            for mm in mlist:
-                qa = (a, mm.queryIdx); qb = (fi, mm.trainIdx)
-                if qb in track3d:
+        # ---------- Local stereo seeding (frische Punkte vorne) --------
+        neighbors = []
+        for d in range(1, SEED_SPAN + 1):
+            if (fi, fi + d) in matches: neighbors.append((fi, fi + d))
+            if (fi - d, fi) in matches: neighbors.append((fi - d, fi))
+        for (a, b) in neighbors:
+            mlist = matches.get((a, b), [])
+            if len(mlist) < SEED_MIN_INL:
+                continue
+            if a not in poses_R or b not in poses_R:
+                continue
+            pts_a, pts_b = _idx2pts(mlist, keypoints[a], keypoints[b])
+            XA = _triangulate(K, poses_R[a], poses_t[a], poses_R[b], poses_t[b], pts_a, pts_b)
+            front_seed = _in_front(poses_R[a], poses_t[a], XA) & _in_front(poses_R[b], poses_t[b], XA)
+            if not np.any(front_seed):
+                continue
+            errA = _reproj_err(K, poses_R[a], poses_t[a], XA, pts_a)
+            errB = _reproj_err(K, poses_R[b], poses_t[b], XA, pts_b)
+            good = front_seed & (errA <= SEED_REPROJ) & (errB <= SEED_REPROJ)
+            if not np.any(good):
+                continue
+            for (mm, keep, X) in zip(mlist, good, XA):
+                if not keep:
                     continue
-                pts_a.append(keypoints[a][mm.queryIdx].pt)
-                pts_f.append(keypoints[fi][mm.trainIdx].pt)
-                pairs_af.append((qa, qb))
-
-            if len(pts_a) < tri_min_corresp:
-                continue
-
-            pts_a_np = np.float32(pts_a)
-            pts_f_np = np.float32(pts_f)
-            Xaf_all = triangulate(poses_R[a], poses_t[a], poses_R[fi], poses_t[fi],
-                                  pts_a_np, pts_f_np)
-            front_mask = in_front(poses_R[a], poses_t[a], Xaf_all) & \
-                         in_front(poses_R[fi], poses_t[fi], Xaf_all)
-            if not np.any(front_mask):
-                continue
-
-            sel_pairs = [p for p, keep in zip(pairs_af, front_mask) if keep]
-            Xaf = Xaf_all[front_mask]
-
-            for (qa, qb), X in zip(sel_pairs, Xaf):
+                qa = (a, mm.queryIdx); qb = (b, mm.trainIdx)
                 gi = track3d.get(qa, None)
                 if gi is not None and gi < len(points3d) and points3d[gi] is not None:
                     track3d[qb] = gi
-                    continue
-                gi = len(points3d)
-                track3d[qa] = gi
-                track3d[qb] = gi
-                points3d.append(X)
+                else:
+                    gi = len(points3d)
+                    track3d[qa] = gi
+                    track3d[qb] = gi
+                    points3d.append(X)
 
-    # 4) Rückgabe + Pose-Datei schreiben ----------
+        # ---------- Triangulation (kombiniert über alle Anker) ---------
+        pairs_all, ptsA_all, ptsF_all, ANCH_all = [], [], [], []
+        for a in anchors:
+            for mm in matches[(a, fi)]:
+                qa = (a, mm.queryIdx); qb = (fi, mm.trainIdx)
+                if qb in track3d:
+                    continue
+                if qa in track3d and (track3d[qa] < len(points3d)) and (points3d[track3d[qa]] is not None):
+                    track3d[qb] = track3d[qa]
+                    continue
+                pairs_all.append((qa, qb))
+                ptsA_all.append(keypoints[a][mm.queryIdx].pt)
+                ptsF_all.append(keypoints[fi][mm.trainIdx].pt)
+                ANCH_all.append(a)
+
+        if len(pairs_all) >= TRI_MIN_CORR:
+            ptsA_np = np.float32(ptsA_all)
+            ptsF_np = np.float32(ptsF_all)
+            keep_idx_global = []
+            X_global = []
+            unique_anchors = list(sorted(set(ANCH_all)))
+            for a in unique_anchors:
+                idx = [k for k, aa in enumerate(ANCH_all) if aa == a]
+                if len(idx) < 6:
+                    continue
+                XA = _triangulate(K, poses_R[a], poses_t[a], poses_R[fi], poses_t[fi],
+                                  ptsA_np[idx], ptsF_np[idx])
+                front = _in_front(poses_R[a], poses_t[a], XA) & _in_front(poses_R[fi], poses_t[fi], XA)
+                if not np.any(front):
+                    continue
+                errA = _reproj_err(K, poses_R[a], poses_t[a], XA, ptsA_np[idx])
+                errF = _reproj_err(K, poses_R[fi], poses_t[fi], XA, ptsF_np[idx])
+                repro_mask = (errA <= TRI_REPROJ_MAX) & (errF <= TRI_REPROJ_MAX)
+                Kinv = np.linalg.inv(K)
+                rayA = (Kinv @ np.hstack([ptsA_np[idx], np.ones((len(idx), 1))]).T).T
+                rayF = (Kinv @ np.hstack([ptsF_np[idx], np.ones((len(idx), 1))]).T).T
+                rayA /= np.linalg.norm(rayA, axis=1, keepdims=True)
+                rayF /= np.linalg.norm(rayF, axis=1, keepdims=True)
+                cosang = np.sum(rayA * rayF, axis=1).clip(-1, 1)
+                angdeg = np.degrees(np.arccos(cosang))
+                para_mask = angdeg > TRI_MIN_PARALLAX_DEG
+                good = front & repro_mask & para_mask
+                if not np.any(good):
+                    continue
+                for loc_k, ok in zip(idx, good):
+                    if ok:
+                        keep_idx_global.append(loc_k)
+                X_global.extend(list(XA[good]))
+            if len(keep_idx_global) >= TRI_MIN_CORR:
+                for k, X in zip(keep_idx_global, X_global):
+                    qa, qb = pairs_all[k]
+                    gi = track3d.get(qa, None)
+                    if gi is not None and gi < len(points3d) and points3d[gi] is not None:
+                        track3d[qb] = gi
+                    else:
+                        gi = len(points3d)
+                        track3d[qa] = gi
+                        track3d[qb] = gi
+                        points3d.append(X)
+
+    # --------- output --------------------------------------------------
     pts = np.array([p for p in points3d if p is not None], dtype=float)
     log(f"[sfm] raw_points={len(pts)}")
     if len(pts) == 0:

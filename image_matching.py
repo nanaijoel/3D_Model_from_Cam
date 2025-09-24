@@ -1,12 +1,13 @@
+# image_matching.py
 import os, numpy as np, cv2 as cv
 from typing import Callable, List, Tuple, Dict, Optional
 
-
+# --- Matching-Parameter ------------------------------------------------
 RATIO = 0.80
-F_THRESH_NEAR = 1.0          # RANSAC-Threshold (px)
-F_THRESH_WIDE = 1.5
+F_THRESH_NEAR = 1.0          # RANSAC-Threshold (px) für Nachbarn (step <= max_span)
+F_THRESH_WIDE = 1.2          # strenger für Loop-Closure/weite Paare
 MIN_INLIERS_NEAR = 50
-MIN_INLIERS_WIDE = 35
+MIN_INLIERS_WIDE = 120       # deutlich höher für robuste Loop-Closures
 
 def _knn(desc_a, desc_b, k=2):
     if desc_a is None or desc_b is None or len(desc_a) == 0 or len(desc_b) == 0:
@@ -22,25 +23,14 @@ def _ratio_filter(knn_list, ratio=RATIO):
     return out
 
 def _mutual_ratio(desc_a, desc_b, ratio=RATIO):
-
     if desc_a is None or desc_b is None or len(desc_a) == 0 or len(desc_b) == 0:
         return []
     ab = _ratio_filter(_knn(desc_a, desc_b, 2), ratio)
     ba = _ratio_filter(_knn(desc_b, desc_a, 2), ratio)
-
-    back = {}
-    for m in ba:
-        back[m.queryIdx] = m.trainIdx
-
-    mutual = []
-    for m in ab:
-        a = m.queryIdx; b = m.trainIdx
-        if back.get(b, -1) == a:
-            mutual.append(m)
-    return mutual
+    back = {m.queryIdx: m.trainIdx for m in ba}
+    return [m for m in ab if back.get(m.trainIdx, -1) == m.queryIdx]
 
 def _geom_ransac(kps_a, kps_b, matches, thr_px):
-
     if not matches:
         return []
     pts_a = np.float32([kps_a[m.queryIdx].pt for m in matches])
@@ -60,8 +50,8 @@ def build_pairs(descriptors: List[np.ndarray],
                 keypoints: Optional[List[List[cv.KeyPoint]]] = None,
                 # Graph-Parameter:
                 max_span: int = 6,
-                long_spans: Tuple[int, ...] = (10,),
-                add_loop_closures: bool = True
+                long_spans: Tuple[int, ...] = (),   # keine generischen Long-Spans
+                add_loop_closures: bool = True      # genau 1–2 robuste Loops
                 ) -> Tuple[List[Tuple[int, int]], Dict[Tuple[int, int], List[cv.DMatch]]]:
 
     def log(m):  on_log and on_log(m)
@@ -71,21 +61,22 @@ def build_pairs(descriptors: List[np.ndarray],
     if N < 2:
         return [], {}
 
-    # 1) Pair list
+    # 1) Pair list (lokaler Ketten-Graph + wenige robuste Loop-Kandidaten)
     pairs: List[Tuple[int, int]] = []
     for i in range(N - 1):
         pairs.append((i, i + 1))
     for d in range(2, max_span + 1):
         for i in range(0, N - d):
             pairs.append((i, i + d))
-    for d in long_spans:
-        for i in range(0, N - d):
-            pairs.append((i, i + d))
-    if add_loop_closures and N >= 20:
-        loop = {(0, N//2), (0, 2*N//3), (N//4, 3*N//4), (0, N-1)}
-        pairs.extend([(a, b) for (a, b) in loop if b < N])
-    pairs = sorted(set(pairs))
 
+    if add_loop_closures and N >= 20:
+        # Wenige, feste, N-robuste Loop-Kandidaten
+        loop = {(0, N - 1)}
+        if N >= 60:
+            loop.add((N // 4, 3 * N // 4))
+        pairs.extend([(a, b) for (a, b) in loop if 0 <= a < b < N])
+
+    pairs = sorted(set(pairs))
     log(f"[match] building pairs: N={N}, pairs={len(pairs)}")
     prog(35, "Image Matching – build pairs")
 
@@ -96,10 +87,10 @@ def build_pairs(descriptors: List[np.ndarray],
         des_a = descriptors[a]; des_b = descriptors[b]
         m = _mutual_ratio(des_a, des_b, ratio=RATIO)
 
-        # Geometry check
         step = b - a
-        thr = F_THRESH_NEAR if step <= max_span else F_THRESH_WIDE
-        min_inl = MIN_INLIERS_NEAR if step <= max_span else MIN_INLIERS_WIDE
+        is_near = (step <= max_span)
+        thr = F_THRESH_NEAR if is_near else F_THRESH_WIDE
+        min_inl = MIN_INLIERS_NEAR if is_near else MIN_INLIERS_WIDE
 
         if keypoints is not None and len(m) >= 8:
             m = _geom_ransac(keypoints[a], keypoints[b], m, thr_px=thr)
