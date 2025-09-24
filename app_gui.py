@@ -6,6 +6,7 @@ from PySide6.QtGui import QTextCursor
 import open3d as o3d
 from pipeline_runner import PipelineRunner
 
+
 class Worker(QtCore.QThread):
     progress = QtCore.Signal(int, str)  # value, label
     log = QtCore.Signal(str)
@@ -29,33 +30,51 @@ class Worker(QtCore.QThread):
         except Exception as e:
             self.failed.emit(str(e))
 
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Video → 3D Reconstruction (modular)")
-        self.resize(980, 540)
+        self.setWindowTitle("3D Model from Camera Video")
+        self.resize(980, 560)
 
-        self.video_path = ""
+        # Projektwurzel = Ordner mit den .py-Dateien
         self.base_dir = os.path.abspath(".")
+        self.video_path = ""
         self.last_ply = ""
         self.project_root = ""
 
         # --- Controls ---
         self.btn_pick = QtWidgets.QPushButton("Video auswählen…")
-        self.lbl_video = QtWidgets.QLabel("Keine Datei gewählt"); self.lbl_video.setWordWrap(True)
+        self.lbl_video = QtWidgets.QLabel("Keine Datei gewählt")
+        self.lbl_video.setWordWrap(True)
 
-        self.txt_project = QtWidgets.QLineEdit(); self.txt_project.setPlaceholderText("Projektname (z.B. buddha_better)")
-        self.spin_frames = QtWidgets.QSpinBox(); self.spin_frames.setRange(50, 2000); self.spin_frames.setValue(200); self.spin_frames.setSuffix(" Frames")
+        self.txt_project = QtWidgets.QLineEdit()
+        self.txt_project.setPlaceholderText("Projektname (z.B. buddha_better)")
+
+        self.spin_frames = QtWidgets.QSpinBox()
+        self.spin_frames.setRange(50, 2000)
+        self.spin_frames.setValue(200)
+        self.spin_frames.setSuffix(" Frames")
 
         self.btn_compute = QtWidgets.QPushButton("Compute")
         self.btn_compute.setEnabled(False)
 
-        self.progress = QtWidgets.QProgressBar(); self.progress.setRange(0, 100); self.progress.setValue(0)
+        self.progress = QtWidgets.QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
         self.lbl_stage = QtWidgets.QLabel("…")
-        self.chk_autoscroll = QtWidgets.QCheckBox("Autoscroll Log"); self.chk_autoscroll.setChecked(True)
+        self.chk_autoscroll = QtWidgets.QCheckBox("Autoscroll Log")
+        self.chk_autoscroll.setChecked(True)
 
-        self.log = QtWidgets.QTextEdit(); self.log.setReadOnly(True)
-        self.btn_show = QtWidgets.QPushButton("Show 3D Model as Mesh"); self.btn_show.setEnabled(False)
+        self.log = QtWidgets.QTextEdit()
+        self.log.setReadOnly(True)
+
+        # --- Mesh-Auswahl + Anzeigen ---
+        self.cmb_mesh = QtWidgets.QComboBox()
+        self.cmb_mesh.setMinimumWidth(420)
+        self.btn_choose_mesh = QtWidgets.QPushButton("Auswählen…")
+        self.btn_show = QtWidgets.QPushButton("Open 3D Model")
+        self.btn_show.setEnabled(False)   # erst aktiviert, wenn mind. 1 Mesh existiert
 
         # Layout
         form = QtWidgets.QFormLayout()
@@ -65,35 +84,97 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow(self.btn_compute, self.progress)
         form.addRow("Schritt:", self.lbl_stage)
         form.addRow(self.chk_autoscroll)
-        top = QtWidgets.QWidget(); top.setLayout(form)
+
+        mesh_row = QtWidgets.QHBoxLayout()
+        mesh_row.addWidget(self.cmb_mesh, 1)
+        mesh_row.addWidget(self.btn_choose_mesh)
+        form.addRow("Mesh auswählen:", mesh_row)
+
+        top = QtWidgets.QWidget()
+        top.setLayout(form)
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        splitter.addWidget(top); splitter.addWidget(self.log); splitter.setStretchFactor(1,1)
+        splitter.addWidget(top)
+        splitter.addWidget(self.log)
+        splitter.setStretchFactor(1, 1)
 
         bottom = QtWidgets.QWidget()
         bl = QtWidgets.QHBoxLayout(bottom)
         bl.addWidget(self.btn_show)
+
         container = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(container)
         v.addWidget(splitter)
         v.addWidget(bottom)
-
         self.setCentralWidget(container)
 
         # Signals
         self.btn_pick.clicked.connect(self.pick_video)
         self.btn_compute.clicked.connect(self.compute)
         self.btn_show.clicked.connect(self.show_mesh)
+        self.btn_choose_mesh.clicked.connect(self.choose_mesh)
+
+        # initial Mesh-Scan (Projektwurzel)
+        self.scan_meshes()
 
         self.worker = None
 
-    def pick_video(self):
-        filters = "Video-Dateien (*.mp4 *.MP4 *.mov *.MOV *.m4v *.M4V *.avi *.AVI *.mkv *.MKV *.webm *.WEBM *.wmv *.WMV);;Alle Dateien (*)"
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Video wählen", "", filters)
+    # --- Mesh-Handling ---
+    def scan_meshes(self):
+        """Scannt rekursiv ab Projektwurzel nach .ply und füllt das Dropdown."""
+        self.cmb_mesh.blockSignals(True)
+        self.cmb_mesh.clear()
 
-        if not path: return
-        self.video_path = path; self.lbl_video.setText(path)
-        self.btn_compute.setEnabled(True); self.progress.setValue(0); self.log.clear(); self.btn_show.setEnabled(False)
+        ply_paths = []
+        for root, dirs, files in os.walk(self.base_dir):
+            for fn in files:
+                if fn.lower().endswith(".ply"):
+                    ply_paths.append(os.path.join(root, fn))
+
+        ply_paths.sort()
+        for p in ply_paths:
+            self.cmb_mesh.addItem(os.path.relpath(p, self.base_dir), userData=p)
+
+        self.cmb_mesh.blockSignals(False)
+        self.btn_show.setEnabled(self.cmb_mesh.count() > 0)
+
+    def ensure_in_combo(self, path: str):
+        """Stellt sicher, dass ein gewählter Pfad im Dropdown vorhanden ist und setzt ihn aktiv."""
+        if not path:
+            return
+        # existierenden Index finden
+        for i in range(self.cmb_mesh.count()):
+            if self.cmb_mesh.itemData(i) == path:
+                self.cmb_mesh.setCurrentIndex(i)
+                self.btn_show.setEnabled(True)
+                return
+        # sonst hinzufügen (relativer Name ab base_dir, falls möglich)
+        label = os.path.relpath(path, self.base_dir) if os.path.commonpath([self.base_dir, os.path.abspath(path)]) == self.base_dir else os.path.basename(path)
+        self.cmb_mesh.addItem(label, userData=path)
+        self.cmb_mesh.setCurrentIndex(self.cmb_mesh.count() - 1)
+        self.btn_show.setEnabled(True)
+
+    def choose_mesh(self):
+        """Öffnet Dateidialog ab Projektwurzel, fügt die Auswahl dem Dropdown hinzu und setzt sie aktiv."""
+        filters = "PLY Mesh (*.ply);;Alle Dateien (*)"
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Mesh wählen", self.base_dir, filters)
+        if not path:
+            return
+        self.ensure_in_combo(path)
+
+    # --- Video / Pipeline ---
+    def pick_video(self):
+        filters = ("Video-Dateien (*.mp4 *.MP4 *.mov *.MOV *.m4v *.M4V *.avi *.AVI *.mkv *.MKV *.webm *.WEBM *.wmv *.WMV);;"
+                   "Alle Dateien (*)")
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Video wählen", self.base_dir, filters)
+        if not path:
+            return
+        self.video_path = path
+        self.lbl_video.setText(path)
+        self.btn_compute.setEnabled(True)
+        self.progress.setValue(0)
+        self.log.clear()
+        # Mesh-Controls bleiben aktiv
 
     def append_log(self, msg: str):
         self.log.append(msg)
@@ -102,11 +183,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log.ensureCursorVisible()
 
     def set_progress(self, val: int, label: str):
-        self.progress.setValue(val); self.lbl_stage.setText(label)
+        self.progress.setValue(val)
+        self.lbl_stage.setText(label)
 
     def compute(self):
         if not self.video_path:
-            QtWidgets.QMessageBox.warning(self, "Hinweis", "Bitte Video auswählen."); return
+            QtWidgets.QMessageBox.warning(self, "Hinweis", "Bitte Video auswählen.")
+            return
         project = self.txt_project.text().strip() or "default_project"
         target_frames = int(self.spin_frames.value())
         self.btn_compute.setEnabled(False)
@@ -119,21 +202,43 @@ class MainWindow(QtWidgets.QMainWindow):
         self.append_log("[ui] Pipeline gestartet…")
 
     def on_done(self, ply_path: str, project_root: str):
-        self.last_ply = ply_path; self.project_root = project_root
-        self.btn_compute.setEnabled(True); self.btn_show.setEnabled(True)
+        self.last_ply = ply_path
+        self.project_root = project_root
+        self.btn_compute.setEnabled(True)
+        self.btn_show.setEnabled(True)
         self.append_log(f"[ui] Fertig: {ply_path}")
 
+        # Neu gescannte Meshes (inkl. Runtime-Ergebnisse) sofort im Dropdown
+        self.scan_meshes()
+        # zuletzt erzeugtes Mesh sicher in der Liste selektieren
+        if os.path.isfile(ply_path):
+            self.ensure_in_combo(ply_path)
+
     def on_failed(self, msg: str):
-        self.btn_compute.setEnabled(True); self.append_log("[error]\n"+msg)
+        self.btn_compute.setEnabled(True)
+        self.append_log("[error]\n" + msg)
         QtWidgets.QMessageBox.critical(self, "Fehler", msg)
 
     def show_mesh(self):
-        if not self.last_ply or not os.path.isfile(self.last_ply):
-            QtWidgets.QMessageBox.information(self, "Hinweis", "Keine PLY gefunden."); return
-        import open3d as o3d
-        pcd = o3d.io.read_point_cloud(self.last_ply)
-        o3d.visualization.draw_geometries([pcd])
+        # Auswahl aus Dropdown, Fallback auf last_ply
+        ply_path = self.last_ply
+        if self.cmb_mesh.currentIndex() >= 0:
+            sel = self.cmb_mesh.currentData()
+            if sel and os.path.isfile(sel):
+                ply_path = sel
+
+        if not ply_path or not os.path.isfile(ply_path):
+            QtWidgets.QMessageBox.information(self, "Hinweis", "Kein gültiges PLY ausgewählt/gefunden.")
+            return
+        try:
+            pcd = o3d.io.read_point_cloud(ply_path)
+            o3d.visualization.draw_geometries([pcd])
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Fehler beim Öffnen", str(e))
+
 
 if __name__ == "__main__":
     app = QtWidgets.QApplication([])
-    mw = MainWindow(); mw.show(); app.exec()
+    mw = MainWindow()
+    mw.show()
+    app.exec()

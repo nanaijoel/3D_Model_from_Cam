@@ -1,11 +1,48 @@
+import os
 import numpy as np
 import cv2 as cv
-from typing import Callable, List, Dict, Tuple
+from typing import Callable, List, Dict, Tuple, Optional
 
 def _idx2pts(matches, kps1, kps2):
     pts1 = np.float32([kps1[m.queryIdx].pt for m in matches])
     pts2 = np.float32([kps2[m.trainIdx].pt for m in matches])
     return pts1, pts2
+
+def _save_camera_poses_npz_csv(poses_R: Dict[int, np.ndarray],
+                               poses_t: Dict[int, np.ndarray],
+                               out_dir: str,
+                               on_log: Optional[Callable[[str], None]] = None):
+    """Speichert Kamera-Posen als .npz (inkl. Zentren C) + .csv in out_dir."""
+    def log(m):
+        if on_log: on_log(m)
+    os.makedirs(out_dir, exist_ok=True)
+    order = sorted(poses_R.keys())
+    Rs, ts, idxs, Cs = [], [], [], []
+    for i in order:
+        R = poses_R[i]; t = poses_t[i]
+        C = -R.T @ t  # Kamera-Zentrum in Weltkoordinaten
+        Rs.append(R); ts.append(t); idxs.append(i); Cs.append(C.reshape(3))
+    Rs = np.stack(Rs, axis=0) if len(Rs) else np.zeros((0,3,3))
+    ts = np.stack(ts, axis=0) if len(ts) else np.zeros((0,3,1))
+    Cs = np.stack(Cs, axis=0) if len(Cs) else np.zeros((0,3))
+    idxs = np.array(idxs, dtype=int)
+
+    npz_path = os.path.join(out_dir, "camera_poses.npz")
+    np.savez_compressed(npz_path, frame_idx=idxs, R=Rs, t=ts, C=Cs)
+    log(f"[sfm] camera poses saved -> {npz_path}")
+
+    # CSV zusätzlich (für schnellen Blick)
+    try:
+        import csv
+        csv_path = os.path.join(out_dir, "camera_poses.csv")
+        with open(csv_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["frame_idx", "Cx", "Cy", "Cz"])
+            for i, C in zip(idxs, Cs):
+                w.writerow([int(i), float(C[0]), float(C[1]), float(C[2])])
+        log(f"[sfm] camera poses csv -> {csv_path}")
+    except Exception as e:
+        log(f"[sfm] WARN: CSV write failed: {e}")
 
 def run_sfm(keypoints: List[List[cv.KeyPoint]],
             descriptors: List[np.ndarray],
@@ -14,7 +51,8 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
             matches: Dict[Tuple[int,int], List[cv.DMatch]],
             K: np.ndarray,
             on_log: Callable[[str], None] = None,
-            on_progress: Callable[[int,str], None] = None):
+            on_progress: Callable[[int,str], None] = None,
+            poses_out_dir: Optional[str] = None):
     """Sehr kompakte inkrementelle SfM-Variante (SIFT/CPU)."""
     def log(m):
         if on_log: on_log(m)
@@ -25,24 +63,20 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
     log(f"[sfm] size={W}x{H}")
 
     # ---------- 1) Initialpaar automatisch wählen ----------
-    # Schwellen für mutual+F-RANSAC -> etwas milder
-    MIN_MATCHES_INIT = 60  # vorher 150
-    MIN_FLOW_PX = 8.0  # vorher 20
-    MIN_INLIERS_INIT = 40  # vorher 80
+    MIN_MATCHES_INIT = 60
+    MIN_FLOW_PX = 8.0
+    MIN_INLIERS_INIT = 40
 
     def cheirality_count(R, t, pts1, pts2):
-        # zählt, wie viele triangulierte Punkte vor beiden Kameras liegen
         def triangulate(R1, t1, R2, t2, p1, p2):
             P1 = K @ np.hstack((R1, t1));
             P2 = K @ np.hstack((R2, t2))
             X = cv.triangulatePoints(P1, P2, p1.T, p2.T)
             X = (X[:3] / X[3]).T
             return X
-
         def in_front(R, t, X):
             Xc = (R @ X.T + t).T
             return Xc[:, 2] > 0
-
         X = triangulate(np.eye(3), np.zeros((3, 1)), R, t, pts1, pts2)
         front = in_front(np.eye(3), np.zeros((3, 1)), X) & in_front(R, t, X)
         return int(front.sum())
@@ -50,44 +84,34 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
     best = dict(score=-1.0, pair=None, R=None, t=None, mask=None)
     stats = []
 
-    # 1. PASS: mit milden Grenzwerten
     for (i, j) in pairs:
         m = matches.get((i, j), [])
-        if len(m) < MIN_MATCHES_INIT:
-            continue
+        if len(m) < MIN_MATCHES_INIT: continue
         p1, p2 = _idx2pts(m, keypoints[i], keypoints[j])
         flow = float(np.median(np.linalg.norm(p2 - p1, axis=1)))
-        if flow < MIN_FLOW_PX:
-            continue
+        if flow < MIN_FLOW_PX: continue
 
         E, maskE = cv.findEssentialMat(p1, p2, K, method=cv.RANSAC, prob=0.999, threshold=1.5)
-        if E is None:
-            continue
+        if E is None: continue
         _, R, t, maskP = cv.recoverPose(E, p1, p2, K)
         inl_mask = (maskP.ravel().astype(bool)) & (maskE.ravel().astype(bool)[:len(maskP)])
         inliers = int(inl_mask.sum())
-        if inliers < MIN_INLIERS_INIT:
-            continue
+        if inliers < MIN_INLIERS_INIT: continue
 
-        # Score = Inlier + cheirale Punkte (stärker gewichtet)
         ch = cheirality_count(R, t, p1[inl_mask], p2[inl_mask]) if inliers > 0 else 0
         score = inliers + 2.0 * ch
         stats.append((i, j, len(m), flow, inliers, ch, score))
-
         if score > best["score"]:
             best.update(score=score, pair=(i, j), R=R, t=t, mask=inl_mask)
 
-    # 2. PASS (Fallback): wähle bestes Paar nach Cheirality auch ohne Schwellen
     if best["pair"] is None:
         for (i, j) in pairs:
             m = matches.get((i, j), [])
-            if len(m) < 40:
-                continue
+            if len(m) < 40: continue
             p1, p2 = _idx2pts(m, keypoints[i], keypoints[j])
             flow = float(np.median(np.linalg.norm(p2 - p1, axis=1)))
             E, maskE = cv.findEssentialMat(p1, p2, K, method=cv.RANSAC, prob=0.999, threshold=2.0)
-            if E is None:
-                continue
+            if E is None: continue
             _, R, t, maskP = cv.recoverPose(E, p1, p2, K)
             inl_mask = (maskP.ravel().astype(bool)) & (maskE.ravel().astype(bool)[:len(maskP)])
             inliers = int(inl_mask.sum())
@@ -98,7 +122,6 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
                 best.update(score=score, pair=(i, j), R=R, t=t, mask=inl_mask)
 
     if best["pair"] is None:
-        # ein paar Zahlen ins Log helfen beim Diagnostizieren
         if stats:
             stats.sort(key=lambda x: x[-1], reverse=True)
             top = "\n".join([f"   cand ({a},{b}): matches={mm}, flow={fl:.1f}px, inl={ii}, cheiral={ch}, score={sc:.1f}"
@@ -111,9 +134,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
     kps0, kps1 = keypoints[i0], keypoints[j0]
     m01 = matches[(i0, j0)]
     p1, p2 = _idx2pts(m01, kps0, kps1)
-    R = best["R"];
-    t = best["t"];
-    mask = best["mask"]
+    R = best["R"]; t = best["t"]; mask = best["mask"]
 
     # ---------- 2) Triangulation Init ----------
     poses_R = {i0: np.eye(3), j0: R}
@@ -130,12 +151,10 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
         Xc = (R @ X.T + t).T
         return Xc[:, 2] > 0
 
-    p1_in = p1[mask];
-    p2_in = p2[mask]
+    p1_in = p1[mask]; p2_in = p2[mask]
     X_init = triangulate(poses_R[i0], poses_t[i0], poses_R[j0], poses_t[j0], p1_in, p2_in)
     front = in_front(poses_R[i0], poses_t[i0], X_init) & in_front(poses_R[j0], poses_t[j0], X_init)
 
-    # Fallback: Pose invertieren, falls alles hinter den Kameras liegt
     if not np.any(front):
         R_inv = R.T
         t_inv = -R_inv @ t
@@ -151,7 +170,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
     log(f"[sfm] X_init={len(X_init)}")
     prog(60, "SfM – Initialisierung")
 
-    # Track-Map: (frame_idx, kp_idx) -> global point index
+    # Track-Map
     track3d: Dict[Tuple[int,int], int] = {}
     points3d: List[np.ndarray] = []
 
@@ -171,15 +190,10 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
     min_inliers_pnp = 80
 
     for step, fi in enumerate(order, start=1):
-        if fi in visited:
-            continue
-
-        # Finde Anker, die bereits eine Pose haben
+        if fi in visited: continue
         anchors = [a for a in visited if (a, fi) in matches]
-        if not anchors:
-            continue
+        if not anchors: continue
 
-        # 2D-3D Paare für PnP
         obj_pts, img_pts = [], []
         for a in anchors:
             mlist = matches[(a, fi)]
@@ -192,21 +206,17 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
                         img_pts.append(keypoints[fi][mm.trainIdx].pt)
                         track3d[qb] = gi
 
-        if len(obj_pts) < min_inliers_pnp:
-            continue
+        if len(obj_pts) < min_inliers_pnp: continue
 
         obj_pts = np.array(obj_pts, dtype=float)
         img_pts = np.array(img_pts, dtype=float)
 
-        # --- PnP (RANSAC) ---
         ok, rvec, tvec, inl = cv.solvePnPRansac(
             obj_pts, img_pts, K, None,
             reprojectionError=2.5, iterationsCount=3000, confidence=0.999
         )
-        if not ok or inl is None or len(inl) < min_inliers_pnp:
-            continue
+        if not ok or inl is None or len(inl) < min_inliers_pnp: continue
 
-        # --- Pose-Refinement (LM) ---
         try:
             rvec, tvec = cv.solvePnPRefineLM(
                 objectPoints=obj_pts[inl.ravel()],
@@ -221,7 +231,6 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
         Rfi, _ = cv.Rodrigues(rvec)
         tfi = tvec.reshape(3, 1)
 
-        # Reprojektion-Fehler loggen (Ø in Pixel)
         proj, _ = cv.projectPoints(obj_pts[inl.ravel()], rvec, tvec, K, None)
         err = np.mean(np.linalg.norm(proj.squeeze() - img_pts[inl.ravel()], axis=1))
         log(f"[sfm] pose {fi}: inliers={len(inl)} repro={err:.2f}px")
@@ -232,20 +241,17 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
 
         prog(int(60 + 30 * len(visited) / len(order)), f"SfM – Pose {fi}")
 
-        # Neue Punkte triangulieren gegen alle Anker
         for a in anchors:
             mlist = matches[(a, fi)]
             pts_a, pts_f, pairs_af = [], [], []
             for mm in mlist:
                 qa = (a, mm.queryIdx); qb = (fi, mm.trainIdx)
-                if qb in track3d:
-                    continue
+                if qb in track3d: continue
                 pts_a.append(keypoints[a][mm.queryIdx].pt)
                 pts_f.append(keypoints[fi][mm.trainIdx].pt)
                 pairs_af.append((qa, qb))
 
-            if len(pts_a) < 40:
-                continue
+            if len(pts_a) < 40: continue
 
             Xaf = triangulate(poses_R[a], poses_t[a], poses_R[fi], poses_t[fi],
                               np.float32(pts_a), np.float32(pts_f))
@@ -262,15 +268,19 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
                 track3d[qa] = gi
                 track3d[qb] = gi
                 if k < len(Xaf):
-                    points3d.append(Xaf[k])
-                    k += 1
+                    points3d.append(Xaf[k]); k += 1
                 else:
                     points3d.append(None)
 
-    # ---------- 4) Rückgabe ----------
+    # ---------- 4) Rückgabe + Pose-Datei schreiben ----------
     pts = np.array([p for p in points3d if p is not None], dtype=float)
     log(f"[sfm] raw_points={len(pts)}")
     if len(pts) == 0:
         raise RuntimeError("SfM erzeugte 0 Punkte. Mehr Parallaxe/Frames und gute Textur nötig.")
     prog(95, "SfM – Punkte sammeln")
-    return pts
+
+    # Speichern der Kameraposen (falls Verzeichnis angegeben)
+    if poses_out_dir is not None and len(poses_R) > 0:
+        _save_camera_poses_npz_csv(poses_R, poses_t, poses_out_dir, on_log=on_log)
+
+    return pts, poses_R, poses_t
