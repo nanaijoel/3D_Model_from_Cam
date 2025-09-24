@@ -70,7 +70,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmb_mesh.setMinimumWidth(420)
         self.btn_choose_mesh = QtWidgets.QPushButton("Auswählen…")
         self.btn_show = QtWidgets.QPushButton("Open 3D Model")
-        self.btn_show.setEnabled(False)   # erst aktiviert, wenn mind. 1 Mesh existiert
+        self.btn_show.setEnabled(False)   # just activated, if at least one mesh available
 
         form = QtWidgets.QFormLayout()
         form.addRow(self.btn_pick, self.lbl_video)
@@ -112,7 +112,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.worker = None
 
-    # --- Mesh-Handling ---
     def scan_meshes(self):
         self.cmb_mesh.blockSignals(True)
         self.cmb_mesh.clear()
@@ -133,20 +132,20 @@ class MainWindow(QtWidgets.QMainWindow):
     def ensure_in_combo(self, path: str):
         if not path:
             return
-        # existierenden Index finden
+
         for i in range(self.cmb_mesh.count()):
             if self.cmb_mesh.itemData(i) == path:
                 self.cmb_mesh.setCurrentIndex(i)
                 self.btn_show.setEnabled(True)
                 return
-        # sonst hinzufügen (relativer Name ab base_dir, falls möglich)
+
         label = os.path.relpath(path, self.base_dir) if os.path.commonpath([self.base_dir, os.path.abspath(path)]) == self.base_dir else os.path.basename(path)
         self.cmb_mesh.addItem(label, userData=path)
         self.cmb_mesh.setCurrentIndex(self.cmb_mesh.count() - 1)
         self.btn_show.setEnabled(True)
 
     def choose_mesh(self):
-        """Öffnet Dateidialog ab Projektwurzel, fügt die Auswahl dem Dropdown hinzu und setzt sie aktiv."""
+
         filters = "PLY Mesh (*.ply);;Alle Dateien (*)"
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Mesh wählen", self.base_dir, filters)
         if not path:
