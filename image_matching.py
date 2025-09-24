@@ -61,7 +61,7 @@ def build_pairs(descriptors: List[np.ndarray],
                 keypoints: Optional[List[List[cv.KeyPoint]]] = None,
                 # Graph-Parameter:
                 max_span: int = 6,
-                long_spans: Tuple[int, ...] = (10, 15, 20),
+                long_spans: Tuple[int, ...] = (10,),
                 add_loop_closures: bool = True
                 ) -> Tuple[List[Tuple[int, int]], Dict[Tuple[int, int], List[cv.DMatch]]]:
     """
