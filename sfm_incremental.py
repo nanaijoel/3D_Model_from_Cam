@@ -14,7 +14,6 @@ def _save_camera_poses_npz_csv(poses_R: Dict[int, np.ndarray],
                                poses_t: Dict[int, np.ndarray],
                                out_dir: str,
                                on_log: Optional[Callable[[str], None]] = None):
-    """Speichert Kamera-Posen als .npz (inkl. Zentren C) + .csv in out_dir."""
     def log(m):
         if on_log:
             on_log(m)
@@ -58,7 +57,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
             on_log: Callable[[str], None] = None,
             on_progress: Callable[[int, str], None] = None,
             poses_out_dir: Optional[str] = None):
-    """Kompaktes inkrementelles SfM (SIFT/CPU) mit robuster 2D–3D-Zuordnung."""
+
     def log(m):
         if on_log: on_log(m)
     def prog(p, s):
@@ -67,7 +66,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
     H, W = shapes[0]
     log(f"[sfm] size={W}x{H}")
 
-    # ---------- 1) Initialpaar automatisch wählen ----------
+    # 1) Choose initial pair automatically
     MIN_MATCHES_INIT = 60
     MIN_FLOW_PX = 8.0
     MIN_INLIERS_INIT = 40
@@ -149,7 +148,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
     p1, p2 = _idx2pts(m01, kps0, kps1)
     R = best["R"]; t = best["t"]; mask = best["mask"]
 
-    # ---------- 2) Triangulation Init ----------
+    # 2) Triangulation Init
     poses_R = {i0: np.eye(3), j0: R}
     poses_t = {i0: np.zeros((3, 1)), j0: t}
 
@@ -172,7 +171,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
     log(f"[sfm] X_init={len(X_init)}")
     prog(60, "SfM – Initialisierung")
 
-    # Track-Map (2D-Observation → globaler 3D-Index)
+    # Track-Map (2D-Observation -> global 3D-Index)
     track3d: Dict[Tuple[int, int], int] = {}
     points3d: List[np.ndarray] = []
 
@@ -186,15 +185,15 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
         track3d[qb] = gi
         points3d.append(X_init[k])
 
-    # ---------- 3) Inkrementell ----------
+    # Incremental
     order = sorted(set([i for ij in pairs for i in ij]))
     visited = {i0, j0}
 
-    min_inliers_pnp = 40             # war 80
-    pnp_reproj_accept = 1.6          # Reproj.-Fehler für knappe Fälle
-    pnp_iters = 6000                 # mehr RANSAC-Iterationen
-    pnp_err = 3.0                    # war 2.5
-    tri_min_corresp = 25             # war 40
+    min_inliers_pnp = 40
+    pnp_reproj_accept = 1.6
+    pnp_iters = 6000
+    pnp_err = 3.0
+    tri_min_corresp = 25
 
     for step, fi in enumerate(order, start=1):
         if fi in visited:
@@ -203,9 +202,9 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
         if not anchors:
             continue
 
-        # --- 3.1 2D–3D sammeln (jeder globale Punkt nur einmal) ---
+        # 3.1 Farm 2D–3D points
         obj_pts, img_pts = [], []
-        used_g = set()  # wichtig: keine doppelten 3D-Punkte in PnP
+        used_g = set()
         for a in anchors:
             mlist = matches[(a, fi)]
             for mm in mlist:
@@ -214,7 +213,6 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
                     gi = track3d[qa]
                     if gi < len(points3d) and points3d[gi] is not None:
                         if gi in used_g:
-                            # schon verwendet → nur 2D-Track pflegen
                             track3d[qb] = gi
                             continue
                         obj_pts.append(points3d[gi])
@@ -239,7 +237,6 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
         accept = bool(ok and inliers >= min_inliers_pnp)
         repro = None
 
-        # knappe Fälle zulassen (gute Reprojektion)
         if not accept and ok and inliers >= 25 and inl is not None:
             proj, _ = cv.projectPoints(obj_pts[inl.ravel()], rvec, tvec, K, None)
             repro = float(np.mean(np.linalg.norm(proj.squeeze() - img_pts[inl.ravel()], axis=1)))
@@ -252,7 +249,6 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
                 log(f"[sfm] reject frame {fi}: inliers={inliers}, repro≈{repro:.2f}px")
             continue
 
-        # optionales Refinement
         try:
             rvec, tvec = cv.solvePnPRefineLM(
                 objectPoints=obj_pts[inl.ravel()],
@@ -278,7 +274,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
 
         prog(int(60 + 30 * len(visited) / len(order)), f"SfM – Pose {fi}")
 
-        # --- 3.2 neue Punkte triangulieren (saubere 1:1-Zuordnung) ---
+        # Triangulate new points
         for a in anchors:
             mlist = matches[(a, fi)]
             pts_a, pts_f, pairs_af = [], [], []
@@ -306,7 +302,6 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
             Xaf = Xaf_all[front_mask]
 
             for (qa, qb), X in zip(sel_pairs, Xaf):
-                # existiert schon ein globaler Punkt über qa?
                 gi = track3d.get(qa, None)
                 if gi is not None and gi < len(points3d) and points3d[gi] is not None:
                     track3d[qb] = gi
@@ -316,7 +311,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
                 track3d[qb] = gi
                 points3d.append(X)
 
-    # ---------- 4) Rückgabe + Pose-Datei schreiben ----------
+    # 4) Rückgabe + Pose-Datei schreiben ----------
     pts = np.array([p for p in points3d if p is not None], dtype=float)
     log(f"[sfm] raw_points={len(pts)}")
     if len(pts) == 0:

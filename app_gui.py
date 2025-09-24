@@ -1,4 +1,3 @@
-# pip install PySide6 opencv-python opencv-contrib-python open3d numpy
 import os
 from PySide6 import QtCore, QtWidgets
 from PySide6.QtGui import QTextCursor
@@ -37,13 +36,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("3D Model from Camera Video")
         self.resize(980, 560)
 
-        # Projektwurzel = Ordner mit den .py-Dateien
         self.base_dir = os.path.abspath(".")
         self.video_path = ""
         self.last_ply = ""
         self.project_root = ""
 
-        # --- Controls ---
         self.btn_pick = QtWidgets.QPushButton("Video auswählen…")
         self.lbl_video = QtWidgets.QLabel("Keine Datei gewählt")
         self.lbl_video.setWordWrap(True)
@@ -69,14 +66,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.log = QtWidgets.QTextEdit()
         self.log.setReadOnly(True)
 
-        # --- Mesh-Auswahl + Anzeigen ---
         self.cmb_mesh = QtWidgets.QComboBox()
         self.cmb_mesh.setMinimumWidth(420)
         self.btn_choose_mesh = QtWidgets.QPushButton("Auswählen…")
         self.btn_show = QtWidgets.QPushButton("Open 3D Model")
         self.btn_show.setEnabled(False)   # erst aktiviert, wenn mind. 1 Mesh existiert
 
-        # Layout
         form = QtWidgets.QFormLayout()
         form.addRow(self.btn_pick, self.lbl_video)
         form.addRow("Projektname:", self.txt_project)
@@ -108,20 +103,17 @@ class MainWindow(QtWidgets.QMainWindow):
         v.addWidget(bottom)
         self.setCentralWidget(container)
 
-        # Signals
         self.btn_pick.clicked.connect(self.pick_video)
         self.btn_compute.clicked.connect(self.compute)
         self.btn_show.clicked.connect(self.show_mesh)
         self.btn_choose_mesh.clicked.connect(self.choose_mesh)
 
-        # initial Mesh-Scan (Projektwurzel)
         self.scan_meshes()
 
         self.worker = None
 
     # --- Mesh-Handling ---
     def scan_meshes(self):
-        """Scannt rekursiv ab Projektwurzel nach .ply und füllt das Dropdown."""
         self.cmb_mesh.blockSignals(True)
         self.cmb_mesh.clear()
 
@@ -139,7 +131,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_show.setEnabled(self.cmb_mesh.count() > 0)
 
     def ensure_in_combo(self, path: str):
-        """Stellt sicher, dass ein gewählter Pfad im Dropdown vorhanden ist und setzt ihn aktiv."""
         if not path:
             return
         # existierenden Index finden
@@ -162,7 +153,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.ensure_in_combo(path)
 
-    # --- Video / Pipeline ---
     def pick_video(self):
         filters = ("Video-Dateien (*.mp4 *.MP4 *.mov *.MOV *.m4v *.M4V *.avi *.AVI *.mkv *.MKV *.webm *.WEBM *.wmv *.WMV);;"
                    "Alle Dateien (*)")
@@ -174,7 +164,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_compute.setEnabled(True)
         self.progress.setValue(0)
         self.log.clear()
-        # Mesh-Controls bleiben aktiv
+
 
     def append_log(self, msg: str):
         self.log.append(msg)
@@ -207,10 +197,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_compute.setEnabled(True)
         self.btn_show.setEnabled(True)
         self.append_log(f"[ui] Fertig: {ply_path}")
-
-        # Neu gescannte Meshes (inkl. Runtime-Ergebnisse) sofort im Dropdown
         self.scan_meshes()
-        # zuletzt erzeugtes Mesh sicher in der Liste selektieren
         if os.path.isfile(ply_path):
             self.ensure_in_combo(ply_path)
 
@@ -220,7 +207,6 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.critical(self, "Fehler", msg)
 
     def show_mesh(self):
-        # Auswahl aus Dropdown, Fallback auf last_ply
         ply_path = self.last_ply
         if self.cmb_mesh.currentIndex() >= 0:
             sel = self.cmb_mesh.currentData()

@@ -2,7 +2,7 @@
 import os
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")  # headless-safe
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 def plot_camera_poses(npz_path: str, out_png_path: str | None = None, show: bool = False, title: str = "Camera Trajectory"):

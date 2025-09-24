@@ -6,7 +6,7 @@ from typing import Callable, List
 def extract_and_save_frames(video_path: str, target_frames: int, out_dir: str,
                             on_log: Callable[[str], None] = None,
                             on_progress: Callable[[int,str], None] = None) -> List[str]:
-    """Uniformes Sampling -> PNGs in out_dir, gibt Pfade zurück."""
+
     def log(m): on_log and on_log(m)
     def prog(p, s): on_progress and on_progress(p, s)
 

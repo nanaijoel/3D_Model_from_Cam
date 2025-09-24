@@ -7,9 +7,8 @@ from image_matching import build_pairs
 from sfm_incremental import run_sfm
 from depth_mvs import run_depth_mvs
 from meshing import save_point_cloud
-
-# Plotter
 from camera_pose_plot import plot_camera_poses
+
 
 class PipelineRunner:
     def __init__(self, base_dir: str, on_log: Callable[[str], None], on_progress: Callable[[int, str], None]):
@@ -36,21 +35,20 @@ class PipelineRunner:
         focal = 0.9 * max(w, h); pp = (w/2.0, h/2.0)
         K = np.array([[focal, 0, pp[0]], [0, focal, pp[1]], [0, 0, 1]], float)
 
-        # --- NEU: Posen-Verzeichnis definieren ---
+        # Pose folder
         poses_dir = os.path.join(paths.root, "poses")
         os.makedirs(poses_dir, exist_ok=True)
 
-        # 5) SfM inkl. Pose-Speicherung
+        # 5) SfM including saving camera poses
         pts, poses_R, poses_t = run_sfm(
             kps, descs, shapes, pairs, matches, K,
             log, prog,
             poses_out_dir=poses_dir
         )
 
-        # 5b) 3D-Plot der Kameraposen erzeugen (PNG)
+        # 5b) 3D-Plot of camera poses
         npz_path = os.path.join(poses_dir, "camera_poses.npz")
         if os.path.isfile(npz_path):
-            # bevorzugt im sfm-Ordner speichern (übersichtlicher)
             sfm_dir = getattr(paths, "sfm", os.path.join(paths.root, "sfm"))
             os.makedirs(sfm_dir, exist_ok=True)
             out_png = os.path.join(sfm_dir, "camera_poses_plot.png")

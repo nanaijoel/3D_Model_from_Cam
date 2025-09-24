@@ -15,13 +15,11 @@ def generate_object_masks(images: List[str], out_dir: str,
             log(f"[mask] WARN: {path} unlesbar"); continue
         h, w = bgr.shape[:2]
 
-        # Statue dunkel, Hintergrund hell -> LAB-L-Kanal, Otsu, invertieren
         L = cv.cvtColor(bgr, cv.COLOR_BGR2LAB)[:, :, 0]
         blur = cv.GaussianBlur(L, (5, 5), 0)
         _, th = cv.threshold(blur, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU)
         mask = 255 - th
 
-        # Morphologie + größte Komponente nahe Bildzentrum
         kernel = np.ones((7, 7), np.uint8)
         mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel, iterations=2)
         mask = cv.morphologyEx(mask, cv.MORPH_OPEN, kernel, iterations=1)
@@ -34,7 +32,6 @@ def generate_object_masks(images: List[str], out_dir: str,
         else:
             keep = mask
 
-        # Elliptische Zentral-ROI, um Randartefakte zu cutten
         roi = np.zeros_like(keep)
         cv.ellipse(roi, (w//2, h//2), (int(w*0.40), int(h*0.45)), 0, 0, 360, 255, -1)
         keep = cv.bitwise_and(keep, roi)

@@ -1,12 +1,12 @@
 import os, numpy as np, cv2 as cv
 from typing import Callable, List, Tuple, Dict, Optional
 
-# --- Strengere Tuning-Parameter ---
-RATIO = 0.80                 # war 0.90 – jetzt strenger
-F_THRESH_NEAR = 1.0          # RANSAC-Threshold (px) nahe Paare
-F_THRESH_WIDE = 1.5          # ... weite Paare
-MIN_INLIERS_NEAR = 50        # Mindest-Inlier nach RANSAC (nahe)
-MIN_INLIERS_WIDE = 35        # Mindest-Inlier nach RANSAC (weit)
+
+RATIO = 0.80
+F_THRESH_NEAR = 1.0          # RANSAC-Threshold (px)
+F_THRESH_WIDE = 1.5
+MIN_INLIERS_NEAR = 50
+MIN_INLIERS_WIDE = 35
 
 def _knn(desc_a, desc_b, k=2):
     if desc_a is None or desc_b is None or len(desc_a) == 0 or len(desc_b) == 0:
@@ -22,16 +22,15 @@ def _ratio_filter(knn_list, ratio=RATIO):
     return out
 
 def _mutual_ratio(desc_a, desc_b, ratio=RATIO):
-    """Symmetrisches (A↔B) Lowe-Ratio-Matching, behält nur wechselseitige NN."""
+
     if desc_a is None or desc_b is None or len(desc_a) == 0 or len(desc_b) == 0:
         return []
     ab = _ratio_filter(_knn(desc_a, desc_b, 2), ratio)
     ba = _ratio_filter(_knn(desc_b, desc_a, 2), ratio)
 
-    # Mappe: b_idx -> a_idx aus Rückrichtung
     back = {}
     for m in ba:
-        back[m.queryIdx] = m.trainIdx  # (B→A): query=B, train=A
+        back[m.queryIdx] = m.trainIdx
 
     mutual = []
     for m in ab:
@@ -41,7 +40,7 @@ def _mutual_ratio(desc_a, desc_b, ratio=RATIO):
     return mutual
 
 def _geom_ransac(kps_a, kps_b, matches, thr_px):
-    """Fundamental-Matrix RANSAC, gibt Inlier-Matches zurück (oder [])."""
+
     if not matches:
         return []
     pts_a = np.float32([kps_a[m.queryIdx].pt for m in matches])
@@ -64,14 +63,7 @@ def build_pairs(descriptors: List[np.ndarray],
                 long_spans: Tuple[int, ...] = (10,),
                 add_loop_closures: bool = True
                 ) -> Tuple[List[Tuple[int, int]], Dict[Tuple[int, int], List[cv.DMatch]]]:
-    """
-    Dicht, aber robust:
-      - Nachbarn (i, i+1)
-      - Sliding-Window bis max_span (i, i+d) für alle i
-      - Long-Range (i, i+d) für alle i
-      - optionale Loop-Closures
-    Matching: mutual Lowe-Ratio → F-RANSAC → Mindest-Inlier. Kein Fallback!
-    """
+
     def log(m):  on_log and on_log(m)
     def prog(v, s): on_progress and on_progress(int(v), s)
 
@@ -79,7 +71,7 @@ def build_pairs(descriptors: List[np.ndarray],
     if N < 2:
         return [], {}
 
-    # 1) Paarliste
+    # 1) Pair list
     pairs: List[Tuple[int, int]] = []
     for i in range(N - 1):
         pairs.append((i, i + 1))
@@ -102,10 +94,9 @@ def build_pairs(descriptors: List[np.ndarray],
 
     for j, (a, b) in enumerate(pairs):
         des_a = descriptors[a]; des_b = descriptors[b]
-        # mutual Lowe-Ratio
         m = _mutual_ratio(des_a, des_b, ratio=RATIO)
 
-        # Geometrieprüfung
+        # Geometry check
         step = b - a
         thr = F_THRESH_NEAR if step <= max_span else F_THRESH_WIDE
         min_inl = MIN_INLIERS_NEAR if step <= max_span else MIN_INLIERS_WIDE
@@ -113,7 +104,6 @@ def build_pairs(descriptors: List[np.ndarray],
         if keypoints is not None and len(m) >= 8:
             m = _geom_ransac(keypoints[a], keypoints[b], m, thr_px=thr)
 
-        # Mindest-Inlier erzwingen (kein Fallback!)
         if len(m) < min_inl:
             m = []
 
