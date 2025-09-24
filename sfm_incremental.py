@@ -187,18 +187,24 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
     # ---------- 3) Inkrementell ----------
     order = sorted(set([i for ij in pairs for i in ij]))
     visited = {i0, j0}
-    min_inliers_pnp = 80
+    min_inliers_pnp = 40  # war 80
+    pnp_reproj_accept = 1.6  # Reproj.-Fehler, um knappe Fälle zuzulassen
+    pnp_iters = 6000  # mehr RANSAC-Iterationen
+    pnp_err = 3.0  # war 2.5
 
     for step, fi in enumerate(order, start=1):
-        if fi in visited: continue
+        if fi in visited:
+            continue
         anchors = [a for a in visited if (a, fi) in matches]
-        if not anchors: continue
+        if not anchors:
+            continue
 
         obj_pts, img_pts = [], []
         for a in anchors:
             mlist = matches[(a, fi)]
             for mm in mlist:
-                qa = (a, mm.queryIdx); qb = (fi, mm.trainIdx)
+                qa = (a, mm.queryIdx);
+                qb = (fi, mm.trainIdx)
                 if qa in track3d:
                     gi = track3d[qa]
                     if gi < len(points3d) and points3d[gi] is not None:
@@ -206,17 +212,37 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
                         img_pts.append(keypoints[fi][mm.trainIdx].pt)
                         track3d[qb] = gi
 
-        if len(obj_pts) < min_inliers_pnp: continue
+        if len(obj_pts) < min_inliers_pnp:
+            log(f"[sfm] try PnP frame {fi}: 2D-3D={len(obj_pts)} need≥{min_inliers_pnp}")
+            continue
 
         obj_pts = np.array(obj_pts, dtype=float)
         img_pts = np.array(img_pts, dtype=float)
 
         ok, rvec, tvec, inl = cv.solvePnPRansac(
             obj_pts, img_pts, K, None,
-            reprojectionError=2.5, iterationsCount=3000, confidence=0.999
+            reprojectionError=float(pnp_err),
+            iterationsCount=int(pnp_iters),
+            confidence=0.999
         )
-        if not ok or inl is None or len(inl) < min_inliers_pnp: continue
+        inliers = int(len(inl)) if (inl is not None) else 0
+        accept = bool(ok and inliers >= min_inliers_pnp)
+        repro = None
 
+        # knappe Fälle zulassen: genug Inlier + sehr kleiner Reproj.-Fehler
+        if not accept and ok and inliers >= 25 and inl is not None:
+            proj, _ = cv.projectPoints(obj_pts[inl.ravel()], rvec, tvec, K, None)
+            repro = float(np.mean(np.linalg.norm(proj.squeeze() - img_pts[inl.ravel()], axis=1)))
+            accept = (repro <= pnp_reproj_accept)
+
+        if not accept:
+            if repro is None:
+                log(f"[sfm] reject frame {fi}: inliers={inliers} (<{min_inliers_pnp})")
+            else:
+                log(f"[sfm] reject frame {fi}: inliers={inliers}, repro≈{repro:.2f}px")
+            continue
+
+        # optionales Refinement
         try:
             rvec, tvec = cv.solvePnPRefineLM(
                 objectPoints=obj_pts[inl.ravel()],
@@ -231,9 +257,10 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
         Rfi, _ = cv.Rodrigues(rvec)
         tfi = tvec.reshape(3, 1)
 
-        proj, _ = cv.projectPoints(obj_pts[inl.ravel()], rvec, tvec, K, None)
-        err = np.mean(np.linalg.norm(proj.squeeze() - img_pts[inl.ravel()], axis=1))
-        log(f"[sfm] pose {fi}: inliers={len(inl)} repro={err:.2f}px")
+        if repro is None:
+            proj, _ = cv.projectPoints(obj_pts[inl.ravel()], rvec, tvec, K, None)
+            repro = float(np.mean(np.linalg.norm(proj.squeeze() - img_pts[inl.ravel()], axis=1)))
+        log(f"[sfm] pose {fi}: inliers={inliers} repro={repro:.2f}px")
 
         poses_R[fi] = Rfi
         poses_t[fi] = tfi
@@ -241,17 +268,21 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
 
         prog(int(60 + 30 * len(visited) / len(order)), f"SfM – Pose {fi}")
 
+        # neue Punkte triangulieren (kleine Lockerung hilft)
         for a in anchors:
             mlist = matches[(a, fi)]
             pts_a, pts_f, pairs_af = [], [], []
             for mm in mlist:
-                qa = (a, mm.queryIdx); qb = (fi, mm.trainIdx)
-                if qb in track3d: continue
+                qa = (a, mm.queryIdx);
+                qb = (fi, mm.trainIdx)
+                if qb in track3d:
+                    continue
                 pts_a.append(keypoints[a][mm.queryIdx].pt)
                 pts_f.append(keypoints[fi][mm.trainIdx].pt)
                 pairs_af.append((qa, qb))
 
-            if len(pts_a) < 40: continue
+            if len(pts_a) < 25:  # war 40
+                continue
 
             Xaf = triangulate(poses_R[a], poses_t[a], poses_R[fi], poses_t[fi],
                               np.float32(pts_a), np.float32(pts_f))
@@ -268,7 +299,8 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
                 track3d[qa] = gi
                 track3d[qb] = gi
                 if k < len(Xaf):
-                    points3d.append(Xaf[k]); k += 1
+                    points3d.append(Xaf[k]);
+                    k += 1
                 else:
                     points3d.append(None)
 
