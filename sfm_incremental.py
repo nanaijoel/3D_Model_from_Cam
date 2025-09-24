@@ -112,7 +112,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
 
     # --------- Init-Paar lokal um die Mitte ---------------------------
     N = len(shapes)
-    mid = N // 4
+    mid = N // 2
     w = min(INIT_WINDOW_FRAMES, max(10, N // 3))
     def in_init_window(i, j):
         return (abs(j - i) <= INIT_MAX_SPAN) and (min(i, j) >= mid - w) and (max(i, j) <= mid + w)
