@@ -1,9 +1,9 @@
-# sfm_incremental.py
+# sfm_new.py
 import os
 import numpy as np
 import cv2 as cv
 from typing import Callable, List, Dict, Tuple, Optional, DefaultDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from collections import defaultdict
 
 # ============================== Config ===============================
@@ -14,9 +14,10 @@ class SfMConfig:
     MIN_MATCHES_INIT: int = 50
     MIN_FLOW_PX: float = 6.0
     MIN_INLIERS_INIT: int = 35
-    INIT_WINDOW_FRAMES: int = 80
-    INIT_MAX_SPAN: int = 6
-    INIT_WINDOW_CENTER: Optional[int] = None
+    INIT_WINDOW_FRAMES: int = 80                  # Hard-Cap für Halbbreite
+    INIT_MAX_SPAN: int = 6                        # Max. Abstand des Startpaares
+    INIT_WINDOW_CENTER: Optional[int] = None      # Standard: Mitte der Sequenz
+    INIT_WINDOW_RATIO: Optional[float] = None     # z.B. 0.5 => Halbbreite = 0.5*N
     FORCE_INIT_PAIR: Optional[Tuple[int, int]] = None
 
     # --- PnP ---
@@ -28,7 +29,7 @@ class SfMConfig:
     # --- Triangulation (pairwise during expansion) ---
     TRI_MIN_CORR: int = 14
     TRI_REPROJ_MAX: float = 2.0
-    TRI_MIN_PARALLAX_DEG: float = 4.0  # strenger als vorher
+    TRI_MIN_PARALLAX_DEG: float = 4.0            # strenger als klassisch
 
     # --- Local stereo seeding ---
     SEED_SPAN: int = 3
@@ -36,13 +37,25 @@ class SfMConfig:
     SEED_REPROJ: float = 2.0
 
     # --- Multiview point validation ("promotion") ---
-    POINT_PROMOTION_MIN_OBS: int = 2
+    POINT_PROMOTION_MIN_OBS: int = 4
     POINT_MAX_MULTIVIEW_REPROJ: float = 2.0
-    POINT_MIN_MULTIVIEW_PARALLAX_DEG: float = 3.0
-    POINT_REQUIRE_POSITIVE_DEPTH_RATIO: float = 0.5  # Anteil der Sichten mit z>0
+    POINT_MIN_MULTIVIEW_PARALLAX_DEG: float = 5.0
+    POINT_REQUIRE_POSITIVE_DEPTH_RATIO: float = 0.7
 
-    # --- Frame gating for *creating* points (pose ok, aber keine neuen Punkte) ---
-    FRAME_MAX_MEDIAN_REPROJ_FOR_NEW_POINTS: float = 3.0
+    # Low-parallax fallback (strengere Repro-Kriterien, viele Sichten)
+    LOWPAR_FALLBACK_MIN_OBS: int = 6
+    LOWPAR_FALLBACK_MAX_MEDIAN_REPROJ: float = 1.6
+    LOWPAR_FALLBACK_MIN_POSDEPTH_RATIO: float = 0.85
+
+    # --- Frame gating for creating new points ---
+    FRAME_MAX_MEDIAN_REPROJ_FOR_NEW_POINTS: float = 2.8
+
+    # --- Optionaler Densify-Pass am Ende ---
+    DENSIFY_ENABLE: bool = True
+    DENSIFY_MAX_SPAN: int = 20
+    DENSIFY_MIN_MATCHES: int = 60
+    DENSIFY_MIN_PARALLAX_DEG: float = 4.0
+    DENSIFY_MAX_REPROJ: float = 2.0
 
 
 # ============================== Helpers ==============================
@@ -104,31 +117,28 @@ def _reproj_err(K, R, t, X, pts2d):
     return np.linalg.norm(proj - pts2d, axis=1)
 
 def _bearing_in_world(Kinv, R, uv):
-    # uv: Nx2 image points
     rays_cam = (Kinv @ np.hstack([uv, np.ones((len(uv), 1))]).T).T
     rays_cam /= np.linalg.norm(rays_cam, axis=1, keepdims=True)
-    # direction in world = R^T * ray_cam
     return (R.T @ rays_cam.T).T
 
 def _pairwise_max_parallax_deg(Kinv, poses_R, poses_t, obs_list):
-    # obs_list: [(f, (u,v)), ...]
-    # compute angle between world rays for all pairs, return max angle (deg) and the best pair indices
     best = (0.0, None)
     for a in range(len(obs_list)):
         fa, uva = obs_list[a]
-        Ra, ta = poses_R.get(fa), poses_t.get(fa)
+        Ra = poses_R.get(fa)
         if Ra is None: continue
         for b in range(a+1, len(obs_list)):
             fb, uvb = obs_list[b]
-            Rb, tb = poses_R.get(fb), poses_t.get(fb)
+            Rb = poses_R.get(fb)
             if Rb is None: continue
-            da = _bearing_in_world(Kinv, Ra, np.array([uva], dtype=float))[0]
-            db = _bearing_in_world(Kinv, Rb, np.array([uvb], dtype=float))[0]
+            da = _bearing_in_world(Kinv, Ra, np.array([uva], float))[0]
+            db = _bearing_in_world(Kinv, Rb, np.array([uvb], float))[0]
             cosang = np.clip(da @ db, -1.0, 1.0)
             ang = float(np.degrees(np.arccos(cosang)))
             if ang > best[0]:
                 best = (ang, (fa, fb, uva, uvb))
     return best
+
 
 # ============================= Track DB ==============================
 
@@ -137,7 +147,7 @@ class TrackDB:
     def __init__(self, K: np.ndarray, cfg: SfMConfig):
         self.points3d: List[Optional[np.ndarray]] = []
         self.state: List[str] = []  # 'tentative' | 'ok' | 'dead'
-        self.obs: DefaultDict[int, List[Tuple[int, Tuple[float,float]]]] = defaultdict(list)  # gi -> [(frame,(u,v)),...]
+        self.obs: DefaultDict[int, List[Tuple[int, Tuple[float, float]]]] = defaultdict(list)
         self.K = K
         self.Kinv = np.linalg.inv(K)
         self.cfg = cfg
@@ -148,59 +158,69 @@ class TrackDB:
         self.state.append('tentative')
         return gi
 
-    def set_point(self, gi: int, X: np.ndarray):
-        self.points3d[gi] = X
-
-    def add_obs(self, gi: int, frame: int, uv: Tuple[float,float]):
+    def add_obs(self, gi: int, frame: int, uv: Tuple[float, float]):
         self.obs[gi].append((frame, (float(uv[0]), float(uv[1]))))
 
     def promote_points(self, poses_R: Dict[int, np.ndarray], poses_t: Dict[int, np.ndarray]):
-        """Promote tentative points to 'ok' using multiview parallax + reprojection median, otherwise kill."""
         cfg = self.cfg
         for gi in range(len(self.points3d)):
             if self.state[gi] != 'tentative':
                 continue
             ob = self.obs.get(gi, [])
             if len(ob) < cfg.POINT_PROMOTION_MIN_OBS:
-                # keep tentative for now
                 continue
 
-            # choose best-parallax pair and retriangulate
+            # 1) Best-parallax retriangulation
             max_par, pair = _pairwise_max_parallax_deg(self.Kinv, poses_R, poses_t, ob)
-            if (pair is None) or (max_par < cfg.POINT_MIN_MULTIVIEW_PARALLAX_DEG):
-                # too little geometry -> drop
-                self.points3d[gi] = None
-                self.state[gi] = 'dead'
-                continue
-
-            fa, fb, uva, uvb = pair
-            Ra, ta = poses_R[fa], poses_t[fa]
-            Rb, tb = poses_R[fb], poses_t[fb]
-            X = _triangulate(self.K, Ra, ta, Rb, tb,
-                             np.array([uva], dtype=np.float32),
-                             np.array([uvb], dtype=np.float32))[0]
-
-            # check depths across views
-            pos_ok = 0
-            repro_all = []
-            for f, uv in ob:
-                R, t = poses_R.get(f), poses_t.get(f)
-                if R is None:
-                    continue
-                z = (R @ X.reshape(3,1) + t)[2,0]
-                if z > 0: pos_ok += 1
-                err = _reproj_err(self.K, R, t, X.reshape(1,3), np.array([uv], dtype=float))[0]
-                repro_all.append(err)
-
-            if (len(repro_all) == 0) or (np.median(repro_all) > cfg.POINT_MAX_MULTIVIEW_REPROJ) \
-               or (pos_ok / max(1,len(ob)) < cfg.POINT_REQUIRE_POSITIVE_DEPTH_RATIO):
-                self.points3d[gi] = None
-                self.state[gi] = 'dead'
-                continue
-
-            # Accept point
-            self.points3d[gi] = X
-            self.state[gi] = 'ok'
+            accept = False
+            if pair is not None and max_par >= cfg.POINT_MIN_MULTIVIEW_PARALLAX_DEG:
+                fa, fb, uva, uvb = pair
+                Ra, ta = poses_R[fa], poses_t[fa]
+                Rb, tb = poses_R[fb], poses_t[fb]
+                X = _triangulate(self.K, Ra, ta, Rb, tb,
+                                 np.array([uva], np.float32),
+                                 np.array([uvb], np.float32))[0]
+                pos_ok = 0
+                repro_all = []
+                for f, uv in ob:
+                    R, t = poses_R.get(f), poses_t.get(f)
+                    if R is None: continue
+                    z = (R @ X.reshape(3, 1) + t)[2, 0]
+                    if z > 0: pos_ok += 1
+                    repro_all.append(_reproj_err(self.K, R, t, X.reshape(1, 3), np.array([uv], float))[0])
+                if len(repro_all) and np.median(repro_all) <= cfg.POINT_MAX_MULTIVIEW_REPROJ and \
+                   pos_ok / len(ob) >= cfg.POINT_REQUIRE_POSITIVE_DEPTH_RATIO:
+                    self.points3d[gi] = X
+                    self.state[gi] = 'ok'
+                    continue  # done
+            # 2) Low-parallax fallback (sehr streng, aber erlaubt kleine Winkel)
+            if len(ob) >= cfg.LOWPAR_FALLBACK_MIN_OBS:
+                # nimm erstes/letztes (oder weit auseinander) Paar als Fallback
+                fa, uva = ob[0]
+                fb, uvb = ob[-1]
+                Ra, ta = poses_R.get(fa), poses_t.get(fa)
+                Rb, tb = poses_R.get(fb), poses_t.get(fb)
+                if (Ra is not None) and (Rb is not None):
+                    X = _triangulate(self.K, Ra, ta, Rb, tb,
+                                     np.array([uva], np.float32),
+                                     np.array([uvb], np.float32))[0]
+                    pos_ok = 0
+                    repro_all = []
+                    for f, uv in ob:
+                        R, t = poses_R.get(f), poses_t.get(f)
+                        if R is None: continue
+                        z = (R @ X.reshape(3, 1) + t)[2, 0]
+                        if z > 0: pos_ok += 1
+                        repro_all.append(_reproj_err(self.K, R, t, X.reshape(1, 3), np.array([uv], float))[0])
+                    if len(repro_all) >= cfg.LOWPAR_FALLBACK_MIN_OBS and \
+                       np.median(repro_all) <= cfg.LOWPAR_FALLBACK_MAX_MEDIAN_REPROJ and \
+                       pos_ok / len(ob) >= cfg.LOWPAR_FALLBACK_MIN_POSDEPTH_RATIO:
+                        self.points3d[gi] = X
+                        self.state[gi] = 'ok'
+                        continue
+            # sonst verwerfen
+            self.points3d[gi] = None
+            self.state[gi] = 'dead'
 
     def valid_points_array(self) -> np.ndarray:
         return np.array([p for p, st in zip(self.points3d, self.state) if (p is not None and st == 'ok')],
@@ -230,12 +250,12 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
     log(f"[sfm] size={W}x{H}")
 
     # metrics
-    _acc_repro = []  # frame-wise mean reproj (accepted PnP inliers)
+    _acc_repro = []
     _rej_count = 0
 
     cfg = config or SfMConfig()
 
-    # Unpack cfg (short names)
+    # Unpack cfg
     MIN_MATCHES_INIT = cfg.MIN_MATCHES_INIT
     MIN_FLOW_PX = cfg.MIN_FLOW_PX
     MIN_INLIERS_INIT = cfg.MIN_INLIERS_INIT
@@ -258,7 +278,13 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
     # --------- Init-Paar lokal um die Mitte ---------------------------
     N = len(shapes)
     mid = (cfg.INIT_WINDOW_CENTER if cfg.INIT_WINDOW_CENTER is not None else (N // 2))
-    w = min(INIT_WINDOW_FRAMES, max(10, N // 3))
+
+    if cfg.INIT_WINDOW_RATIO is not None:
+        w_candidate = max(1, int(round(N * float(cfg.INIT_WINDOW_RATIO))))
+    else:
+        w_candidate = max(10, N // 3)
+    w = min(INIT_WINDOW_FRAMES, w_candidate)
+
     def in_init_window(i, j):
         return (abs(j - i) <= INIT_MAX_SPAN) and (min(i, j) >= mid - w) and (max(i, j) <= mid + w)
 
@@ -286,8 +312,8 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
         # cheirality score
         ch = 0
         if inliers > 0:
-            X = _triangulate(K, np.eye(3), np.zeros((3,1)), R, t, p1[inl_mask], p2[inl_mask])
-            ch = int((_in_front(np.eye(3), np.zeros((3,1)), X) &
+            X = _triangulate(K, np.eye(3), np.zeros((3, 1)), R, t, p1[inl_mask], p2[inl_mask])
+            ch = int((_in_front(np.eye(3), np.zeros((3, 1)), X) &
                       _in_front(R, t, X)).sum())
         score = inliers + 2.0 * ch
         stats.append((i, j, len(m), flow, inliers, ch, score))
@@ -470,8 +496,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
         remaining.remove(fi)
         prog(int(60 + 25 * len(visited) / len(all_frames)), f"SfM – Pose {fi}")
 
-        # ---------- Local stereo seeding (frische Punkte vorne) --------
-        # Verhindere "Kegel": nur neue Punkte, wenn Frame median-reproj gut ist
+        # ---------- Local stereo seeding --------------------------------
         allow_new_points = (med_repro is None) or (med_repro <= cfg.FRAME_MAX_MEDIAN_REPROJ_FOR_NEW_POINTS)
 
         neighbors = []
@@ -492,7 +517,6 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
                     continue
                 errA = _reproj_err(K, poses_R[a], poses_t[a], XA, pts_a)
                 errB = _reproj_err(K, poses_R[b], poses_t[b], XA, pts_b)
-                # Parallax-Filter strenger
                 raysA = _bearing_in_world(np.linalg.inv(K), poses_R[a], pts_a)
                 raysB = _bearing_in_world(np.linalg.inv(K), poses_R[b], pts_b)
                 cosang = np.clip(np.sum(raysA * raysB, axis=1), -1, 1)
@@ -515,7 +539,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
                         TDB.add_obs(gi, a, uvA)
                         TDB.add_obs(gi, b, uvB)
 
-        # ---------- Triangulation (kombiniert über alle Anker) ---------
+        # ---------- Triangulation (alle Anker) --------------------------
         if allow_new_points:
             pairs_all, ptsA_all, ptsF_all, ANCH_all = [], [], [], []
             for a in anchors:
@@ -552,7 +576,6 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
                         continue
                     errA = _reproj_err(K, poses_R[a], poses_t[a], XA, ptsA_np[idx])
                     errF = _reproj_err(K, poses_R[fi], poses_t[fi], XA, ptsF_np[idx])
-                    # Parallax angle check
                     raysA = _bearing_in_world(np.linalg.inv(K), poses_R[a], ptsA_np[idx])
                     raysF = _bearing_in_world(np.linalg.inv(K), poses_R[fi], ptsF_np[idx])
                     cosang = np.clip(np.sum(raysA * raysF, axis=1), -1, 1)
@@ -579,7 +602,42 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
                             TDB.add_obs(gi, qa[0], tuple(uvA))
                             TDB.add_obs(gi, fi, tuple(uvF))
 
-        # ------- Nach jedem Frame: Punkte befördern / aussortieren -----
+        # ------- Nach jedem Frame: Punkte befördern --------------------
+        TDB.promote_points(poses_R, poses_t)
+
+    # ---- Optional: Densify-Pass --------------------------------------
+    if cfg.DENSIFY_ENABLE and len(poses_R) >= 2:
+        vis = sorted(poses_R.keys())
+        for ia, a in enumerate(vis):
+            for b in vis[ia+1:]:
+                if abs(b - a) > cfg.DENSIFY_MAX_SPAN:
+                    continue
+                mlist = matches.get((a, b), [])
+                if len(mlist) < cfg.DENSIFY_MIN_MATCHES:
+                    continue
+                pts_a, pts_b = _idx2pts(mlist, keypoints[a], keypoints[b])
+                XA = _triangulate(K, poses_R[a], poses_t[a], poses_R[b], poses_t[b], pts_a, pts_b)
+                front = _in_front(poses_R[a], poses_t[a], XA) & _in_front(poses_R[b], poses_t[b], XA)
+                if not np.any(front):
+                    continue
+                errA = _reproj_err(K, poses_R[a], poses_t[a], XA, pts_a)
+                errB = _reproj_err(K, poses_R[b], poses_t[b], XA, pts_b)
+                raysA = _bearing_in_world(np.linalg.inv(K), poses_R[a], pts_a)
+                raysB = _bearing_in_world(np.linalg.inv(K), poses_R[b], pts_b)
+                ang = np.degrees(np.arccos(np.clip(np.sum(raysA * raysB, axis=1), -1, 1)))
+                good = front & (errA <= cfg.DENSIFY_MAX_REPROJ) & (errB <= cfg.DENSIFY_MAX_REPROJ) & (ang >= cfg.DENSIFY_MIN_PARALLAX_DEG)
+                if not np.any(good):
+                    continue
+                for mm, keep, X, uvA, uvB in zip(mlist, good, XA, pts_a, pts_b):
+                    if not keep:
+                        continue
+                    qa = (a, mm.queryIdx); qb = (b, mm.trainIdx)
+                    if qa in track3d or qb in track3d:
+                        continue
+                    gi = TDB.new_point(X)
+                    track3d[qa] = gi; track3d[qb] = gi
+                    TDB.add_obs(gi, a, uvA); TDB.add_obs(gi, b, uvB)
+        # Nachverdichtet: erneut promoten
         TDB.promote_points(poses_R, poses_t)
 
     # --------- output --------------------------------------------------
@@ -595,7 +653,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
     metrics = {
         'num_points': int(len(pts)),
         'frames_used': int(len(poses_R)),
-        'avg_reproj': (float(np.mean(_acc_repro)) if len(_acc_repro)>0 else None),
+        'avg_reproj': (float(np.mean(_acc_repro)) if len(_acc_repro) > 0 else None),
         'rejected_frames': int(_rej_count),
         'init_pair': tuple(map(int, (i0, j0)))
     }
@@ -610,36 +668,32 @@ def run_sfm_multi(keypoints, descriptors, shapes, pairs, matches, K,
                   n_runs: int = 5,
                   on_log=None, on_progress=None,
                   poses_out_dir: Optional[str] = None):
-    """Run SfM multiple times with different init windows and pick the best.
-    Scoring favors many VALIDATED points, many frames, and low reprojection.
-
-    Returns: pts, poses_R, poses_t, report(dict)
-    """
+    """Run SfM multiple times with different init windows and pick the best."""
     def log(m): on_log and on_log(m)
-    def prog(p,s): on_progress and on_progress(p,s)
+    def prog(p, s): on_progress and on_progress(p, s)
 
     N = len(shapes)
-    centers = np.linspace(N*0.15, N*0.85, num=max(2, min(n_runs, 5)), dtype=int)
+    centers = np.linspace(N * 0.15, N * 0.85, num=max(2, min(n_runs, 5)), dtype=int)
     extra = n_runs - len(centers)
     rng = np.random.default_rng(42)
     if extra > 0:
-        jitter = np.clip(rng.normal(0, N*0.05, size=extra).astype(int), -N//6, N//6)
-        extra_centers = np.clip(rng.integers(0, N, size=extra) + jitter, 0, N-1)
+        jitter = np.clip(rng.normal(0, N * 0.05, size=extra).astype(int), -N // 6, N // 6)
+        extra_centers = np.clip(rng.integers(0, N, size=extra) + jitter, 0, N - 1)
         centers = list(centers) + list(extra_centers)
 
     trials = []
     for r, c in enumerate(centers):
-        cfg = SfMConfig(INIT_WINDOW_CENTER=int(c))  # rest defaults
+        cfg = SfMConfig(INIT_WINDOW_CENTER=int(c))
         try:
             pts, Rdict, tdict, metrics = run_sfm(
                 keypoints, descriptors, shapes, pairs, matches, K,
                 on_log=lambda m, r=r: log(f"[run {r+1}/{len(centers)}] {m}"),
-                on_progress=lambda p, s, r=r: prog(int( (r/(len(centers))) * 90 + p/len(centers) * 90/100 * 100 ), f"Ensemble {r+1}/{len(centers)} – {s}"),
+                on_progress=lambda p, s, r=r: prog(int((r / (len(centers))) * 90 + p / len(centers) * 90 / 100 * 100),
+                                                  f"Ensemble {r+1}/{len(centers)} – {s}"),
                 poses_out_dir=None,
                 config=cfg, return_metrics=True
             )
-            # Heuristic score (favor validated 3D points)
-            score = metrics['num_points'] + 50*metrics['frames_used'] - 200*(metrics['avg_reproj'] or 5.0) - 20*metrics['rejected_frames']
+            score = metrics['num_points'] + 50 * metrics['frames_used'] - 200 * (metrics['avg_reproj'] or 5.0) - 20 * metrics['rejected_frames']
             trials.append(dict(idx=r, center=int(c), pts=pts, R=Rdict, t=tdict, metrics=metrics, score=float(score)))
             log(f"[ensemble] run {r+1}: score={score:.1f}, points={metrics['num_points']}, frames={metrics['frames_used']}, avg_reproj={(metrics['avg_reproj'] or float('nan')):.2f}")
         except Exception as e:
@@ -657,7 +711,7 @@ def run_sfm_multi(keypoints, descriptors, shapes, pairs, matches, K,
     report = dict(
         best_score=float(best['score']),
         best_center=int(best['center']),
-        best_init_pair=tuple(map(int, metrics.get('init_pair', (-1,-1)))),
+        best_init_pair=tuple(map(int, metrics.get('init_pair', (-1, -1)))),
         runs=[dict(center=int(t['center']), score=float(t['score']), metrics=t['metrics']) for t in trials]
     )
     prog(98, "Ensemble – pick best")

@@ -114,10 +114,10 @@ def sift_extract(images: List[str], out_dir: str,
 
     sift = cv.SIFT_create(
         nfeatures=14000,
-        nOctaveLayers=3,
-        contrastThreshold=0.02,
-        edgeThreshold=10,
-        sigma=1.6
+        nOctaveLayers=5,
+        contrastThreshold=0.01,
+        edgeThreshold=14,
+        sigma=1.1
     )
 
     keypoints, descriptors, shapes = [], [], []
