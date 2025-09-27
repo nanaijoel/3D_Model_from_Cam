@@ -1,5 +1,8 @@
 # meshing.py
 import open3d as o3d, numpy as np, os
+from typing import Optional
+
+# ---------- Basis: Point-Cloud speichern ----------
 
 def _median_nn_distance(points_xyz: np.ndarray) -> float:
     if len(points_xyz) < 3:
@@ -25,7 +28,6 @@ def save_point_cloud(points_xyz: np.ndarray, out_path: str, filter_min_points: i
         nn_med = _median_nn_distance(points_xyz)
         voxel = max(1e-4, 0.5 * nn_med)            # adaptiv; nicht zu grob, um dünne Bereiche zu erhalten
         pcd = pcd.voxel_down_sample(voxel_size=voxel)
-
         # weniger aggressiv in dünnen Regionen
         pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=12, std_ratio=2.0)
 
@@ -33,7 +35,7 @@ def save_point_cloud(points_xyz: np.ndarray, out_path: str, filter_min_points: i
     on_progress and on_progress(100, "Save PLY")
     return out_path
 
-# --- add below save_point_cloud(...) ---
+# ---------- Poisson/Alpha: Hilfsfunktionen ----------
 
 def _diag_from_pcd(pcd):
     bb = pcd.get_axis_aligned_bounding_box()
@@ -112,6 +114,8 @@ def _transfer_vertex_colors(mesh, pcd, k=1):
     mesh.vertex_colors = o3d.utility.Vector3dVector(cols)
     return mesh
 
+# ---------- Hauptfunktion: Poisson/Alpha aus PLY ----------
+
 def reconstruct_solid_mesh_from_ply(
     ply_in: str,
     mesh_out: str,
@@ -175,4 +179,52 @@ def reconstruct_solid_mesh_from_ply(
         raise RuntimeError(f"Failed to write mesh: {mesh_out}")
     on_log and on_log(f"[mesh] solid saved -> {mesh_out} (V={len(mesh.vertices)}, F={len(mesh.triangles)})")
     on_progress and on_progress(100, "Watertight Mesh")
+    return mesh_out
+
+# ---------- NEU: Voxel-Closing (zusätzliches geschlossenes Mesh) ----------
+
+def voxel_close_mesh(mesh_in: str,
+                     mesh_out: str,
+                     grid: int = 180,
+                     smooth: int = 4,
+                     simplify: int = 0,
+                     on_log: Optional[callable] = None,
+                     on_progress: Optional[callable] = None) -> str:
+    try:
+        import trimesh
+    except Exception as e:
+        raise RuntimeError("Trimesh wird benötigt: pip install trimesh") from e
+
+    on_log and on_log(f"[mesh] voxel-close: load mesh -> {mesh_in}")
+    tm = trimesh.load(mesh_in, process=False)
+    if tm.vertices is None or len(tm.vertices) == 0:
+        raise RuntimeError("Input mesh empty.")
+
+    ext = (tm.bounds[1] - tm.bounds[0])
+    diag = float(np.linalg.norm(ext))
+    pitch = diag / max(16, int(grid))
+    on_log and on_log(f"[mesh] voxel-close: grid={grid}, pitch≈{pitch:.5f}")
+
+    vox = tm.voxelized(pitch=pitch)
+    vox = vox.fill(method='holes')
+    tm_vox = vox.marching_cubes
+
+    # -> Open3D für Feinschliff + Speichern
+    verts = o3d.utility.Vector3dVector(np.asarray(tm_vox.vertices, float))
+    faces = o3d.utility.Vector3iVector(np.asarray(tm_vox.faces, np.int32))
+    o3m = o3d.geometry.TriangleMesh(verts, faces)
+    o3m = _mesh_cleanup(o3m)
+    if int(smooth) > 0:
+        o3m = _mesh_smooth(o3m, iters=int(smooth))
+    if int(simplify) > 0:
+        o3m = _mesh_simplify(o3m, target_tris=int(simplify))
+    o3m.compute_vertex_normals()
+
+    os.makedirs(os.path.dirname(mesh_out) or ".", exist_ok=True)
+    ok = o3d.io.write_triangle_mesh(mesh_out, o3m)
+    if not ok:
+        raise RuntimeError(f"Failed to write voxel-closed mesh: {mesh_out}")
+
+    on_log and on_log(f"[mesh] voxel-closed saved -> {mesh_out} (V={len(o3m.vertices)}, F={len(o3m.triangles)})")
+    on_progress and on_progress(100, "Voxel-Closed Mesh")
     return mesh_out

@@ -8,9 +8,7 @@ from frame_extractor import extract_and_save_frames
 from feature_extraction import sift_extract
 from image_matching import build_pairs
 from sfm_incremental import run_sfm, run_sfm_multi, SfMConfig
-# from depth_mvs import run_depth_mvs  # optional
-# from meshing import save_point_cloud
-from meshing import save_point_cloud, reconstruct_solid_mesh_from_ply
+from meshing import save_point_cloud, reconstruct_solid_mesh_from_ply, voxel_close_mesh
 from camera_pose_plot import plot_camera_poses
 
 
@@ -58,13 +56,6 @@ class PipelineRunner:
         os.makedirs(poses_dir, exist_ok=True)
 
         # 5) S f M
-        #
-        #   SFM_ENSEMBLE_RUNS (int, default 1)  -> run_sfm_multi
-        #   SFM_INIT_RATIO (float, default 0.5) -> Halbbreite = ratio * N (GUI: "halbieren")
-        #   SFM_INIT_MAX_SPAN (int, default 6)  -> max |j - i| fürs Startpaar
-        #   SFM_INIT_FRAMES_CAP (int, default 1e9) -> Cap der Halbbreite
-        #   SFM_FRONT_FRIENDLY (bool, default True) -> frontfreundliche Promotion
-        #   SFM_DENSIFY (bool, default True) -> Densify-Pass am Ende
         ensemble_runs = int(os.getenv("SFM_ENSEMBLE_RUNS", "1"))
         init_ratio = float(os.getenv("SFM_INIT_RATIO", "0.5"))
         init_max_span = int(os.getenv("SFM_INIT_MAX_SPAN", "6"))
@@ -79,7 +70,6 @@ class PipelineRunner:
             DENSIFY_ENABLE=densify_enable,
         )
 
-
         if front_friendly:
             cfg.POINT_PROMOTION_MIN_OBS = int(os.getenv("SFM_POINT_PROMOTION_MIN_OBS", "5"))
             cfg.POINT_MIN_MULTIVIEW_PARALLAX_DEG = float(os.getenv("SFM_POINT_MIN_PARALLAX_DEG", "3.0"))
@@ -88,10 +78,8 @@ class PipelineRunner:
             cfg.TRI_MIN_PARALLAX_DEG = float(os.getenv("SFM_TRI_MIN_PARALLAX_DEG", "3.0"))
             cfg.SEED_SPAN = int(os.getenv("SFM_SEED_SPAN", "4"))
             cfg.SEED_MIN_INL = int(os.getenv("SFM_SEED_MIN_INL", "35"))
-            # Frame-Gate für neue Punkte nicht zu hart:
             cfg.FRAME_MAX_MEDIAN_REPROJ_FOR_NEW_POINTS = float(os.getenv("SFM_FRAME_MAX_MEDIAN_REPROJ", "2.8"))
 
-        # Logging der wichtigsten Schalter
         log(f"[pipeline] SFM cfg: INIT_WINDOW_RATIO={cfg.INIT_WINDOW_RATIO}, "
             f"INIT_MAX_SPAN={cfg.INIT_MAX_SPAN}, DENSIFY={cfg.DENSIFY_ENABLE}, "
             f"FRONT_FRIENDLY={front_friendly}, ENSEMBLE_RUNS={ensemble_runs}")
@@ -102,9 +90,8 @@ class PipelineRunner:
                 kps, descs, shapes, pairs, matches, K,
                 n_runs=ensemble_runs,
                 on_log=log, on_progress=prog,
-                poses_out_dir=poses_dir  # Posen des besten Laufs speichern
+                poses_out_dir=poses_dir
             )
-            # Mini-Report ins Log
             log(f"[pipeline] ensemble: best_center={report.get('best_center')}, "
                 f"best_init_pair={report.get('best_init_pair')}, best_score={report.get('best_score'):.1f}")
         else:
@@ -115,7 +102,7 @@ class PipelineRunner:
                 config=cfg
             )
 
-        # ---------------- 5b) Kamera-Plot -------
+        # 5b) Kamera-Plot (optional)
         npz_path = os.path.join(poses_dir, "camera_poses.npz")
         if os.path.isfile(npz_path):
             sfm_dir = getattr(paths, "sfm", os.path.join(paths.root, "sfm"))
@@ -127,18 +114,14 @@ class PipelineRunner:
             except Exception as e:
                 log(f"[pipeline] WARN: camera pose plot failed: {e}")
 
-        # ---------------- 6) Depth/MVS (optional)
-        # run_depth_mvs(paths.raw_frames, pts, paths.depth, log, prog)
-
-        # ---------------- 7) Mesh / Save -------
+        # 6) Mesh / Save (sparse)
         ply_path = os.path.join(paths.mesh, "reconstruction_sparse.ply")
         save_point_cloud(pts, ply_path, on_log=log, on_progress=prog)
         log(f"[pipeline] saved sparse cloud -> {ply_path}")
 
-
-
-        # ---------------- 8) Watertight Mesh (optional via ENV) -------
+        # 7) Watertight Mesh (Poisson/Alpha, optional via ENV)
         solid_enable = _parse_bool(os.getenv("MESH_SOLID_ENABLE", "true"), True)
+        mesh_out = None
         if solid_enable:
             mesh_name = os.getenv("MESH_OUT_NAME", "mesh_solid_poisson.ply")
             mesh_out = os.path.join(paths.mesh, mesh_name)
@@ -170,5 +153,25 @@ class PipelineRunner:
                 on_log=log, on_progress=prog
             )
             log(f"[pipeline] solid mesh -> {mesh_out}")
+
+        # 8) NEU: Voxel-Closed Mesh zusätzlich erzeugen (optional)
+        voxel_enable = _parse_bool(os.getenv("MESH_VOXELCLOSE_ENABLE", "true"), True)
+        if voxel_enable and mesh_out is not None:
+            voxel_name = os.getenv("MESH_VOXEL_OUT_NAME", "mesh_voxel_closed.ply")
+            voxel_out = os.path.join(paths.mesh, voxel_name)
+            voxel_grid = int(os.getenv("MESH_VOXEL_GRID", "180"))       # Auflösung (~marching cubes)
+            voxel_smooth = int(os.getenv("MESH_VOXEL_SMOOTH", "4"))     # leicht glätten
+            voxel_simplify = int(os.getenv("MESH_VOXEL_SIMPLIFY", "0")) # optional decimation
+
+            try:
+                prog(97, "Voxel-Closed Mesh – start")
+                voxel_close_mesh(
+                    mesh_in=mesh_out, mesh_out=voxel_out,
+                    grid=voxel_grid, smooth=voxel_smooth, simplify=voxel_simplify,
+                    on_log=log, on_progress=prog
+                )
+                log(f"[pipeline] voxel-closed mesh -> {voxel_out}")
+            except Exception as e:
+                log(f"[pipeline] WARN: voxel-close failed: {e}")
 
         return ply_path, paths

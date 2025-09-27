@@ -3,10 +3,10 @@ import os, numpy as np, cv2 as cv
 from typing import Callable, List, Tuple, Dict, Optional
 
 # --- Matching-Parameter ------------------------------------------------
-RATIO = 0.80
-F_THRESH_NEAR = 1.0          # RANSAC-Threshold (px) für Nachbarn (step <= max_span)
-F_THRESH_WIDE = 1.2          # strenger für Loop-Closure/weite Paare
-MIN_INLIERS_NEAR = 50
+RATIO = 0.85
+F_THRESH_NEAR = 0.5          # RANSAC-Threshold (px) für Nachbarn (step <= max_span)
+F_THRESH_WIDE = 1.5         # strenger für Loop-Closure/weite Paare
+MIN_INLIERS_NEAR = 40
 MIN_INLIERS_WIDE = 120       # deutlich höher für robuste Loop-Closures
 
 def _knn(desc_a, desc_b, k=2):
