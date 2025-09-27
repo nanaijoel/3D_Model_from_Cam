@@ -9,7 +9,8 @@ from feature_extraction import sift_extract
 from image_matching import build_pairs
 from sfm_incremental import run_sfm, run_sfm_multi, SfMConfig
 # from depth_mvs import run_depth_mvs  # optional
-from meshing import save_point_cloud
+# from meshing import save_point_cloud
+from meshing import save_point_cloud, reconstruct_solid_mesh_from_ply
 from camera_pose_plot import plot_camera_poses
 
 
@@ -133,5 +134,41 @@ class PipelineRunner:
         ply_path = os.path.join(paths.mesh, "reconstruction_sparse.ply")
         save_point_cloud(pts, ply_path, on_log=log, on_progress=prog)
         log(f"[pipeline] saved sparse cloud -> {ply_path}")
+
+
+
+        # ---------------- 8) Watertight Mesh (optional via ENV) -------
+        solid_enable = _parse_bool(os.getenv("MESH_SOLID_ENABLE", "true"), True)
+        if solid_enable:
+            mesh_name = os.getenv("MESH_OUT_NAME", "mesh_solid_poisson.ply")
+            mesh_out = os.path.join(paths.mesh, mesh_name)
+
+            method = os.getenv("MESH_METHOD", "poisson")  # "poisson" | "alpha"
+            depth = int(os.getenv("MESH_DEPTH", "10"))
+            scale = float(os.getenv("MESH_SCALE", "1.1"))
+            no_linear_fit = _parse_bool(os.getenv("MESH_NO_LINEAR_FIT", "false"), False)
+            dens_q = float(os.getenv("MESH_DENS_Q", "0.02"))
+            alpha = float(os.getenv("MESH_ALPHA", "1.0"))
+            bbox_expand = float(os.getenv("MESH_BBOX_EXPAND", "0.03"))
+            pre_filter = _parse_bool(os.getenv("MESH_PRE_FILTER", "false"), False)
+            pre_filter_neighbors = int(os.getenv("MESH_PRE_FILTER_NEIGHBORS", "12"))
+            pre_filter_std = float(os.getenv("MESH_PRE_FILTER_STD", "2.0"))
+            voxel = float(os.getenv("MESH_VOXEL", "0.0"))
+            normals_k = int(os.getenv("MESH_NORMALS_K", "40"))
+            smooth = int(os.getenv("MESH_SMOOTH", "12"))
+            simplify = int(os.getenv("MESH_SIMPLIFY", "0"))
+            color_transfer = _parse_bool(os.getenv("MESH_COLOR_TRANSFER", "false"), False)
+
+            prog(96, "Watertight Mesh – start")
+            reconstruct_solid_mesh_from_ply(
+                ply_in=ply_path, mesh_out=mesh_out,
+                method=method, depth=depth, scale=scale, no_linear_fit=no_linear_fit,
+                dens_quantile=dens_q, alpha=alpha, bbox_expand=bbox_expand,
+                pre_filter=pre_filter, pre_filter_neighbors=pre_filter_neighbors, pre_filter_std=pre_filter_std,
+                voxel=voxel, normals_k=normals_k, smooth=smooth, simplify=simplify,
+                color_transfer=color_transfer,
+                on_log=log, on_progress=prog
+            )
+            log(f"[pipeline] solid mesh -> {mesh_out}")
 
         return ply_path, paths
