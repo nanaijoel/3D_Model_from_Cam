@@ -83,8 +83,10 @@ def _make_statue_mask(img_bgr: np.ndarray) -> np.ndarray:
     ell = (((X - cx)/rx)**2 + ((Y - cy)/ry)**2) <= 1.0
     central = np.zeros((h,w), np.uint8); central[ell] = 1
 
-    fg = fg * central
-
+    fg_central = fg * central
+    ratio = float(fg_central.sum()) / (float(fg.sum()) + 1e-6)
+    if ratio >= 0.55:
+        fg = fg_central
     # Morphology
     k = cv.getStructuringElement(cv.MORPH_RECT, (7,7))
     fg = cv.morphologyEx(fg, cv.MORPH_OPEN, k)
@@ -114,10 +116,10 @@ def sift_extract(images: List[str], out_dir: str,
 
     sift = cv.SIFT_create(
         nfeatures=14000,
-        nOctaveLayers=5,
-        contrastThreshold=0.01,
+        nOctaveLayers=3,
+        contrastThreshold=0.02,
         edgeThreshold=14,
-        sigma=1.1
+        sigma=1.2
     )
 
     keypoints, descriptors, shapes = [], [], []
@@ -137,7 +139,12 @@ def sift_extract(images: List[str], out_dir: str,
         mask = _make_statue_mask(img_bgr)
 
         # Detection just in mask
+        MIN_KP_MASKED = 1200
         kps, des = sift.detectAndCompute(proc, mask)
+        if (des is None) or (len(kps) < MIN_KP_MASKED):
+            kps2, des2 = sift.detectAndCompute(proc, None)
+            if des2 is not None and len(kps2) > 1.3 * max(1, len(kps)):
+                kps, des = kps2, des2
         des = _rootsift(des)
 
         keypoints.append(kps)
