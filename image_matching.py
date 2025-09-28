@@ -1,111 +1,159 @@
-# image_matching.py
-import os, numpy as np, cv2 as cv
-from typing import Callable, List, Tuple, Dict, Optional
+import os
+from typing import Callable, Dict, List, Tuple, Optional
 
-# --- Matching-Parameter ------------------------------------------------
-RATIO = 0.82
-F_THRESH_NEAR = 0.8          # RANSAC-Threshold (px) für Nachbarn
-F_THRESH_WIDE = 1.6          # für Loops
-MIN_INLIERS_NEAR = 20
-MIN_INLIERS_WIDE = 70
+import cv2 as cv
+import numpy as np
+import torch
 
-def _knn(desc_a, desc_b, k=2):
-    if desc_a is None or desc_b is None or len(desc_a) == 0 or len(desc_b) == 0:
-        return []
-    bf = cv.BFMatcher(cv.NORM_L2, crossCheck=False)
-    return bf.knnMatch(desc_a, desc_b, k=k)
+Pair = Tuple[int, int]
 
-def _ratio_filter(knn_list, ratio=RATIO):
-    out = []
-    for p in knn_list:
-        if len(p) == 2 and p[0].distance < ratio * p[1].distance:
-            out.append(p[0])
-    return out
 
-def _mutual_ratio(desc_a, desc_b, ratio=RATIO):
-    if desc_a is None or desc_b is None or len(desc_a) == 0 or len(desc_b) == 0:
-        return []
-    ab = _ratio_filter(_knn(desc_a, desc_b, 2), ratio)
-    ba = _ratio_filter(_knn(desc_b, desc_a, 2), ratio)
-    back = {m.queryIdx: m.trainIdx for m in ba}
-    return [m for m in ab if back.get(m.trainIdx, -1) == m.queryIdx]
+def _ratio_test(matches, ratio: float):
+    good = []
+    for m, n in matches:
+        if m.distance < ratio * n.distance:
+            good.append(m)
+    return good
 
-def _geom_ransac(kps_a, kps_b, matches, thr_px):
-    if not matches:
-        return []
-    pts_a = np.float32([kps_a[m.queryIdx].pt for m in matches])
-    pts_b = np.float32([kps_b[m.trainIdx].pt for m in matches])
-    F, mask = cv.findFundamentalMat(pts_a, pts_b, cv.FM_RANSAC,
-                                    ransacReprojThreshold=float(thr_px),
-                                    confidence=0.999)
-    if F is None or mask is None:
-        return []
-    mask = mask.ravel().astype(bool)
-    return [mm for mm, ok in zip(matches, mask) if ok]
 
-def build_pairs(descriptors: List[np.ndarray],
-                on_log: Optional[Callable[[str], None]] = None,
-                on_progress: Optional[Callable[[int, str], None]] = None,
-                save_dir: Optional[str] = None,
-                keypoints: Optional[List[List[cv.KeyPoint]]] = None,
-                # Graph-Parameter:
-                max_span: int = 6,
-                long_spans: Tuple[int, ...] = (),   # keine generischen Long-Spans
-                add_loop_closures: bool = True      # genau 1–2 robuste Loops
-                ) -> Tuple[List[Tuple[int, int]], Dict[Tuple[int, int], List[cv.DMatch]]]:
-
+def build_pairs(
+    descriptors: List[np.ndarray],
+    on_log: Optional[Callable[[str], None]] = None,
+    on_progress: Optional[Callable[[int, str], None]] = None,
+    save_dir: Optional[str] = None,
+    keypoints: Optional[List[List[cv.KeyPoint]]] = None,
+    meta: Optional[dict] = None
+) -> Tuple[List[Pair], Dict[Pair, List[cv.DMatch]]]:
+    """
+    MATCH_BACKEND == 'lightglue'  -> nutzt LightGlue (erwartet SuperPoint/DISK-ähnliche Deskriptoren)
+    sonst: klassisches BF + Ratio-Test.
+    """
     def log(m):  on_log and on_log(m)
-    def prog(v, s): on_progress and on_progress(int(v), s)
+    def prog(p, s): on_progress and on_progress(int(p), s)
+
+    backend = os.getenv("MATCH_BACKEND", "classic").lower()
+    ratio = float(os.getenv("MATCH_RATIO", "0.82"))
 
     N = len(descriptors)
-    if N < 2:
-        return [], {}
+    idxs = list(range(N))
 
-    # 1) Pair list (lokaler Ketten-Graph + wenige robuste Loop-Kandidaten)
-    pairs: List[Tuple[int, int]] = []
-    for i in range(N - 1):
-        pairs.append((i, i + 1))
-    for d in range(2, max_span + 1):
-        for i in range(0, N - d):
-            pairs.append((i, i + d))
+    # einfache Nachbarschafts-Paare (i,i+1..i+4) + ein paar Long-Range
+    pairs: List[Pair] = []
+    for i in idxs:
+        for d in range(1, 5):
+            j = i + d
+            if j < N:
+                pairs.append((i, j))
+    if N > 8:
+        for i in range(0, N, max(1, N // 8)):
+            j = N - 1
+            if i < j:
+                pairs.append((i, j))
 
-    if add_loop_closures and N >= 20:
-        # Wenige, feste, N-robuste Loop-Kandidaten
-        loop = {(0, N - 1)}
-        if N >= 60:
-            loop.add((N // 4, 3 * N // 4))
-        pairs.extend([(a, b) for (a, b) in loop if 0 <= a < b < N])
+    matches: Dict[Pair, List[cv.DMatch]] = {}
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
 
-    pairs = sorted(set(pairs))
-    log(f"[match] building pairs: N={N}, pairs={len(pairs)}")
-    prog(35, "Image Matching – build pairs")
+    # ---------------- LightGlue ----------------
+    if backend == "lightglue":
+        from lightglue import LightGlue
 
-    # 2) Matching
-    matches: Dict[Tuple[int, int], List[cv.DMatch]] = {}
+        # Device-Entscheidung wie bei Features
+        device_env = os.getenv("FEATURE_DEVICE", "").lower().strip()
+        device = device_env if device_env in ("cuda", "cpu") else ("cuda" if torch.cuda.is_available() else "cpu")
+        matcher = LightGlue(features="superpoint").to(device).eval()
+        log(f"[match] LightGlue on {device}")
 
-    for j, (a, b) in enumerate(pairs):
-        des_a = descriptors[a]; des_b = descriptors[b]
-        m = _mutual_ratio(des_a, des_b, ratio=RATIO)
+        assert keypoints is not None and meta is not None, \
+            "[match] LightGlue benötigt keypoints und meta (scores, image_size) von SuperPoint."
 
-        step = b - a
-        is_near = (step <= max_span)
-        thr = F_THRESH_NEAR if is_near else F_THRESH_WIDE
-        min_inl = MIN_INLIERS_NEAR if is_near else MIN_INLIERS_WIDE
+        sp_scores = meta.get("sp_scores", None)
+        sp_sizes  = meta.get("sp_sizes", None)
 
-        if keypoints is not None and len(m) >= 8:
-            m = _geom_ransac(keypoints[a], keypoints[b], m, thr_px=thr)
+        def to_torch_feat(i: int):
+            kps = keypoints[i]
+            des = descriptors[i]
+            if des is None or len(kps) == 0 or des.size == 0:
+                return None
 
-        if len(m) < min_inl:
-            m = []
+            # [N,2] (x,y)
+            kp_xy = np.array([[kp.pt[0], kp.pt[1]] for kp in kps], dtype=np.float32, order="C")
+            kp_xy_t = torch.from_numpy(kp_xy)[None, ...].to(device)               # [1,N,2]
 
-        matches[(a, b)] = m
+            # Deskriptoren: LightGlue erwartet [B,C,N]
+            desc = des.astype(np.float32, copy=False)                             # [N,C]
+            desc_t = torch.from_numpy(desc).T.contiguous()[None, ...].to(device)  # [1,C,N]
+
+            # Scores (optional aber hilfreich)
+            if sp_scores is not None and len(sp_scores) > i and sp_scores[i] is not None:
+                sc = torch.from_numpy(sp_scores[i].astype(np.float32, copy=False))[None, ...].to(device)  # [1,N]
+            else:
+                sc = torch.ones((1, kp_xy.shape[0]), dtype=torch.float32, device=device)
+
+            # Bildgröße [B,2] = [H,W]
+            if sp_sizes is not None and len(sp_sizes) > i and sp_sizes[i] is not None:
+                H, W = sp_sizes[i]
+            else:
+                # fallback: aus Keypoints grob abschätzen
+                H = int(max(1, max(int(k.pt[1]) for k in kps)))
+                W = int(max(1, max(int(k.pt[0]) for k in kps)))
+            size_t = torch.tensor([[int(H), int(W)]], dtype=torch.int32, device=device)  # [1,2]
+
+            return {
+                "keypoints": kp_xy_t,     # [1,N,2]
+                "descriptors": desc_t,    # [1,C,N]
+                "scores": sc,             # [1,N]
+                "image_size": size_t      # [1,2]
+            }
+
+        torch.set_grad_enabled(False)
+        with torch.no_grad():
+            for t, (i, j) in enumerate(pairs):
+                Fi = to_torch_feat(i)
+                Fj = to_torch_feat(j)
+                if Fi is None or Fj is None:
+                    matches[(i, j)] = []
+                else:
+                    out = matcher({"image0": Fi, "image1": Fj})
+                    m0 = out["matches0"][0].detach().cpu().numpy()  # [N0], Indexe in image1 oder -1
+                    valid = np.where(m0 >= 0)[0]
+                    if valid.size == 0:
+                        matches[(i, j)] = []
+                    else:
+                        dj = m0[valid]
+                        ms = [cv.DMatch(_queryIdx=int(qi), _trainIdx=int(int(tj)), _imgIdx=0, _distance=0.0)
+                              for qi, tj in zip(valid.tolist(), dj.tolist())]
+                        matches[(i, j)] = ms
+
+                if save_dir:
+                    arr = np.array([[m.queryIdx, m.trainIdx] for m in matches[(i, j)]], dtype=np.int32)
+                    np.savez_compressed(os.path.join(save_dir, f"match_{i:04d}_{j:04d}.npz"),
+                                        idx_i=i, idx_j=j, matches=arr)
+                if N:
+                    prog(40 + (t + 1) / max(1, len(pairs)) * 15, "Image Matching (lightglue)")
+        return pairs, matches
+
+    # ---------------- Klassisch (BF + Ratio) ----------------
+    log("[match] classic BF matcher")
+    bf = cv.BFMatcher(cv.NORM_L2, crossCheck=False)
+
+    for t, (i, j) in enumerate(pairs):
+        di = descriptors[i]; dj = descriptors[j]
+        if di is None or dj is None or len(di) == 0 or len(dj) == 0:
+            matches[(i, j)] = []
+            if N:
+                prog(40 + (t + 1) / max(1, len(pairs)) * 15, "Image Matching (classic)")
+            continue
+
+        knn = bf.knnMatch(di, dj, k=2)
+        good = _ratio_test(knn, ratio)
+        matches[(i, j)] = good
 
         if save_dir:
-            os.makedirs(save_dir, exist_ok=True)
-            np.savez(os.path.join(save_dir, f"matches_{a:04d}_{b:04d}.npz"),
-                     a=np.int32([mm.queryIdx for mm in m]),
-                     b=np.int32([mm.trainIdx for mm in m]))
-        log(f"[match] ({a:04d},{b:04d}) → inliers={len(m)} (step={step})")
-        prog(40 + int((j + 1) / max(1, len(pairs)) * 10), "Image Matching")
+            np.savez_compressed(os.path.join(save_dir, f"match_{i:04d}_{j:04d}.npz"),
+                                idx_i=i, idx_j=j,
+                                matches=np.array([[m.queryIdx, m.trainIdx] for m in good], dtype=np.int32))
+        if N:
+            prog(40 + (t + 1) / max(1, len(pairs)) * 15, "Image Matching (classic)")
 
     return pairs, matches
