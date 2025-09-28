@@ -7,7 +7,7 @@ features:
   backend: superpoint          # superpoint | sift
   device: cuda                 # cuda | cpu  (muss zu Matching-Device passen)
   use_mask: false
-  max_kp: 16000
+  max_kp: 15000
   debug_every: 0               # 0 = aus; z.B. 30 speichert jede 30. Maske
 
 # --- Matching ---

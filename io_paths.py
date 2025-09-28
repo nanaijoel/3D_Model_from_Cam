@@ -8,10 +8,8 @@ class ProjectPaths:
     raw_frames: str
     features: str
     matches: str
-    sfm: str
-    depth: str
     mesh: str
-    logs: str
+    sfm: str
 
 def make_project_paths(base_dir: str, project_name: str) -> ProjectPaths:
     root = os.path.join(base_dir, "projects", project_name)
@@ -21,9 +19,7 @@ def make_project_paths(base_dir: str, project_name: str) -> ProjectPaths:
         "features": os.path.join(root, "features"),
         "matches": os.path.join(root, "matches"),
         "sfm": os.path.join(root, "sfm"),
-        "depth": os.path.join(root, "depth"),
         "mesh": os.path.join(root, "mesh"),
-        "logs": os.path.join(root, "logs"),
     }
     for p in paths.values():
         os.makedirs(p, exist_ok=True)
