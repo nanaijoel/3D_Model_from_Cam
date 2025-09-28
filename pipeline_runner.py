@@ -7,7 +7,8 @@ from frame_extractor import extract_and_save_frames
 from feature_extraction import extract_features
 from image_matching import build_pairs
 from sfm_incremental import run_sfm, SfMConfig
-from meshing import save_point_cloud  # keine Mesh-Rekonstruktion!
+from meshing import save_point_cloud, reconstruct_solid_mesh_from_ply, voxel_close_mesh
+
 
 # ---------------------- config utils ----------------------
 
@@ -162,5 +163,39 @@ class PipelineRunner:
         log(f"[sfm] raw_points(after validation)={points3d.shape[0]:d}")
         log(f"[ui] Fertig: {sparse_ply}")
 
-        # (Kein Meshing, keine weiteren Schritte)
+        # 7) Meshing (simpel, ohne Config)
+        mesh_dir = os.path.join(paths.root, "mesh")
+        os.makedirs(mesh_dir, exist_ok=True)
+
+        # 7a) Poisson-Mesh
+        solid_mesh = os.path.join(mesh_dir, "solid_mesh_poisson.ply")
+        log("[mesh] reconstruct solid mesh (poisson)")
+        try:
+            reconstruct_solid_mesh_from_ply(
+                sparse_ply, solid_mesh,
+                method="poisson",
+                depth=10, scale=1.1, no_linear_fit=False,
+                dens_quantile=0.015,
+                bbox_expand=0.03,
+                pre_filter=False, voxel=0.0,
+                normals_k=40, smooth=16, simplify=0,
+                color_transfer=False,
+                on_log=log, on_progress=prog
+            )
+            log(f"[ui] Solid mesh: {solid_mesh}")
+        except Exception as e:
+            log(f"[mesh] solid reconstruction failed: {e}")
+
+        # 7b) Voxel-Closed aus dem Poisson-Mesh
+        voxel_mesh = os.path.join(mesh_dir, "voxel_closed_mesh.ply")
+        log("[mesh] voxel-close mesh (make fully closed volume)")
+        try:
+            voxel_close_mesh(
+                solid_mesh, voxel_mesh,
+                grid=180, smooth=16, simplify=0,
+                on_log=log, on_progress=prog
+            )
+            log(f"[ui] Voxel-closed mesh: {voxel_mesh}")
+        except Exception as e:
+            log(f"[mesh] voxel_close failed: {e}")
         return sparse_ply, paths

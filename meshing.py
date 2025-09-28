@@ -1,72 +1,272 @@
 # meshing.py
 import os
-import numpy as np
 from typing import Optional
+import numpy as np
 
-# ---------- Minimal: Point-Cloud speichern (ohne Filter/Downsample) ----------
+import open3d as o3d
 
-def _write_ply_ascii_xyz(points_xyz: np.ndarray, out_path: str) -> None:
-    """Schreibt eine reine XYZ-ASCII-PLY ohne jegliche Nachbearbeitung."""
-    pts = np.asarray(points_xyz, dtype=np.float64).reshape(-1, 3)
+# ---------- Basis: Point-Cloud speichern ----------
+
+def _median_nn_distance(points_xyz: np.ndarray) -> float:
+    if len(points_xyz) < 3:
+        return 0.01
+    try:
+        from scipy.spatial import cKDTree
+        idx = np.random.choice(len(points_xyz), size=min(4000, len(points_xyz)), replace=False)
+        tree = cKDTree(points_xyz)
+        d, _ = tree.query(points_xyz[idx], k=2)
+        return float(np.median(d[:, 1]))
+    except Exception:
+        bb = points_xyz.max(0) - points_xyz.min(0)
+        diag = float(np.linalg.norm(bb))
+        return max(1e-3, diag / max(300.0, len(points_xyz) ** (1 / 3)))
+
+def save_point_cloud(points_xyz: np.ndarray, out_path: str, filter_min_points: int = 1000,
+                     on_log=None, on_progress=None):
+    """
+    Speichert eine Punktwolke als PLY (mit optionalem leichtem Downsample/Outlier-Filter).
+    """
+    on_log and on_log(f"[mesh] save point cloud -> {out_path}")
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write("ply\nformat ascii 1.0\n")
-        f.write(f"element vertex {len(pts)}\n")
-        f.write("property float x\nproperty float y\nproperty float z\n")
-        f.write("end_header\n")
-        for x, y, z in pts:
-            f.write(f"{x} {y} {z}\n")
 
-def save_point_cloud(points_xyz, out_path: str,
-                     on_log=None, on_progress=None) -> str:
-    """
-    Speichert die Punktwolke exakt so, wie sie vom SfM kommt.
-    - Kein Downsample
-    - Kein Outlier-Filter
-    - Kein Automatik-Kram
-    """
-    on_log and on_log(f"[mesh] save point cloud (no-filter) -> {out_path}")
+    pts = np.asarray(points_xyz, dtype=float).reshape(-1, 3)
+    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
 
-    # Dict-Varianten robust abholen
-    if isinstance(points_xyz, dict):
-        for key in ("points_xyz", "points", "X", "xyz", "pts"):
-            if key in points_xyz:
-                points_xyz = points_xyz[key]
-                break
-        else:
-            raise TypeError(f"save_point_cloud: unsupported dict keys {list(points_xyz.keys())}")
+    if len(pts) >= int(filter_min_points):
+        nn_med = _median_nn_distance(pts)
+        voxel = max(1e-4, 0.5 * nn_med)  # adaptiv; nicht zu grob, um dünne Bereiche zu erhalten
+        try:
+            pcd = pcd.voxel_down_sample(voxel_size=float(voxel))
+        except Exception:
+            pass
+        try:
+            # sanft – wir wollen keine dünnen Bereiche verlieren
+            pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=12, std_ratio=2.0)
+        except Exception:
+            pass
 
-    pts = np.asarray(points_xyz, dtype=np.float64).reshape(-1, 3)
-    if pts.size == 0:
-        raise RuntimeError("No points to save.")
-
-    # Schreibe immer ASCII-PLY (maximale Kompatibilität, garantiert gleiche Punktzahl)
-    _write_ply_ascii_xyz(pts, out_path)
-
+    o3d.io.write_point_cloud(out_path, pcd)
     on_progress and on_progress(100, "Save PLY")
     return out_path
 
+# ---------- Poisson/Alpha: Hilfsfunktionen ----------
 
-# ---------- (Optional) spätere Meshing-Funktionen bleiben, aber werden hier nicht benutzt ----------
-
-def _estimate_normals_o3d(pcd, k: int = 40):
-    import open3d as o3d
-    # Radius so wählen, dass es „vernünftig“ ist – wird nur benutzt, falls du später meshen willst
+def _diag_from_pcd(pcd):
     bb = pcd.get_axis_aligned_bounding_box()
     ext = np.asarray(bb.get_extent(), dtype=float)
-    diag = float(np.linalg.norm(ext))
+    return float(np.linalg.norm(ext))
+
+def _estimate_normals_o3d(pcd, k: int = 40):
+    diag = _diag_from_pcd(pcd)
     radius = max(1e-3, 0.02 * diag)
-    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=int(k)))
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=int(k))
+    )
     try:
         pcd.orient_normals_consistent_tangent_plane(int(k))
     except Exception:
         center = pcd.get_center()
         pcd.orient_normals_towards_camera_location(np.asarray(center, dtype=float))
 
+def _mesh_poisson(pcd, depth=10, scale=1.1, linear_fit=True):
+    mesh, dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd, depth=int(depth), scale=float(scale), linear_fit=bool(linear_fit)
+    )
+    return mesh, np.asarray(dens, float)
 
-def reconstruct_solid_mesh_from_ply(*args, **kwargs):
+def _mesh_alpha(pcd, alpha):
+    return o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd, float(alpha))
+
+def _mesh_cleanup(mesh):
+    mesh.remove_duplicated_vertices()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_degenerate_triangles()
+    mesh.remove_non_manifold_edges()
+    mesh.remove_unreferenced_vertices()
+    return mesh
+
+def _mesh_crop_bbox(mesh, pcd, expand_ratio: float):
+    if expand_ratio <= 0:
+        return mesh
+    bb = pcd.get_axis_aligned_bounding_box()
+    bb = bb.scale(1.0 + float(expand_ratio), bb.get_center())
+    try:
+        return mesh.crop(bb)
+    except Exception:
+        # Fallback: manuell kappen
+        mins = bb.get_min_bound()
+        maxs = bb.get_max_bound()
+        verts = np.asarray(mesh.vertices)
+        inside = np.all((verts >= mins) & (verts <= maxs), axis=1)
+        mesh.remove_vertices_by_mask(~inside)
+        return mesh
+
+def _trim_by_density(mesh, densities: np.ndarray, q: float):
+    if densities is None or len(densities) != len(mesh.vertices) or q <= 0:
+        return mesh
+    thr = float(np.quantile(densities, np.clip(q, 0.0, 0.5)))
+    mask = densities < thr
+    mesh.remove_vertices_by_mask(mask)
+    return mesh
+
+def _mesh_smooth(mesh, iters=8):
+    if iters <= 0:
+        return mesh
+    try:
+        return mesh.filter_smooth_taubin(number_of_iterations=int(iters))
+    except Exception:
+        return mesh.filter_smooth_simple(number_of_iterations=int(iters))
+
+def _mesh_simplify(mesh, target_tris=0):
+    if target_tris and target_tris > 0 and len(mesh.triangles) > target_tris:
+        return mesh.simplify_quadric_decimation(int(target_tris))
+    return mesh
+
+def _transfer_vertex_colors(mesh, pcd, k=1):
+    if not pcd.has_colors():
+        return mesh
+    tree = o3d.geometry.KDTreeFlann(pcd)
+    mverts = np.asarray(mesh.vertices)
+    pcols = np.asarray(pcd.colors)
+    cols = np.zeros((len(mverts), 3), dtype=np.float64)
+    for i, v in enumerate(mverts):
+        _, idx, _ = tree.search_knn_vector_3d(v, max(1, int(k)))
+        cols[i] = np.mean(pcols[idx], axis=0)
+    mesh.vertex_colors = o3d.utility.Vector3dVector(cols)
+    return mesh
+
+# ---------- Hauptfunktion: Poisson/Alpha aus PLY ----------
+
+def reconstruct_solid_mesh_from_ply(
+    ply_in: str,
+    mesh_out: str,
+    *,
+    method: str = "poisson",      # "poisson" | "alpha"
+    depth: int = 10,
+    scale: float = 1.1,
+    no_linear_fit: bool = False,
+    dens_quantile: float = 0.015,
+    alpha: float = 0.0,
+    bbox_expand: float = 0.03,
+    pre_filter: bool = False,
+    pre_filter_neighbors: int = 12,
+    pre_filter_std: float = 2.0,
+    voxel: float = 0.0,
+    normals_k: int = 40,
+    smooth: int = 8,
+    simplify: int = 0,
+    color_transfer: bool = False,
+    on_log=None,
+    on_progress=None,
+) -> str:
     """
-    Platzhalter, falls der GUI-Flow das importiert.
-    Hier aktuell NICHT benutzt, weil wir dein Run erstmal ohne Meshing stabilisieren wollten.
+    Baut ein geschlossenes Mesh direkt aus der PLY-Punktwolke.
     """
-    raise NotImplementedError("Meshing ist aktuell deaktiviert (wir speichern nur sparse.ply).")
+    on_log and on_log(f"[mesh] solid: load cloud -> {ply_in}")
+    pcd = o3d.io.read_point_cloud(ply_in)
+    if (pcd is None) or (len(pcd.points) == 0):
+        raise RuntimeError("Loaded point cloud is empty.")
+
+    if pre_filter:
+        try:
+            pcd, _ = pcd.remove_statistical_outlier(
+                nb_neighbors=max(8, int(pre_filter_neighbors)),
+                std_ratio=float(pre_filter_std)
+            )
+        except Exception:
+            pass
+    if float(voxel) > 0:
+        try:
+            pcd = pcd.voxel_down_sample(voxel_size=float(voxel))
+        except Exception:
+            pass
+
+    _estimate_normals_o3d(pcd, k=int(normals_k))
+
+    if method == "poisson":
+        mesh, dens = _mesh_poisson(
+            pcd, depth=int(depth), scale=float(scale), linear_fit=(not bool(no_linear_fit))
+        )
+        if float(dens_quantile) > 0:
+            mesh = _trim_by_density(mesh, dens, float(dens_quantile))
+    elif method == "alpha":
+        if float(alpha) <= 0.0:
+            nn = _median_nn_distance(np.asarray(pcd.points))
+            alpha = 2.5 * float(nn)
+        mesh = _mesh_alpha(pcd, float(alpha))
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
+    mesh = _mesh_crop_bbox(mesh, pcd, expand_ratio=float(bbox_expand))
+    mesh = _mesh_cleanup(mesh)
+    if int(smooth) > 0:
+        mesh = _mesh_smooth(mesh, iters=int(smooth))
+    if int(simplify) > 0:
+        mesh = _mesh_simplify(mesh, target_tris=int(simplify))
+    mesh.compute_vertex_normals()
+    if bool(color_transfer):
+        mesh = _transfer_vertex_colors(mesh, pcd, k=1)
+
+    os.makedirs(os.path.dirname(mesh_out) or ".", exist_ok=True)
+    ok = o3d.io.write_triangle_mesh(mesh_out, mesh, write_vertex_colors=bool(color_transfer))
+    if not ok:
+        raise RuntimeError(f"Failed to write mesh: {mesh_out}")
+    on_log and on_log(f"[mesh] solid saved -> {mesh_out} (V={len(mesh.vertices)}, F={len(mesh.triangles)})")
+    on_progress and on_progress(100, "Watertight Mesh")
+    return mesh_out
+
+# ---------- Voxel-Closing (zusätzliches geschlossenes Mesh) ----------
+
+def voxel_close_mesh(mesh_in: str,
+                     mesh_out: str,
+                     grid: int = 180,
+                     smooth: int = 4,
+                     simplify: int = 0,
+                     on_log: Optional[callable] = None,
+                     on_progress: Optional[callable] = None) -> str:
+    """
+    Voxelisiert ein (bereits zusammenhängendes) Mesh, füllt Löcher und rekonstruiert
+    ein massives, geschlossenes Volumen.
+    """
+    try:
+        import trimesh
+    except Exception as e:
+        raise RuntimeError("Trimesh wird benötigt: pip install trimesh") from e
+
+    on_log and on_log(f"[mesh] voxel-close: load mesh -> {mesh_in}")
+    tm = trimesh.load(mesh_in, process=False)
+    if tm.vertices is None or len(tm.vertices) == 0:
+        raise RuntimeError("Input mesh empty.")
+
+    ext = (tm.bounds[1] - tm.bounds[0])
+    diag = float(np.linalg.norm(ext))
+    pitch = diag / max(16, int(grid))
+    on_log and on_log(f"[mesh] voxel-close: grid={grid}, pitch≈{pitch:.5f}")
+
+    vox = tm.voxelized(pitch=pitch)
+    try:
+        vox = vox.fill(method='holes')
+    except Exception:
+        vox = vox.fill()
+
+    tm_vox = vox.marching_cubes
+
+    # -> Open3D für Feinschliff + Speichern
+    verts = o3d.utility.Vector3dVector(np.asarray(tm_vox.vertices, float))
+    faces = o3d.utility.Vector3iVector(np.asarray(tm_vox.faces, np.int32))
+    o3m = o3d.geometry.TriangleMesh(verts, faces)
+    o3m = _mesh_cleanup(o3m)
+    if int(smooth) > 0:
+        o3m = _mesh_smooth(o3m, iters=int(smooth))
+    if int(simplify) > 0:
+        o3m = _mesh_simplify(o3m, target_tris=int(simplify))
+    o3m.compute_vertex_normals()
+
+    os.makedirs(os.path.dirname(mesh_out) or ".", exist_ok=True)
+    ok = o3d.io.write_triangle_mesh(mesh_out, o3m)
+    if not ok:
+        raise RuntimeError(f"Failed to write voxel-closed mesh: {mesh_out}")
+
+    on_log and on_log(f"[mesh] voxel-closed saved -> {mesh_out} (V={len(o3m.vertices)}, F={len(o3m.triangles)})")
+    on_progress and on_progress(100, "Voxel-Closed Mesh")
+    return mesh_out
