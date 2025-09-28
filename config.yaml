@@ -7,7 +7,7 @@ features:
   backend: superpoint          # superpoint | sift
   device: cuda                 # cuda | cpu  (muss zu Matching-Device passen)
   use_mask: false
-  max_kp: 4096
+  max_kp: 16000
   debug_every: 0               # 0 = aus; z.B. 30 speichert jede 30. Maske
 
 # --- Matching ---
@@ -17,11 +17,11 @@ matching:
 
 # --- SfM ---
 sfm:
-  init_ratio: 0.5              # Anteil Nachbarn für Anfangspaar (0..1)
-  init_max_span: 6             # max. Frame-Abstand fürs Startpaar
+  init_ratio: 0.4              # Anteil Nachbarn für Anfangspaar (0..1)
+  init_max_span: 5             # max. Frame-Abstand fürs Startpaar
   densify: true
   use_keyframes: true
   use_loops: true
   pose_smoothing: true
-  smooth_lambda: 0.25
+  smooth_lambda: 0.3
 

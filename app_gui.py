@@ -50,7 +50,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.spin_frames = QtWidgets.QSpinBox()
         self.spin_frames.setRange(50, 2000)
-        self.spin_frames.setValue(300)
+        self.spin_frames.setValue(120)
         self.spin_frames.setSuffix(" Frames")
 
         self.btn_compute = QtWidgets.QPushButton("Compute")

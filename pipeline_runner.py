@@ -157,7 +157,7 @@ class PipelineRunner:
         if not (isinstance(res, tuple) and len(res) >= 1):
             raise RuntimeError("SFM lieferte kein Punkte-Array zurück.")
         points3d = np.asarray(res[0], dtype=np.float64).reshape(-1, 3)
-        sparse_ply = os.path.join(paths.root, "sparse.ply")
+        sparse_ply = os.path.join(paths.root, "mesh/sparse.ply")
         save_point_cloud(points3d, sparse_ply, on_log=log, on_progress=prog)
         log(f"[sfm] raw_points(after validation)={points3d.shape[0]:d}")
         log(f"[ui] Fertig: {sparse_ply}")
