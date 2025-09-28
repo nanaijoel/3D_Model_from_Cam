@@ -17,12 +17,12 @@ matching:
 
 # --- SfM ---
 sfm:
-  init_ratio: 0.4              # Anteil Nachbarn für Anfangspaar (0..1)
-  init_max_span: 5             # max. Frame-Abstand fürs Startpaar
+  init_ratio: 0.2              # Anteil Nachbarn für Anfangspaar (0..1)
+  init_max_span: 3             # max. Frame-Abstand fürs Startpaar
   densify: true
-  use_keyframes: true
+  use_keyframes: false
   use_loops: true
   pose_smoothing: true
-  smooth_lambda: 0.3
+  smooth_lambda: 0.9
 
 
