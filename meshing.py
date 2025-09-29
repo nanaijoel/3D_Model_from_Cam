@@ -41,7 +41,7 @@ def save_point_cloud(points_xyz: np.ndarray, out_path: str, filter_min_points: i
             pass
         try:
             # sanft – wir wollen keine dünnen Bereiche verlieren
-            pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=12, std_ratio=2.0)
+            pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=4, std_ratio=0.8)
         except Exception:
             pass
 

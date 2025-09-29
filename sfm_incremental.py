@@ -11,7 +11,7 @@ from collections import defaultdict
 @dataclass
 class SfMConfig:
     # --- Init pair search ---
-    MIN_MATCHES_INIT: int = 50
+    MIN_MATCHES_INIT: int = 250
     MIN_FLOW_PX: float = 6.0
     MIN_INLIERS_INIT: int = 35
     INIT_WINDOW_FRAMES: int = 80
@@ -21,7 +21,7 @@ class SfMConfig:
     FORCE_INIT_PAIR: Optional[Tuple[int, int]] = None
 
     # --- PnP ---
-    MIN_INLIERS_PNP: int = 28
+    MIN_INLIERS_PNP: int = 160
     PNP_ITERS: int = 8000
     PNP_ERR_PX: float = 3.0
     PNP_REPROJ_ACCEPT: float = 2.0
