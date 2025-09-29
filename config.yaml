@@ -6,9 +6,9 @@
 features:
   backend: superpoint          # superpoint | sift
   device: cuda                 # cuda | cpu  (muss zu Matching-Device passen)
-  use_mask: false
+  use_mask: true
   max_kp: 15000
-  debug_every: 0               # 0 = aus; z.B. 30 speichert jede 30. Maske
+  debug_every: 30               # 0 = aus; z.B. 30 speichert jede 30. Maske
 
 # --- Matching ---
 matching:
@@ -23,6 +23,6 @@ sfm:
   use_keyframes: false
   use_loops: true
   pose_smoothing: true
-  smooth_lambda: 0.9
+  smooth_lambda: 0.01
 
 

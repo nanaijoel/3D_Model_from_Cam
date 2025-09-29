@@ -40,7 +40,7 @@ def build_pairs(
     # einfache Nachbarschafts-Paare (i,i+1..i+4) + ein paar Long-Range
     pairs: List[Pair] = []
     for i in idxs:
-        for d in range(1, 4):
+        for d in range(1, 5):
             j = i + d
             if j < N:
                 pairs.append((i, j))
