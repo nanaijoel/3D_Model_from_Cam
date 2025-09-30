@@ -5,7 +5,7 @@ import numpy as np
 
 import open3d as o3d
 
-# ---------- Basis: Point-Cloud speichern ----------
+# Basic: save point cloud
 
 def _median_nn_distance(points_xyz: np.ndarray) -> float:
     if len(points_xyz) < 3:
@@ -24,7 +24,7 @@ def _median_nn_distance(points_xyz: np.ndarray) -> float:
 def save_point_cloud(points_xyz: np.ndarray, out_path: str, filter_min_points: int = 1000,
                      on_log=None, on_progress=None):
     """
-    Speichert eine Punktwolke als PLY (mit optionalem leichtem Downsample/Outlier-Filter).
+    Saves a point cloud as PLY (with optional light downsampling/outlier filtering).
     """
     on_log and on_log(f"[mesh] save point cloud -> {out_path}")
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
@@ -34,13 +34,13 @@ def save_point_cloud(points_xyz: np.ndarray, out_path: str, filter_min_points: i
 
     if len(pts) >= int(filter_min_points):
         nn_med = _median_nn_distance(pts)
-        voxel = max(1e-4, 0.5 * nn_med)  # adaptiv; nicht zu grob, um dünne Bereiche zu erhalten
+        voxel = max(1e-4, 0.5 * nn_med)  # adaptive; not too coarse to preserve thin structures
         try:
             pcd = pcd.voxel_down_sample(voxel_size=float(voxel))
         except Exception:
             pass
         try:
-            # sanft – wir wollen keine dünnen Bereiche verlieren
+            # gentle – try to preserve thin structures
             pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=4, std_ratio=0.8)
         except Exception:
             pass
@@ -49,7 +49,7 @@ def save_point_cloud(points_xyz: np.ndarray, out_path: str, filter_min_points: i
     on_progress and on_progress(100, "Save PLY")
     return out_path
 
-# ---------- Poisson/Alpha: Hilfsfunktionen ----------
+# Poisson/Alpha: helper functions
 
 def _diag_from_pcd(pcd):
     bb = pcd.get_axis_aligned_bounding_box()
@@ -93,7 +93,7 @@ def _mesh_crop_bbox(mesh, pcd, expand_ratio: float):
     try:
         return mesh.crop(bb)
     except Exception:
-        # Fallback: manuell kappen
+        # Fallback: manually clip against the AABB
         mins = bb.get_min_bound()
         maxs = bb.get_max_bound()
         verts = np.asarray(mesh.vertices)
@@ -135,7 +135,7 @@ def _transfer_vertex_colors(mesh, pcd, k=1):
     mesh.vertex_colors = o3d.utility.Vector3dVector(cols)
     return mesh
 
-# ---------- Hauptfunktion: Poisson/Alpha aus PLY ----------
+# Main function: Poisson/Alpha from PLY
 
 def reconstruct_solid_mesh_from_ply(
     ply_in: str,
@@ -160,7 +160,7 @@ def reconstruct_solid_mesh_from_ply(
     on_progress=None,
 ) -> str:
     """
-    Baut ein geschlossenes Mesh direkt aus der PLY-Punktwolke.
+    Builds a watertight mesh directly from a PLY point cloud.
     """
     on_log and on_log(f"[mesh] solid: load cloud -> {ply_in}")
     pcd = o3d.io.read_point_cloud(ply_in)
@@ -215,7 +215,7 @@ def reconstruct_solid_mesh_from_ply(
     on_progress and on_progress(100, "Watertight Mesh")
     return mesh_out
 
-# ---------- Voxel-Closing (zusätzliches geschlossenes Mesh) ----------
+# Voxel-closing (additional watertight mesh)
 
 def voxel_close_mesh(mesh_in: str,
                      mesh_out: str,
@@ -225,13 +225,13 @@ def voxel_close_mesh(mesh_in: str,
                      on_log: Optional[callable] = None,
                      on_progress: Optional[callable] = None) -> str:
     """
-    Voxelisiert ein (bereits zusammenhängendes) Mesh, füllt Löcher und rekonstruiert
-    ein massives, geschlossenes Volumen.
+    Voxelizes an already connected mesh, fills holes, and reconstructs
+    a solid, watertight volume.
     """
     try:
         import trimesh
     except Exception as e:
-        raise RuntimeError("Trimesh wird benötigt: pip install trimesh") from e
+        raise RuntimeError("Trimesh is required: pip install trimesh") from e
 
     on_log and on_log(f"[mesh] voxel-close: load mesh -> {mesh_in}")
     tm = trimesh.load(mesh_in, process=False)
@@ -251,7 +251,7 @@ def voxel_close_mesh(mesh_in: str,
 
     tm_vox = vox.marching_cubes
 
-    # -> Open3D für Feinschliff + Speichern
+    # Use Open3D for cleanup and saving
     verts = o3d.utility.Vector3dVector(np.asarray(tm_vox.vertices, float))
     faces = o3d.utility.Vector3iVector(np.asarray(tm_vox.faces, np.int32))
     o3m = o3d.geometry.TriangleMesh(verts, faces)

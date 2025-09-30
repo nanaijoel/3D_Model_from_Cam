@@ -10,7 +10,7 @@ from sfm_incremental import run_sfm, SfMConfig
 from meshing import save_point_cloud, reconstruct_solid_mesh_from_ply, voxel_close_mesh
 
 
-# ---------------------- config utils ----------------------
+# config utils
 
 def _load_yaml_or_json(path: str) -> Dict[str, Any]:
     ext = os.path.splitext(path)[1].lower()
@@ -95,7 +95,7 @@ def _dump_resolved_config(project_root: str) -> str:
             json.dump(kv, f, indent=2, ensure_ascii=False)
     return out_path
 
-# ---------------------- Pipeline Runner (nur sparse.ply) --------------------
+# pipeline runner (sparse.ply only)
 
 class PipelineRunner:
     def __init__(self, base_dir: str, on_log: Callable[[str], None], on_progress: Callable[[int, str], None]):
@@ -106,30 +106,30 @@ class PipelineRunner:
     def run(self, video_path: str, project_name: str, target_frames: int) -> Tuple[str, object]:
         log, prog = self.on_log, self.on_progress
         paths = make_project_paths(self.base_dir, project_name)
-        log(f"[pipeline] Projekt: {paths.root}")
+        log(f"[pipeline] Project: {paths.root}")
 
-        # Config
+        # config
         cfg_path = _maybe_find_config(self.base_dir)
         if cfg_path:
             cfg = _load_yaml_or_json(cfg_path)
             _apply_env_from_config(cfg)
             log(f"[pipeline] config loaded: {cfg_path}")
 
-        # 1) Frames
+        # 1) frames
         imgs = extract_and_save_frames(video_path, target_frames, paths.raw_frames, log, prog)
         if not imgs:
-            raise RuntimeError("Keine Frames extrahiert.")
-        log(f"[frames] gespeichert: {len(imgs)}")
+            raise RuntimeError("No frames were extracted.")
+        log(f"[frames] saved: {len(imgs)}")
 
-        # 2) Features
+        # 2) features
         kps, descs, shapes, meta = extract_features(imgs, paths.features, log, prog)
         if not kps or not shapes:
-            raise RuntimeError("Feature-Extraktion ergab keine Keypoints.")
+            raise RuntimeError("Feature extraction returned no keypoints.")
 
-        # 3) Matching
+        # 3) matching
         pairs, matches = build_pairs(descs, log, prog, save_dir=paths.matches, keypoints=kps, meta=meta)
 
-        # 4) Intrinsics (einfach)
+        # 4) intrinsics (simple)
         h, w = shapes[0]
         focal = 0.9 * float(max(w, h))
         pp = (w / 2.0, h / 2.0)
@@ -154,20 +154,20 @@ class PipelineRunner:
         res = run_sfm(kps, descs, shapes, pairs, matches, K, log, prog,
                       poses_out_dir=poses_dir, config=cfg_sfm)
 
-        # 6) Sparse speichern (ohne Reduktion!) -> projects/<name>/sparse.ply
+        # 6) save sparse (no reduction) -> projects/<name>/sparse.ply
         if not (isinstance(res, tuple) and len(res) >= 1):
-            raise RuntimeError("SFM lieferte kein Punkte-Array zurück.")
+            raise RuntimeError("SfM did not return a points array.")
         points3d = np.asarray(res[0], dtype=np.float64).reshape(-1, 3)
         sparse_ply = os.path.join(paths.root, "mesh/sparse.ply")
         save_point_cloud(points3d, sparse_ply, on_log=log, on_progress=prog)
         log(f"[sfm] raw_points(after validation)={points3d.shape[0]:d}")
-        log(f"[ui] Fertig: {sparse_ply}")
+        log(f"[ui] Done: {sparse_ply}")
 
-        # 7) Meshing (simpel, ohne Config)
+        # 7) meshing (simple, no config)
         mesh_dir = os.path.join(paths.root, "mesh")
         os.makedirs(mesh_dir, exist_ok=True)
 
-        # 7a) Poisson-Mesh
+        # 7a) Poisson mesh
         solid_mesh = os.path.join(mesh_dir, "solid_mesh_poisson.ply")
         log("[mesh] reconstruct solid mesh (poisson)")
         try:
@@ -186,7 +186,7 @@ class PipelineRunner:
         except Exception as e:
             log(f"[mesh] solid reconstruction failed: {e}")
 
-        # 7b) Voxel-Closed aus dem Poisson-Mesh
+        # 7b) voxel-closed from the Poisson mesh
         voxel_mesh = os.path.join(mesh_dir, "voxel_closed_mesh.ply")
         log("[mesh] voxel-close mesh (make fully closed volume)")
         try:

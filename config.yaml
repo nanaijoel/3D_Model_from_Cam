@@ -1,28 +1,22 @@
-# =========================
-# Pipeline-Konfiguration
-# =========================
-
-# --- Feature-Extraktion ---
+# Feature extraction
 features:
   backend: superpoint          # superpoint | sift
-  device: cuda                 # cuda | cpu  (muss zu Matching-Device passen)
+  device: cuda                 # cuda | cpu (must match the matching device)
   use_mask: false
   max_kp: 12000
-  debug_every: 30               # 0 = aus; z.B. 30 speichert jede 30. Maske
+  debug_every: 30              # 0 = off; e.g., 30 saves every 30th mask
 
-# --- Matching ---
+# Matching
 matching:
   backend: lightglue           # lightglue | classic
-  ratio: 0.82                  # nur für classic-SNN; bei lightglue egal
+  ratio: 0.82                  # only for classic SNN; ignored by lightglue
 
-# --- SfM ---
+# SfM
 sfm:
-  init_ratio: 0.3            # Anteil Nachbarn für Anfangspaar (0..1)
-  init_max_span: 4             # max. Frame-Abstand fürs Startpaar
+  init_ratio: 0.3              # fraction of neighbors for initial pair (0..1)
+  init_max_span: 4             # max frame distance for the start pair
   densify: true
   use_keyframes: true
   use_loops: true
   pose_smoothing: true
   smooth_lambda: 0.001
-
-

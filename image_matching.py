@@ -25,8 +25,8 @@ def build_pairs(
     meta: Optional[dict] = None
 ) -> Tuple[List[Pair], Dict[Pair, List[cv.DMatch]]]:
     """
-    MATCH_BACKEND == 'lightglue'  -> nutzt LightGlue (erwartet SuperPoint/DISK-ähnliche Deskriptoren)
-    sonst: klassisches BF + Ratio-Test.
+    MATCH_BACKEND == 'lightglue'  -> uses LightGlue (expects SuperPoint/DISK-like descriptors)
+    otherwise: classic BF + ratio test.
     """
     def log(m):  on_log and on_log(m)
     def prog(p, s): on_progress and on_progress(int(p), s)
@@ -37,7 +37,7 @@ def build_pairs(
     N = len(descriptors)
     idxs = list(range(N))
 
-    # einfache Nachbarschafts-Paare (i,i+1..i+4) + ein paar Long-Range
+    # simple neighborhood pairs (i, i+1..i+4) plus a few long-range pairs
     pairs: List[Pair] = []
     for i in idxs:
         for d in range(1, 5):
@@ -54,18 +54,18 @@ def build_pairs(
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
 
-    # ---------------- LightGlue ----------------
+    # LightGlue
     if backend == "lightglue":
         from lightglue import LightGlue
 
-        # Device-Entscheidung wie bei Features
+        # device selection (same convention as features)
         device_env = os.getenv("FEATURE_DEVICE", "").lower().strip()
         device = device_env if device_env in ("cuda", "cpu") else ("cuda" if torch.cuda.is_available() else "cpu")
         matcher = LightGlue(features="superpoint").to(device).eval()
         log(f"[match] LightGlue on {device}")
 
         assert keypoints is not None and meta is not None, \
-            "[match] LightGlue benötigt keypoints und meta (scores, image_size) von SuperPoint."
+            "[match] LightGlue requires keypoints and meta (scores, image_size) from SuperPoint."
 
         sp_scores = meta.get("sp_scores", None)
         sp_sizes  = meta.get("sp_sizes", None)
@@ -80,21 +80,21 @@ def build_pairs(
             kp_xy = np.array([[kp.pt[0], kp.pt[1]] for kp in kps], dtype=np.float32, order="C")
             kp_xy_t = torch.from_numpy(kp_xy)[None, ...].to(device)               # [1,N,2]
 
-            # Deskriptoren: LightGlue erwartet [B,C,N]
+            # descriptors: LightGlue expects [B,C,N]
             desc = des.astype(np.float32, copy=False)                             # [N,C]
             desc_t = torch.from_numpy(desc).T.contiguous()[None, ...].to(device)  # [1,C,N]
 
-            # Scores (optional aber hilfreich)
+            # scores (optional but helpful)
             if sp_scores is not None and len(sp_scores) > i and sp_scores[i] is not None:
                 sc = torch.from_numpy(sp_scores[i].astype(np.float32, copy=False))[None, ...].to(device)  # [1,N]
             else:
                 sc = torch.ones((1, kp_xy.shape[0]), dtype=torch.float32, device=device)
 
-            # Bildgröße [B,2] = [H,W]
+            # image size [B,2] = [H,W]
             if sp_sizes is not None and len(sp_sizes) > i and sp_sizes[i] is not None:
                 H, W = sp_sizes[i]
             else:
-                # fallback: aus Keypoints grob abschätzen
+                # fallback: rough estimate from keypoints
                 H = int(max(1, max(int(k.pt[1]) for k in kps)))
                 W = int(max(1, max(int(k.pt[0]) for k in kps)))
             size_t = torch.tensor([[int(H), int(W)]], dtype=torch.int32, device=device)  # [1,2]
@@ -115,7 +115,7 @@ def build_pairs(
                     matches[(i, j)] = []
                 else:
                     out = matcher({"image0": Fi, "image1": Fj})
-                    m0 = out["matches0"][0].detach().cpu().numpy()  # [N0], Indexe in image1 oder -1
+                    m0 = out["matches0"][0].detach().cpu().numpy()  # [N0], indices in image1 or -1
                     valid = np.where(m0 >= 0)[0]
                     if valid.size == 0:
                         matches[(i, j)] = []
@@ -133,7 +133,7 @@ def build_pairs(
                     prog(40 + (t + 1) / max(1, len(pairs)) * 15, "Image Matching (lightglue)")
         return pairs, matches
 
-    # ---------------- Klassisch (BF + Ratio) ----------------
+    # Classic (BF + ratio)
     log("[match] classic BF matcher")
     bf = cv.BFMatcher(cv.NORM_L2, crossCheck=False)
 

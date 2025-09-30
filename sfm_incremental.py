@@ -6,11 +6,11 @@ from typing import Callable, List, Dict, Tuple, Optional, DefaultDict
 from dataclasses import dataclass
 from collections import defaultdict
 
-# ============================== Config ===============================
+# Config
 
 @dataclass
 class SfMConfig:
-    # --- Init pair search ---
+    # Init pair search
     MIN_MATCHES_INIT: int = 250
     MIN_FLOW_PX: float = 6.0
     MIN_INLIERS_INIT: int = 35
@@ -20,23 +20,23 @@ class SfMConfig:
     INIT_WINDOW_RATIO: Optional[float] = None
     FORCE_INIT_PAIR: Optional[Tuple[int, int]] = None
 
-    # --- PnP ---
+    # PnP
     MIN_INLIERS_PNP: int = 160
     PNP_ITERS: int = 8000
     PNP_ERR_PX: float = 3.0
     PNP_REPROJ_ACCEPT: float = 2.0
 
-    # --- Triangulation (pairwise during expansion) ---
+    # Triangulation (pairwise during expansion)
     TRI_MIN_CORR: int = 14
     TRI_REPROJ_MAX: float = 2.0
     TRI_MIN_PARALLAX_DEG: float = 4.0
 
-    # --- Local stereo seeding ---
+    # Local stereo seeding
     SEED_SPAN: int = 3
     SEED_MIN_INL: int = 40
     SEED_REPROJ: float = 2.0
 
-    # --- Multiview point validation ("promotion") ---
+    # Multiview point validation (promotion)
     POINT_PROMOTION_MIN_OBS: int = 4
     POINT_MAX_MULTIVIEW_REPROJ: float = 2.0
     POINT_MIN_MULTIVIEW_PARALLAX_DEG: float = 5.0
@@ -47,31 +47,31 @@ class SfMConfig:
     LOWPAR_FALLBACK_MAX_MEDIAN_REPROJ: float = 1.6
     LOWPAR_FALLBACK_MIN_POSDEPTH_RATIO: float = 0.85
 
-    # --- Frame gating for creating new points ---
+    # Frame gating for creating new points
     FRAME_MAX_MEDIAN_REPROJ_FOR_NEW_POINTS: float = 2.8
 
-    # --- Optional Densify-Pass ---
+    # Optional densify pass
     DENSIFY_ENABLE: bool = True
     DENSIFY_MAX_SPAN: int = 20
     DENSIFY_MIN_MATCHES: int = 60
     DENSIFY_MIN_PARALLAX_DEG: float = 4.0
     DENSIFY_MAX_REPROJ: float = 2.0
 
-    # ================= NEW: Keyframes & Loops & Smoothing ==============
+    # Keyframes, loop constraints, smoothing
     USE_KEYFRAMES: bool = True
-    KF_MIN_BASELINE_NORM: float = 0.012       # ~1.2% der max(Bildkante) als Normalisierte Baseline
-    KF_MIN_PARALLAX_DEG: float = 1.5          # minimaler zusätzlicher Parallaxbeitrag, um KF zu rechtfertigen
-    KF_MIN_NEW_2D3D: int = 18                 # min. neue 2D-3D Korrespondenzen für Pose-Schätzung
+    KF_MIN_BASELINE_NORM: float = 0.012
+    KF_MIN_PARALLAX_DEG: float = 1.5
+    KF_MIN_NEW_2D3D: int = 18
 
     USE_LOOP_CONSTRAINTS: bool = True
-    LOOP_MAX_SPAN: int = 9999                 # bis zu globalen Loops zulassen
-    LOOP_MIN_INLIERS: int = 80                # benötigt robuste Matches, bevor Loop genutzt wird
+    LOOP_MAX_SPAN: int = 9999
+    LOOP_MIN_INLIERS: int = 80
 
-    POSE_SMOOTHING: bool = True               # optional „leichte“ Glättung
-    SMOOTH_LAMBDA: float = 0.25               # 0..1; kleiner = stärker glätten
+    POSE_SMOOTHING: bool = True
+    SMOOTH_LAMBDA: float = 0.25
 
 
-# ============================== Helpers ==============================
+# Helpers
 
 def _idx2pts(matches, kps1, kps2):
     pts1 = np.float32([kps1[m.queryIdx].pt for m in matches])
@@ -153,7 +153,7 @@ def _pairwise_max_parallax_deg(Kinv, poses_R, poses_t, obs_list):
     return best
 
 
-# ============================= Track DB ==============================
+# Track database
 
 class TrackDB:
     """Manages 3D points, observations and promotion (multi-view validation)."""
@@ -176,9 +176,8 @@ class TrackDB:
 
     def promote_points(self, poses_R: Dict[int, np.ndarray], poses_t: Dict[int, np.ndarray],
                        adapt_from_reproj: Optional[float] = None):
-        """Promote tentative → ok using multi-view checks. Optionally tighten thresholds when reproj is low."""
+        """Promote tentative → ok using multi-view checks. Optionally tighten thresholds when reprojection is low."""
         cfg = self.cfg
-        # adapt thresholds a bit if reconstruction is clean
         par_min = cfg.POINT_MIN_MULTIVIEW_PARALLAX_DEG
         repro_max = cfg.POINT_MAX_MULTIVIEW_REPROJ
         pos_ratio = cfg.POINT_REQUIRE_POSITIVE_DEPTH_RATIO
@@ -194,7 +193,6 @@ class TrackDB:
             if len(ob) < cfg.POINT_PROMOTION_MIN_OBS:
                 continue
 
-            # 1) Best-parallax retriangulation
             max_par, pair = _pairwise_max_parallax_deg(self.Kinv, poses_R, poses_t, ob)
             if pair is not None and max_par >= par_min:
                 fa, fb, uva, uvb = pair
@@ -216,7 +214,7 @@ class TrackDB:
                     self.points3d[gi] = X
                     self.state[gi] = 'ok'
                     continue
-            # 2) Low-parallax fallback (streng, viele Sichten)
+
             if len(ob) >= self.cfg.LOWPAR_FALLBACK_MIN_OBS:
                 fa, uva = ob[0]
                 fb, uvb = ob[-1]
@@ -240,7 +238,7 @@ class TrackDB:
                         self.points3d[gi] = X
                         self.state[gi] = 'ok'
                         continue
-            # sonst verwerfen
+
             self.points3d[gi] = None
             self.state[gi] = 'dead'
 
@@ -249,17 +247,16 @@ class TrackDB:
                         dtype=float)
 
 
-# ============================== Utility: Keyframes & Smoothing ==============================
+# Keyframes and smoothing utilities
 
 def _should_be_keyframe(K, poses_R, poses_t, last_kf_idx: int, fi: int,
                         anchors: List[int], kps, matches, track3d, tdb: TrackDB, cfg: SfMConfig) -> bool:
-    """Decide if 'fi' should be a keyframe: checks baseline/parallax and how many *new* 2D-3D correspondences we get."""
+    """Decide if 'fi' should be a keyframe: baseline/parallax and number of new 2D–3D correspondences."""
     if not cfg.USE_KEYFRAMES:
         return True
     if last_kf_idx is None:
         return True
 
-    # Estimate normalized baseline to last KF using any available anchor
     baseline = 0.0
     parallax_deg = 0.0
     Kinv = np.linalg.inv(K)
@@ -267,7 +264,6 @@ def _should_be_keyframe(K, poses_R, poses_t, last_kf_idx: int, fi: int,
     for a in anchors:
         if (a, fi) not in matches:
             continue
-        # count how many NEW 2D-3D points we gain if we accept fi
         new_2d3d = 0
         for mm in matches[(a, fi)]:
             qa = (a, mm.queryIdx)
@@ -275,61 +271,52 @@ def _should_be_keyframe(K, poses_R, poses_t, last_kf_idx: int, fi: int,
                 gi = track3d[qa]
                 if gi < len(tdb.points3d) and tdb.points3d[gi] is not None:
                     new_2d3d += 1
-        # measure parallax with current anchor bearings vs last KF if available
         if (last_kf_idx in poses_R) and (a in poses_R):
-            # pick one representative correspondence to estimate local parallax proxy
             mlist = matches[(a, fi)]
             if len(mlist) >= 1:
                 uva = np.array([kps[a][mlist[0].queryIdx].pt], np.float32)
                 uvf = np.array([kps[fi][mlist[0].trainIdx].pt], np.float32)
                 da = _bearing_in_world(Kinv, poses_R[a], uva)[0]
-                df = _bearing_in_world(Kinv, poses_R[a], uvf)[0]  # both in world around anchor
+                df = _bearing_in_world(Kinv, poses_R[a], uvf)[0]
                 cosang = np.clip(da @ df, -1.0, 1.0)
                 parallax_deg = max(parallax_deg, float(np.degrees(np.arccos(cosang))))
 
         if new_2d3d >= cfg.KF_MIN_NEW_2D3D and parallax_deg >= cfg.KF_MIN_PARALLAX_DEG:
             return True
 
-    # final baseline proxy: if camera center moved visibly since last KF
     if (last_kf_idx in poses_R) and (fi in poses_R):
         C_last = -poses_R[last_kf_idx].T @ poses_t[last_kf_idx]
         C_now = -poses_R[fi].T @ poses_t[fi]
         d = float(np.linalg.norm(C_now - C_last))
-        # Normalize with a pseudo focal-based scale (rough proxy)
         baseline = d
     return baseline >= cfg.KF_MIN_BASELINE_NORM
 
 
 def _smooth_poses(poses_R: Dict[int, np.ndarray], poses_t: Dict[int, np.ndarray], lam: float):
-    """Tiny pose-graph smoothing along the trajectory order (1D Laplacian on translations, and SLERP-like on rotations)."""
+    """Light pose smoothing along trajectory order (Laplacian on translations, SVD-averaged rotations)."""
     if lam <= 0 or len(poses_R) < 3:
         return
     order = sorted(poses_R.keys())
-    # Smooth translations
-    T = {i: (-poses_R[i].T @ poses_t[i]).reshape(3) for i in order}  # camera centers
+    T = {i: (-poses_R[i].T @ poses_t[i]).reshape(3) for i in order}
     T_sm = T.copy()
     for _ in range(2):
         for k in range(1, len(order) - 1):
             i0, i1, i2 = order[k - 1], order[k], order[k + 1]
             T_sm[i1] = (1 - lam) * T_sm[i1] + 0.5 * lam * (T_sm[i0] + T_sm[i2])
-    # Smooth rotations lightly by averaging neighboring rotation matrices (not strictly on SO(3), but small lam is fine)
     R_sm = {i: poses_R[i].copy() for i in order}
     for _ in range(1):
         for k in range(1, len(order) - 1):
             i0, i1, i2 = order[k - 1], order[k], order[k + 1]
             Ravg = (R_sm[i0] + R_sm[i1] + R_sm[i2]) / 3.0
-            # project to nearest rotation via SVD
             U, _, Vt = np.linalg.svd(Ravg)
             R_sm[i1] = U @ Vt
-
-    # write back (recompute t from smoothed camera centers)
     for i in order:
         C = T_sm[i].reshape(3, 1)
         poses_R[i] = R_sm[i]
         poses_t[i] = -poses_R[i] @ C
 
 
-# ============================== Main =================================
+# Main
 
 def run_sfm(keypoints: List[List[cv.KeyPoint]],
             descriptors: List[np.ndarray],
@@ -356,7 +343,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
 
     cfg = config or SfMConfig()
 
-    # Unpack (unchanged)
+    # Unpack config
     MIN_MATCHES_INIT = cfg.MIN_MATCHES_INIT
     MIN_FLOW_PX = cfg.MIN_FLOW_PX
     MIN_INLIERS_INIT = cfg.MIN_INLIERS_INIT
@@ -376,7 +363,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
     SEED_MIN_INL = cfg.SEED_MIN_INL
     SEED_REPROJ = cfg.SEED_REPROJ
 
-    # --------- Init-Paar (wie bisher, lokal um Mitte) -----------------
+    # Init pair selection (local around the middle)
     N = len(shapes)
     mid = (cfg.INIT_WINDOW_CENTER if cfg.INIT_WINDOW_CENTER is not None else (N // 2))
     if cfg.INIT_WINDOW_RATIO is not None:
@@ -409,14 +396,13 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
         inliers = int(inl_mask.sum())
         if inliers < MIN_INLIERS_INIT:
             continue
-        # cheirality score
-        ch = 0
+        cheir = 0
         if inliers > 0:
             X = _triangulate(K, np.eye(3), np.zeros((3, 1)), R, t, p1[inl_mask], p2[inl_mask])
-            ch = int((_in_front(np.eye(3), np.zeros((3, 1)), X) &
-                      _in_front(R, t, X)).sum())
-        score = inliers + 2.0 * ch
-        stats.append((i, j, len(m), flow, inliers, ch, score))
+            cheir = int((_in_front(np.eye(3), np.zeros((3, 1)), X) &
+                         _in_front(R, t, X)).sum())
+        score = inliers + 2.0 * cheir
+        stats.append((i, j, len(m), flow, inliers, cheir, score))
         if score > best["score"]:
             best.update(score=score, pair=(i, j), R=R, t=t, mask=inl_mask)
 
@@ -433,10 +419,10 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
     if best["pair"] is None:
         if stats:
             stats.sort(key=lambda x: x[-1], reverse=True)
-            top = "\n".join([f"   cand ({a},{b}): matches={mm}, inl={ii}, cheiral={ch}, score={sc:.1f}"
+            top = "\n".join([f"   cand ({a},{b}): matches={mm}, inl={ii}, cheirality={ch}, score={sc:.1f}"
                              for (a, b, mm, _, ii, ch, sc) in stats[:8]])
-            log("[sfm] Init-Kandidaten TOP:\n" + top)
-        raise RuntimeError("[sfm] Initialisierung fehlgeschlagen.")
+            log("[sfm] Init candidates (top):\n" + top)
+        raise RuntimeError("[sfm] Initialization failed.")
 
     i0, j0 = best["pair"]
     log(f"[sfm] init pair = ({i0},{j0}) score={best['score']:.1f}")
@@ -445,7 +431,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
     p1_all, p2_all = _idx2pts(m01, kps0, kps1)
     R = best["R"]; t = best["t"]; mask = best["mask"]
 
-    # --------- init triangulation ------------------------------------
+    # Init triangulation
     poses_R = {i0: np.eye(3), j0: R}
     poses_t = {i0: np.zeros((3, 1)), j0: t}
 
@@ -464,9 +450,9 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
             X_init, front = X_try, front2
 
     X_init = X_init[front]
-    log(f"[sfm] init inliers={int(mask.sum())} cheiral={int(front.sum())}")
+    log(f"[sfm] init inliers={int(mask.sum())} cheirality={int(front.sum())}")
     log(f"[sfm] X_init={len(X_init)}")
-    prog(60, "SfM – Initialisierung")
+    prog(60, "SfM – Initialization")
 
     # Track DB
     track3d: Dict[Tuple[int, int], int] = {}
@@ -483,7 +469,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
         TDB.add_obs(gi, i0, keypoints[i0][mm.queryIdx].pt)
         TDB.add_obs(gi, j0, keypoints[j0][mm.trainIdx].pt)
 
-    # --------- best-first expansion -----------------------------------
+    # Best-first expansion
     all_frames = sorted(set([i for ij in pairs for i in ij]))
     visited = {i0, j0}
     keyframes = [i0, j0] if cfg.USE_KEYFRAMES else []
@@ -508,7 +494,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
             remaining.remove(fi)
             continue
 
-        # ---------- 2D-3D farming ------------------------------------
+        # 2D–3D collection for PnP
         obj_pts, img_pts = [], []
         used_g = set()
         for a in anchors:
@@ -527,7 +513,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
                         TDB.add_obs(gi, fi, keypoints[fi][mm.trainIdx].pt)
                         used_g.add(gi)
 
-        # --- Keyframe gate: not enough stable 2D-3D? skip if KF mode ---
+        # Keyframe gate
         if cfg.USE_KEYFRAMES and len(obj_pts) < max(cfg.KF_MIN_NEW_2D3D, cfg.MIN_INLIERS_PNP):
             log(f"[sfm] skip non-KF frame {fi}: 2D-3D={len(obj_pts)}")
             remaining.remove(fi)
@@ -575,7 +561,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
             remaining.remove(fi)
             continue
 
-        # refine pose
+        # Refine pose
         try:
             rvec, tvec = cv.solvePnPRefineLM(
                 objectPoints=obj_pts[inl.ravel()],
@@ -601,7 +587,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
         poses_t[fi] = tfi
         visited.add(fi)
 
-        # --- KF decision ---
+        # Keyframe decision
         if _should_be_keyframe(K, poses_R, poses_t, last_kf_idx, fi, anchors, keypoints, matches, track3d, TDB, cfg):
             if cfg.USE_KEYFRAMES:
                 keyframes.append(fi)
@@ -610,7 +596,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
         remaining.remove(fi)
         prog(int(60 + 20 * len(visited) / len(all_frames)), f"SfM – Pose {fi}")
 
-        # ---------- Local stereo seeding (unchanged) -------------------
+        # Local stereo seeding
         allow_new_points = (med_repro is None) or (med_repro <= cfg.FRAME_MAX_MEDIAN_REPROJ_FOR_NEW_POINTS)
 
         neighbors = []
@@ -653,7 +639,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
                         TDB.add_obs(gi, a, uvA)
                         TDB.add_obs(gi, b, uvB)
 
-        # ---------- Triangulation (alle Anker) --------------------------
+        # Triangulation using all anchors
         if allow_new_points:
             pairs_all, ptsA_all, ptsF_all, ANCH_all = [], [], [], []
             for a in anchors:
@@ -716,10 +702,10 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
                             TDB.add_obs(gi, qa[0], tuple(uvA))
                             TDB.add_obs(gi, fi, tuple(uvF))
 
-        # ------- Nach jedem Frame: Punkte befördern --------------------
+        # Promote points after each frame
         TDB.promote_points(poses_R, poses_t, adapt_from_reproj=(med_repro or None))
 
-    # ---- Optional: Densify-Pass --------------------------------------
+    # Optional densify pass
     if cfg.DENSIFY_ENABLE and len(poses_R) >= 2:
         vis = sorted(poses_R.keys())
         for ia, a in enumerate(vis):
@@ -751,12 +737,10 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
                     gi = TDB.new_point(X)
                     track3d[qa] = gi; track3d[qb] = gi
                     TDB.add_obs(gi, a, uvA); TDB.add_obs(gi, b, uvB)
-        # Nachverdichtet: erneut promoten
         TDB.promote_points(poses_R, poses_t)
 
-    # ---- Optional: Loop-Constraints leichte Glättung ------------------
+    # Optional loop constraints with light smoothing
     if cfg.USE_LOOP_CONSTRAINTS and len(poses_R) >= 4:
-        # Wir verwenden vorhandene (a,b)-Paare als Schleifen, wenn weit auseinander & viele Matches
         loops = []
         for (a, b), m in matches.items():
             if (b - a) <= min(cfg.LOOP_MAX_SPAN, max(6, cfg.INIT_MAX_SPAN)):
@@ -766,16 +750,15 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
         if loops:
             loops.sort(key=lambda x: -x[2])
             log(f"[sfm] loop constraints used: {len(loops)} (top: {loops[:3]})")
-            # einfache Pose-Glättung nach Loops (kein volles BA):
             if cfg.POSE_SMOOTHING:
                 _smooth_poses(poses_R, poses_t, lam=float(cfg.SMOOTH_LAMBDA))
 
-    # --------- output --------------------------------------------------
+    # Output
     pts = TDB.valid_points_array()
     log(f"[sfm] raw_points(after validation)={len(pts)}")
     if len(pts) == 0:
-        raise RuntimeError("SfM erzeugte 0 gültige Punkte – Parallaxe/Qualität unzureichend oder Gates zu streng.")
-    prog(95, "SfM – Punkte sammeln")
+        raise RuntimeError("SfM produced 0 valid points — insufficient parallax/quality or thresholds too strict.")
+    prog(95, "SfM – Collect points")
 
     if poses_out_dir is not None and len(poses_R) > 0:
         _save_camera_poses_npz_csv(poses_R, poses_t, poses_out_dir, on_log=on_log)
@@ -792,7 +775,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
     return pts, poses_R, poses_t
 
 
-# --------------------------- ensemble wrapper -------------------------
+# Ensemble wrapper
 
 def run_sfm_multi(keypoints, descriptors, shapes, pairs, matches, K,
                   n_runs: int = 5,

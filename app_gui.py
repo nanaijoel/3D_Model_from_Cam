@@ -42,12 +42,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.last_ply = ""
         self.project_root = ""
 
-        self.btn_pick = QtWidgets.QPushButton("Video auswählen…")
-        self.lbl_video = QtWidgets.QLabel("Keine Datei gewählt")
+        self.btn_pick = QtWidgets.QPushButton("Choose video…")
+        self.lbl_video = QtWidgets.QLabel("No file selected")
         self.lbl_video.setWordWrap(True)
 
         self.txt_project = QtWidgets.QLineEdit()
-        self.txt_project.setPlaceholderText("Projektname (z.B. buddha_better)")
+        self.txt_project.setPlaceholderText("Project name (e.g., buddha_better)")
 
         self.spin_frames = QtWidgets.QSpinBox()
         self.spin_frames.setRange(50, 2000)
@@ -61,7 +61,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self.lbl_stage = QtWidgets.QLabel("…")
-        self.chk_autoscroll = QtWidgets.QCheckBox("Autoscroll Log")
+        self.chk_autoscroll = QtWidgets.QCheckBox("Autoscroll log")
         self.chk_autoscroll.setChecked(True)
 
         self.log = QtWidgets.QTextEdit()
@@ -69,26 +69,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.cmb_mesh = QtWidgets.QComboBox()
         self.cmb_mesh.setMinimumWidth(420)
-        self.btn_choose_mesh = QtWidgets.QPushButton("Auswählen…")
+        self.btn_choose_mesh = QtWidgets.QPushButton("Browse…")
         self.btn_show = QtWidgets.QPushButton("Open 3D Model")
-        self.btn_show.setEnabled(False)   # just activated, if at least one mesh available
+        self.btn_show.setEnabled(False)   # only enabled if at least one mesh available
 
-        # --- NEU: MeshLab-Button ---
-        self.btn_meshlab = QtWidgets.QPushButton("In MeshLab öffnen")
+        self.btn_meshlab = QtWidgets.QPushButton("Open in MeshLab")
         self.btn_meshlab.setEnabled(False)
 
         form = QtWidgets.QFormLayout()
         form.addRow(self.btn_pick, self.lbl_video)
-        form.addRow("Projektname:", self.txt_project)
-        form.addRow("Ziel-Frames:", self.spin_frames)
+        form.addRow("Project name:", self.txt_project)
+        form.addRow("Target frames:", self.spin_frames)
         form.addRow(self.btn_compute, self.progress)
-        form.addRow("Schritt:", self.lbl_stage)
+        form.addRow("Stage:", self.lbl_stage)
         form.addRow(self.chk_autoscroll)
 
         mesh_row = QtWidgets.QHBoxLayout()
         mesh_row.addWidget(self.cmb_mesh, 1)
         mesh_row.addWidget(self.btn_choose_mesh)
-        form.addRow("Mesh auswählen:", mesh_row)
+        form.addRow("Select mesh:", mesh_row)
 
         top = QtWidgets.QWidget()
         top.setLayout(form)
@@ -101,7 +100,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bottom = QtWidgets.QWidget()
         bl = QtWidgets.QHBoxLayout(bottom)
         bl.addWidget(self.btn_show)
-        bl.addWidget(self.btn_meshlab)  # NEU
+        bl.addWidget(self.btn_meshlab)
 
         container = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(container)
@@ -113,7 +112,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_compute.clicked.connect(self.compute)
         self.btn_show.clicked.connect(self.show_mesh)
         self.btn_choose_mesh.clicked.connect(self.choose_mesh)
-        self.btn_meshlab.clicked.connect(self.open_in_meshlab)  # NEU
+        self.btn_meshlab.clicked.connect(self.open_in_meshlab)
 
         self.scan_meshes()
 
@@ -135,7 +134,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.cmb_mesh.blockSignals(False)
         self.btn_show.setEnabled(self.cmb_mesh.count() > 0)
-        self.btn_meshlab.setEnabled(self.cmb_mesh.count() > 0)  # NEU
+        self.btn_meshlab.setEnabled(self.cmb_mesh.count() > 0)
 
     def ensure_in_combo(self, path: str):
         if not path:
@@ -145,26 +144,26 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.cmb_mesh.itemData(i) == path:
                 self.cmb_mesh.setCurrentIndex(i)
                 self.btn_show.setEnabled(True)
-                self.btn_meshlab.setEnabled(True)  # NEU
+                self.btn_meshlab.setEnabled(True)
                 return
 
         label = os.path.relpath(path, self.base_dir) if os.path.commonpath([self.base_dir, os.path.abspath(path)]) == self.base_dir else os.path.basename(path)
         self.cmb_mesh.addItem(label, userData=path)
         self.cmb_mesh.setCurrentIndex(self.cmb_mesh.count() - 1)
         self.btn_show.setEnabled(True)
-        self.btn_meshlab.setEnabled(True)  # NEU
+        self.btn_meshlab.setEnabled(True)
 
     def choose_mesh(self):
-        filters = "PLY Mesh (*.ply);;Alle Dateien (*)"
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Mesh wählen", self.base_dir, filters)
+        filters = "PLY Mesh (*.ply);;All files (*)"
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Choose mesh", self.base_dir, filters)
         if not path:
             return
         self.ensure_in_combo(path)
 
     def pick_video(self):
-        filters = ("Video-Dateien (*.mp4 *.MP4 *.mov *.MOV *.m4v *.M4V *.avi *.AVI *.mkv *.MKV *.webm *.WEBM *.wmv *.WMV);;"
-                   "Alle Dateien (*)")
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Video wählen", self.base_dir, filters)
+        filters = ("Video files (*.mp4 *.MP4 *.mov *.MOV *.m4v *.M4V *.avi *.AVI *.mkv *.MKV *.webm *.WEBM *.wmv *.WMV);;"
+                   "All files (*)")
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Choose video", self.base_dir, filters)
         if not path:
             return
         self.video_path = path
@@ -185,7 +184,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def compute(self):
         if not self.video_path:
-            QtWidgets.QMessageBox.warning(self, "Hinweis", "Bitte Video auswählen.")
+            QtWidgets.QMessageBox.warning(self, "Notice", "Please choose a video.")
             return
         project = self.txt_project.text().strip() or "default_project"
         target_frames = int(self.spin_frames.value())
@@ -196,15 +195,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker.done.connect(self.on_done)
         self.worker.failed.connect(self.on_failed)
         self.worker.start()
-        self.append_log("[ui] Pipeline gestartet…")
+        self.append_log("[ui] Pipeline started…")
 
     def on_done(self, ply_path: str, project_root: str):
         self.last_ply = ply_path
         self.project_root = project_root
         self.btn_compute.setEnabled(True)
         self.btn_show.setEnabled(True)
-        self.btn_meshlab.setEnabled(True)  # NEU
-        self.append_log(f"[ui] Fertig: {ply_path}")
+        self.btn_meshlab.setEnabled(True)
+        self.append_log(f"[ui] Done: {ply_path}")
         self.scan_meshes()
         if os.path.isfile(ply_path):
             self.ensure_in_combo(ply_path)
@@ -212,7 +211,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_failed(self, msg: str):
         self.btn_compute.setEnabled(True)
         self.append_log("[error]\n" + msg)
-        QtWidgets.QMessageBox.critical(self, "Fehler", msg)
+        QtWidgets.QMessageBox.critical(self, "Error", msg)
 
     def _current_ply_path(self) -> str:
         ply_path = self.last_ply
@@ -222,17 +221,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 ply_path = sel
         return ply_path if (ply_path and os.path.isfile(ply_path)) else ""
 
-    # --- NEU: super-simpler Start des MeshLab-Binaries (mit kleinem, sauberem Qt-Env) ---
     def open_in_meshlab(self):
         ply_path = self._current_ply_path()
         if not ply_path:
-            QtWidgets.QMessageBox.information(self, "Hinweis", "Kein gültiges PLY ausgewählt/gefunden.")
+            QtWidgets.QMessageBox.information(self, "Notice", "No valid PLY file selected/found.")
             return
 
         appdir = os.path.expanduser("~/MeshLab/MeshLab2025.07-linux_x86_64")
         exe = os.path.join(appdir, "usr", "bin", "meshlab")
 
-        # kleines, sauberes Env gegen xcb-Ärger durch cv2/qt/plugins
         env = os.environ.copy()
         for k in ["QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH", "QT_STYLE_OVERRIDE",
                   "QT_API", "QT_QPA_PLATFORMTHEME", "PYTHONPATH", "LD_LIBRARY_PATH"]:
@@ -240,7 +237,7 @@ class MainWindow(QtWidgets.QMainWindow):
         env["QT_QPA_PLATFORM"] = "xcb"
 
         subprocess.Popen([exe, os.path.abspath(ply_path)], cwd=appdir, env=env)
-        self.append_log(f"[ui] Öffne in MeshLab: {ply_path}")
+        self.append_log(f"[ui] Open in MeshLab: {ply_path}")
 
     def show_mesh(self):
         ply_path = self.last_ply
@@ -250,13 +247,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 ply_path = sel
 
         if not ply_path or not os.path.isfile(ply_path):
-            QtWidgets.QMessageBox.information(self, "Hinweis", "Kein gültiges PLY ausgewählt/gefunden.")
+            QtWidgets.QMessageBox.information(self, "Notice", "No valid PLY file selected/found.")
             return
         try:
             pcd = o3d.io.read_point_cloud(ply_path)
             o3d.visualization.draw_geometries([pcd])
         except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Fehler beim Öffnen", str(e))
+            QtWidgets.QMessageBox.critical(self, "Error opening", str(e))
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ import cv2 as cv
 import numpy as np
 import torch
 
-# --------------------------------- helpers ---------------------------------
+# helpers
 
 def _rootsift(des):
     if des is None or len(des) == 0:
@@ -20,7 +20,7 @@ def _kp_to_np(kps):
         out[i] = (k.pt[0], k.pt[1], k.size, k.angle, k.response, k.octave, k.class_id)
     return out
 
-# ------------------------------ SuperPoint glue -----------------------------
+# SuperPoint glue
 
 def _to_tensor(img_gray: np.ndarray) -> torch.Tensor:
     # uint8 [H,W] -> float [1,1,H,W] in [0,1]
@@ -36,7 +36,7 @@ def _sp_to_cv_kp(sp_kp: torch.Tensor, scores: torch.Tensor) -> List[cv.KeyPoint]
         kps.append(cv.KeyPoint(float(x), float(y), 3.0, -1.0, float(s), 0, -1))
     return kps
 
-# ------------------------------ API: extract -------------------------------
+# API: extract
 
 def extract_features(
     images: List[str],
@@ -88,7 +88,7 @@ def extract_features(
         fg = cv.morphologyEx(fg, cv.MORPH_CLOSE, k, iterations=2)
         return fg
 
-    # --- choose extractor
+    # choose extractor
     sp = None
     if backend == "superpoint":
         try:
