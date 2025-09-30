@@ -37,7 +37,7 @@ def build_pairs(
     N = len(descriptors)
     idxs = list(range(N))
 
-    # simple neighborhood pairs (i, i+1..i+4) plus a few long-range pairs
+    # simple neighborhood pairs
     pairs: List[Pair] = []
     for i in idxs:
         for d in range(1, 5):

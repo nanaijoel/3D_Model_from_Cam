@@ -1,4 +1,4 @@
-# sfm_incremental.py
+# sfm_incremental.py (refactored)
 import os
 import numpy as np
 import cv2 as cv
@@ -6,7 +6,9 @@ from typing import Callable, List, Dict, Tuple, Optional, DefaultDict
 from dataclasses import dataclass
 from collections import defaultdict
 
+# =========================
 # Config
+# =========================
 
 @dataclass
 class SfMConfig:
@@ -71,7 +73,9 @@ class SfMConfig:
     SMOOTH_LAMBDA: float = 0.25
 
 
+# =========================
 # Helpers
+# =========================
 
 def _idx2pts(matches, kps1, kps2):
     pts1 = np.float32([kps1[m.queryIdx].pt for m in matches])
@@ -153,7 +157,9 @@ def _pairwise_max_parallax_deg(Kinv, poses_R, poses_t, obs_list):
     return best
 
 
+# =========================
 # Track database
+# =========================
 
 class TrackDB:
     """Manages 3D points, observations and promotion (multi-view validation)."""
@@ -215,6 +221,7 @@ class TrackDB:
                     self.state[gi] = 'ok'
                     continue
 
+            # Low-parallax fallback
             if len(ob) >= self.cfg.LOWPAR_FALLBACK_MIN_OBS:
                 fa, uva = ob[0]
                 fb, uvb = ob[-1]
@@ -247,7 +254,9 @@ class TrackDB:
                         dtype=float)
 
 
+# =========================
 # Keyframes and smoothing utilities
+# =========================
 
 def _should_be_keyframe(K, poses_R, poses_t, last_kf_idx: int, fi: int,
                         anchors: List[int], kps, matches, track3d, tdb: TrackDB, cfg: SfMConfig) -> bool:
@@ -316,7 +325,383 @@ def _smooth_poses(poses_R: Dict[int, np.ndarray], poses_t: Dict[int, np.ndarray]
         poses_t[i] = -poses_R[i] @ C
 
 
-# Main
+# =========================
+# NEW: SfM pipeline subroutines
+# =========================
+
+def _init_window_bounds(N: int, cfg: SfMConfig):
+    mid = (cfg.INIT_WINDOW_CENTER if cfg.INIT_WINDOW_CENTER is not None else (N // 2))
+    if cfg.INIT_WINDOW_RATIO is not None:
+        w_candidate = max(1, int(round(N * float(cfg.INIT_WINDOW_RATIO))))
+    else:
+        w_candidate = max(10, N // 3)
+    w = min(cfg.INIT_WINDOW_FRAMES, w_candidate)
+    return mid, w
+
+def _in_init_window(i, j, mid, w, cfg: SfMConfig):
+    return (abs(j - i) <= cfg.INIT_MAX_SPAN) and (min(i, j) >= mid - w) and (max(i, j) <= mid + w)
+
+def _select_init_pair(pairs, matches, keypoints, K, cfg: SfMConfig, mid, w,
+                      on_log: Optional[Callable[[str], None]] = None):
+    """Pick best (i0,j0) & recover relative pose."""
+    def log(m): on_log and on_log(m)
+    best = dict(score=-1.0, pair=None, R=None, t=None, mask=None)
+    stats = []
+    for (i, j) in pairs:
+        if not _in_init_window(i, j, mid, w, cfg):
+            continue
+        m = matches.get((i, j), [])
+        if len(m) < cfg.MIN_MATCHES_INIT:
+            continue
+        p1, p2 = _idx2pts(m, keypoints[i], keypoints[j])
+        flow = float(np.median(np.linalg.norm(p2 - p1, axis=1)))
+        if flow < cfg.MIN_FLOW_PX:
+            continue
+        E, maskE = cv.findEssentialMat(p1, p2, K, method=cv.RANSAC, prob=0.999, threshold=1.5)
+        if E is None:
+            continue
+        _, R, t, maskP = cv.recoverPose(E, p1, p2, K)
+        inl_mask = (maskP.ravel().astype(bool)) & (maskE.ravel().astype(bool)[:len(maskP)])
+        inliers = int(inl_mask.sum())
+        if inliers < cfg.MIN_INLIERS_INIT:
+            continue
+        cheir = 0
+        if inliers > 0:
+            X = _triangulate(K, np.eye(3), np.zeros((3, 1)), R, t, p1[inl_mask], p2[inl_mask])
+            cheir = int((_in_front(np.eye(3), np.zeros((3, 1)), X) &
+                         _in_front(R, t, X)).sum())
+        score = inliers + 2.0 * cheir
+        stats.append((i, j, len(m), flow, inliers, cheir, score))
+        if score > best["score"]:
+            best.update(score=score, pair=(i, j), R=R, t=t, mask=inl_mask)
+
+    # Optional forced pair
+    if (cfg.FORCE_INIT_PAIR is not None) and (cfg.FORCE_INIT_PAIR in matches):
+        i0, j0 = cfg.FORCE_INIT_PAIR
+        log(f"[sfm] FORCE init pair = ({i0},{j0})")
+        kps0, kps1 = keypoints[i0], keypoints[j0]
+        m01 = matches[(i0, j0)]
+        p1_all, p2_all = _idx2pts(m01, kps0, kps1)
+        E, _ = cv.findEssentialMat(p1_all, p2_all, K, method=cv.RANSAC, prob=0.999, threshold=1.5)
+        _, R, t, maskP = cv.recoverPose(E, p1_all, p2_all, K)
+        best.update(score=float(len(m01)), pair=(i0, j0), R=R, t=t, mask=maskP.ravel().astype(bool))
+
+    if best["pair"] is None:
+        if stats:
+            stats.sort(key=lambda x: x[-1], reverse=True)
+            top = "\n".join([f"   cand ({a},{b}): matches={mm}, inl={ii}, cheirality={ch}, score={sc:.1f}"
+                             for (a, b, mm, _, ii, ch, sc) in stats[:8]])
+            log("[sfm] Init candidates (top):\n" + top)
+        raise RuntimeError("[sfm] Initialization failed.")
+
+    return best
+
+def _initialize_with_pair(best, keypoints, matches, K, on_log=None):
+    """Build initial poses, triangulate, seed TrackDB/track3d."""
+    def log(m): on_log and on_log(m)
+    (i0, j0) = best["pair"]
+    kps0, kps1 = keypoints[i0], keypoints[j0]
+    m01 = matches[(i0, j0)]
+    p1_all, p2_all = _idx2pts(m01, kps0, kps1)
+    R = best["R"]; t = best["t"]; mask = best["mask"]
+
+    poses_R = {i0: np.eye(3), j0: R}
+    poses_t = {i0: np.zeros((3, 1)), j0: t}
+
+    p1_in = p1_all[mask]; p2_in = p2_all[mask]
+    X_init = _triangulate(K, poses_R[i0], poses_t[i0], poses_R[j0], poses_t[j0], p1_in, p2_in)
+    front = _in_front(poses_R[i0], poses_t[i0], X_init) & _in_front(poses_R[j0], poses_t[j0], X_init)
+
+    if not np.any(front):
+        R_inv = R.T
+        t_inv = -R_inv @ t
+        X_try = _triangulate(K, poses_R[i0], poses_t[i0], R_inv, t_inv, p1_in, p2_in)
+        front2 = _in_front(poses_R[i0], poses_t[i0], X_try) & _in_front(R_inv, t_inv, X_try)
+        if np.any(front2):
+            R, t = R_inv, t_inv
+            poses_R[j0], poses_t[j0] = R, t
+            X_init, front = X_try, front2
+
+    X_init = X_init[front]
+    log(f"[sfm] init pair = ({i0},{j0}) score={best['score']:.1f}")
+    log(f"[sfm] init inliers={int(mask.sum())} cheirality={int(front.sum())}")
+    log(f"[sfm] X_init={len(X_init)}")
+
+    # Seed TrackDB
+    TDB = TrackDB(K, SfMConfig())  # cfg overwritten by caller right after
+    TDB.cfg = TDB.cfg  # no-op, kept for clarity
+    track3d: Dict[Tuple[int, int], int] = {}
+    idx_inliers = np.where(mask)[0][front]
+    for k, mi in enumerate(idx_inliers):
+        mm = m01[mi]
+        qa = (i0, mm.queryIdx)
+        qb = (j0, mm.trainIdx)
+        gi = TDB.new_point(X_init[k])
+        track3d[qa] = gi
+        track3d[qb] = gi
+        TDB.add_obs(gi, i0, keypoints[i0][mm.queryIdx].pt)
+        TDB.add_obs(gi, j0, keypoints[j0][mm.trainIdx].pt)
+    return (i0, j0), poses_R, poses_t, track3d, TDB
+
+def _count_corr_for_frame(fi: int, visited: set, matches, track3d) -> int:
+    c = 0
+    for a in visited:
+        if (a, fi) not in matches:
+            continue
+        for mm in matches[(a, fi)]:
+            if (a, mm.queryIdx) in track3d:
+                c += 1
+    return c
+
+def _collect_2d3d_for_frame(fi: int, anchors: List[int],
+                            keypoints, matches, track3d, TDB: TrackDB):
+    obj_pts, img_pts = [], []
+    used_g = set()
+    for a in anchors:
+        for mm in matches[(a, fi)]:
+            qa = (a, mm.queryIdx); qb = (fi, mm.trainIdx)
+            if qa in track3d:
+                gi = track3d[qa]
+                if gi < len(TDB.points3d) and TDB.points3d[gi] is not None:
+                    if gi in used_g:
+                        track3d[qb] = gi
+                        TDB.add_obs(gi, fi, keypoints[fi][mm.trainIdx].pt)
+                        continue
+                    obj_pts.append(TDB.points3d[gi])
+                    img_pts.append(keypoints[fi][mm.trainIdx].pt)
+                    track3d[qb] = gi
+                    TDB.add_obs(gi, fi, keypoints[fi][mm.trainIdx].pt)
+                    used_g.add(gi)
+    return np.array(obj_pts, float), np.array(img_pts, float)
+
+def _estimate_pose_pnp(obj_pts, img_pts, K, cfg: SfMConfig):
+    """PnP RANSAC + optional acceptance via reproj & cheirality."""
+    ok, rvec, tvec, inl = cv.solvePnPRansac(
+        obj_pts, img_pts, K, None,
+        reprojectionError=float(cfg.PNP_ERR_PX),
+        iterationsCount=int(cfg.PNP_ITERS),
+        confidence=0.999
+    )
+    inliers = int(len(inl)) if (inl is not None) else 0
+    accept = bool(ok and inliers >= cfg.MIN_INLIERS_PNP)
+    repro = None
+    med_repro = None
+
+    if ok and inl is not None:
+        proj, _ = cv.projectPoints(obj_pts[inl.ravel()], rvec, tvec, K, None)
+        err = np.linalg.norm(proj.squeeze() - img_pts[inl.ravel()], axis=1)
+        repro = float(np.mean(err))
+        med_repro = float(np.median(err))
+        if not accept:
+            accept = (repro <= cfg.PNP_REPROJ_ACCEPT)
+
+    if not accept:
+        return None, None, inliers, repro, med_repro, inl
+
+    # LM refine
+    try:
+        rvec, tvec = cv.solvePnPRefineLM(
+            objectPoints=obj_pts[inl.ravel()],
+            imagePoints=img_pts[inl.ravel()],
+            cameraMatrix=K, distCoeffs=None,
+            rvec=rvec, tvec=tvec,
+            criteria=(cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_COUNT, 20, 1e-6)
+        )
+    except Exception:
+        pass
+
+    if repro is None:
+        proj, _ = cv.projectPoints(obj_pts[inl.ravel()], rvec, tvec, K, None)
+        err = np.linalg.norm(proj.squeeze() - img_pts[inl.ravel()], axis=1)
+        repro = float(np.mean(err))
+        med_repro = float(np.median(err))
+
+    Rfi, _ = cv.Rodrigues(rvec)
+    tfi = tvec.reshape(3, 1)
+    return Rfi, tfi, inliers, repro, med_repro, inl
+
+def _local_stereo_seed(fi: int, poses_R, poses_t, keypoints, matches, K, cfg: SfMConfig,
+                       track3d, TDB: TrackDB):
+    kept = 0
+    neighbors = []
+    for d in range(1, cfg.SEED_SPAN + 1):
+        if (fi, fi + d) in matches: neighbors.append((fi, fi + d))
+        if (fi - d, fi) in matches: neighbors.append((fi - d, fi))
+    for (a, b) in neighbors:
+        mlist = matches.get((a, b), [])
+        if len(mlist) < cfg.SEED_MIN_INL:
+            continue
+        if a not in poses_R or b not in poses_R:
+            continue
+        pts_a, pts_b = _idx2pts(mlist, keypoints[a], keypoints[b])
+        XA = _triangulate(K, poses_R[a], poses_t[a], poses_R[b], poses_t[b], pts_a, pts_b)
+        front_seed = _in_front(poses_R[a], poses_t[a], XA) & _in_front(poses_R[b], poses_t[b], XA)
+        if not np.any(front_seed):
+            continue
+        errA = _reproj_err(K, poses_R[a], poses_t[a], XA, pts_a)
+        errB = _reproj_err(K, poses_R[b], poses_t[b], XA, pts_b)
+        raysA = _bearing_in_world(np.linalg.inv(K), poses_R[a], pts_a)
+        raysB = _bearing_in_world(np.linalg.inv(K), poses_R[b], pts_b)
+        cosang = np.clip(np.sum(raysA * raysB, axis=1), -1, 1)
+        angdeg = np.degrees(np.arccos(cosang))
+        good = front_seed & (errA <= cfg.SEED_REPROJ) & (errB <= cfg.SEED_REPROJ) & (angdeg >= cfg.TRI_MIN_PARALLAX_DEG)
+        if not np.any(good):
+            continue
+        for (mm, keep, X, uvA, uvB) in zip(mlist, good, XA, pts_a, pts_b):
+            if not keep:
+                continue
+            qa = (a, mm.queryIdx); qb = (b, mm.trainIdx)
+            gi = track3d.get(qa, None)
+            if gi is not None and TDB.points3d[gi] is not None:
+                track3d[qb] = gi
+                TDB.add_obs(gi, b, uvB)
+            else:
+                gi = TDB.new_point(X)
+                track3d[qa] = gi
+                track3d[qb] = gi
+                TDB.add_obs(gi, a, uvA)
+                TDB.add_obs(gi, b, uvB)
+            kept += 1
+    return kept
+
+def _anchor_triangulation(fi: int, anchors: List[int], poses_R, poses_t,
+                          keypoints, matches, K, cfg: SfMConfig, track3d, TDB: TrackDB):
+    pairs_all, ptsA_all, ptsF_all, ANCH_all = [], [], [], []
+    for a in anchors:
+        for mm in matches[(a, fi)]:
+            qa = (a, mm.queryIdx); qb = (fi, mm.trainIdx)
+            if qb in track3d:
+                gi = track3d[qb]
+                TDB.add_obs(gi, fi, keypoints[fi][mm.trainIdx].pt)
+                continue
+            if qa in track3d and (TDB.points3d[track3d[qa]] is not None):
+                gi = track3d[qa]
+                track3d[qb] = gi
+                TDB.add_obs(gi, fi, keypoints[fi][mm.trainIdx].pt)
+                continue
+            pairs_all.append((qa, qb))
+            ptsA_all.append(keypoints[a][mm.queryIdx].pt)
+            ptsF_all.append(keypoints[fi][mm.trainIdx].pt)
+            ANCH_all.append(a)
+
+    if len(pairs_all) < cfg.TRI_MIN_CORR:
+        return 0
+
+    ptsA_np = np.float32(ptsA_all)
+    ptsF_np = np.float32(ptsF_all)
+    keep_idx_global = []
+    X_global = []
+    unique_anchors = list(sorted(set(ANCH_all)))
+    for a in unique_anchors:
+        idx = [k for k, aa in enumerate(ANCH_all) if aa == a]
+        if len(idx) < 6:
+            continue
+        XA = _triangulate(K, poses_R[a], poses_t[a], poses_R[fi], poses_t[fi],
+                          ptsA_np[idx], ptsF_np[idx])
+        front = _in_front(poses_R[a], poses_t[a], XA) & _in_front(poses_R[fi], poses_t[fi], XA)
+        if not np.any(front):
+            continue
+        errA = _reproj_err(K, poses_R[a], poses_t[a], XA, ptsA_np[idx])
+        errF = _reproj_err(K, poses_R[fi], poses_t[fi], XA, ptsF_np[idx])
+        raysA = _bearing_in_world(np.linalg.inv(K), poses_R[a], ptsA_np[idx])
+        raysF = _bearing_in_world(np.linalg.inv(K), poses_R[fi], ptsF_np[idx])
+        cosang = np.clip(np.sum(raysA * raysF, axis=1), -1, 1)
+        angdeg = np.degrees(np.arccos(cosang))
+        good = front & (errA <= cfg.TRI_REPROJ_MAX) & (errF <= cfg.TRI_REPROJ_MAX) & (angdeg >= cfg.TRI_MIN_PARALLAX_DEG)
+        if not np.any(good):
+            continue
+        for loc_k, ok in zip(idx, good):
+            if ok:
+                keep_idx_global.append(loc_k)
+        X_global.extend(list(XA[good]))
+    if len(keep_idx_global) < cfg.TRI_MIN_CORR:
+        return 0
+
+    created = 0
+    for k, X in zip(keep_idx_global, X_global):
+        qa, qb = pairs_all[k]
+        gi = track3d.get(qa, None)
+        uvA = ptsA_np[k]; uvF = ptsF_np[k]
+        if gi is not None and TDB.points3d[gi] is not None:
+            track3d[qb] = gi
+            TDB.add_obs(gi, fi, tuple(uvF))
+        else:
+            gi = TDB.new_point(X)
+            track3d[qa] = gi
+            track3d[qb] = gi
+            TDB.add_obs(gi, qa[0], tuple(uvA))
+            TDB.add_obs(gi, fi, tuple(uvF))
+        created += 1
+    return created
+
+def _densify_pass(poses_R, poses_t, keypoints, matches, K, cfg: SfMConfig, track3d, TDB: TrackDB):
+    if not (cfg.DENSIFY_ENABLE and len(poses_R) >= 2):
+        return 0
+    created = 0
+    vis = sorted(poses_R.keys())
+    Kinv = np.linalg.inv(K)
+    for ia, a in enumerate(vis):
+        for b in vis[ia+1:]:
+            if abs(b - a) > cfg.DENSIFY_MAX_SPAN:
+                continue
+            mlist = matches.get((a, b), [])
+            if len(mlist) < cfg.DENSIFY_MIN_MATCHES:
+                continue
+            pts_a, pts_b = _idx2pts(mlist, keypoints[a], keypoints[b])
+            XA = _triangulate(K, poses_R[a], poses_t[a], poses_R[b], poses_t[b], pts_a, pts_b)
+            front = _in_front(poses_R[a], poses_t[a], XA) & _in_front(poses_R[b], poses_t[b], XA)
+            if not np.any(front):
+                continue
+            errA = _reproj_err(K, poses_R[a], poses_t[a], XA, pts_a)
+            errB = _reproj_err(K, poses_R[b], poses_t[b], XA, pts_b)
+            raysA = _bearing_in_world(Kinv, poses_R[a], pts_a)
+            raysB = _bearing_in_world(Kinv, poses_R[b], pts_b)
+            ang = np.degrees(np.arccos(np.clip(np.sum(raysA * raysB, axis=1), -1, 1)))
+            good = front & (errA <= cfg.DENSIFY_MAX_REPROJ) & (errB <= cfg.DENSIFY_MAX_REPROJ) & (ang >= cfg.DENSIFY_MIN_PARALLAX_DEG)
+            if not np.any(good):
+                continue
+            for mm, keep, X, uvA, uvB in zip(mlist, good, XA, pts_a, pts_b):
+                if not keep:
+                    continue
+                qa = (a, mm.queryIdx); qb = (b, mm.trainIdx)
+                if qa in track3d or qb in track3d:
+                    continue
+                gi = TDB.new_point(X)
+                track3d[qa] = gi; track3d[qb] = gi
+                TDB.add_obs(gi, a, uvA); TDB.add_obs(gi, b, uvB)
+                created += 1
+    TDB.promote_points(poses_R, poses_t)
+    return created
+
+def _maybe_apply_loops_and_smooth(poses_R, poses_t, matches, cfg: SfMConfig, on_log=None):
+    def log(m): on_log and on_log(m)
+    if not (cfg.USE_LOOP_CONSTRAINTS and len(poses_R) >= 4):
+        return
+    loops = []
+    for (a, b), m in matches.items():
+        if (b - a) <= min(cfg.LOOP_MAX_SPAN, max(6, cfg.INIT_MAX_SPAN)):
+            continue
+        if len(m) >= cfg.LOOP_MIN_INLIERS and (a in poses_R) and (b in poses_R):
+            loops.append((a, b, len(m)))
+    if loops:
+        loops.sort(key=lambda x: -x[2])
+        log(f"[sfm] loop constraints used: {len(loops)} (top: {loops[:3]})")
+        if cfg.POSE_SMOOTHING:
+            _smooth_poses(poses_R, poses_t, lam=float(cfg.SMOOTH_LAMBDA))
+
+def _finalize_output(TDB: TrackDB, poses_R, poses_t, poses_out_dir, on_log=None):
+    def log(m): on_log and on_log(m)
+    pts = TDB.valid_points_array()
+    log(f"[sfm] raw_points(after validation)={len(pts)}")
+    if len(pts) == 0:
+        raise RuntimeError("SfM produced 0 valid points — insufficient parallax/quality or thresholds too strict.")
+    if poses_out_dir is not None and len(poses_R) > 0:
+        _save_camera_poses_npz_csv(poses_R, poses_t, poses_out_dir, on_log=on_log)
+    return pts
+
+# =========================
+# Main: run_sfm (refactored)
+# =========================
 
 def run_sfm(keypoints: List[List[cv.KeyPoint]],
             descriptors: List[np.ndarray],
@@ -343,149 +728,24 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
 
     cfg = config or SfMConfig()
 
-    # Unpack config
-    MIN_MATCHES_INIT = cfg.MIN_MATCHES_INIT
-    MIN_FLOW_PX = cfg.MIN_FLOW_PX
-    MIN_INLIERS_INIT = cfg.MIN_INLIERS_INIT
-    INIT_WINDOW_FRAMES = cfg.INIT_WINDOW_FRAMES
-    INIT_MAX_SPAN = cfg.INIT_MAX_SPAN
-
-    MIN_INLIERS_PNP = cfg.MIN_INLIERS_PNP
-    PNP_ITERS = cfg.PNP_ITERS
-    PNP_ERR_PX = cfg.PNP_ERR_PX
-    PNP_REPROJ_ACCEPT = cfg.PNP_REPROJ_ACCEPT
-
-    TRI_MIN_CORR = cfg.TRI_MIN_CORR
-    TRI_REPROJ_MAX = cfg.TRI_REPROJ_MAX
-    TRI_MIN_PARALLAX_DEG = cfg.TRI_MIN_PARALLAX_DEG
-
-    SEED_SPAN = cfg.SEED_SPAN
-    SEED_MIN_INL = cfg.SEED_MIN_INL
-    SEED_REPROJ = cfg.SEED_REPROJ
-
-    # Init pair selection (local around the middle)
+    # --- Init pair selection ---
     N = len(shapes)
-    mid = (cfg.INIT_WINDOW_CENTER if cfg.INIT_WINDOW_CENTER is not None else (N // 2))
-    if cfg.INIT_WINDOW_RATIO is not None:
-        w_candidate = max(1, int(round(N * float(cfg.INIT_WINDOW_RATIO))))
-    else:
-        w_candidate = max(10, N // 3)
-    w = min(INIT_WINDOW_FRAMES, w_candidate)
+    mid, w = _init_window_bounds(N, cfg)
+    best = _select_init_pair(pairs, matches, keypoints, K, cfg, mid, w, on_log=on_log)
 
-    def in_init_window(i, j):
-        return (abs(j - i) <= INIT_MAX_SPAN) and (min(i, j) >= mid - w) and (max(i, j) <= mid + w)
-
-    best = dict(score=-1.0, pair=None, R=None, t=None, mask=None)
-    stats = []
-
-    for (i, j) in pairs:
-        if not in_init_window(i, j):
-            continue
-        m = matches.get((i, j), [])
-        if len(m) < MIN_MATCHES_INIT:
-            continue
-        p1, p2 = _idx2pts(m, keypoints[i], keypoints[j])
-        flow = float(np.median(np.linalg.norm(p2 - p1, axis=1)))
-        if flow < MIN_FLOW_PX:
-            continue
-        E, maskE = cv.findEssentialMat(p1, p2, K, method=cv.RANSAC, prob=0.999, threshold=1.5)
-        if E is None:
-            continue
-        _, R, t, maskP = cv.recoverPose(E, p1, p2, K)
-        inl_mask = (maskP.ravel().astype(bool)) & (maskE.ravel().astype(bool)[:len(maskP)])
-        inliers = int(inl_mask.sum())
-        if inliers < MIN_INLIERS_INIT:
-            continue
-        cheir = 0
-        if inliers > 0:
-            X = _triangulate(K, np.eye(3), np.zeros((3, 1)), R, t, p1[inl_mask], p2[inl_mask])
-            cheir = int((_in_front(np.eye(3), np.zeros((3, 1)), X) &
-                         _in_front(R, t, X)).sum())
-        score = inliers + 2.0 * cheir
-        stats.append((i, j, len(m), flow, inliers, cheir, score))
-        if score > best["score"]:
-            best.update(score=score, pair=(i, j), R=R, t=t, mask=inl_mask)
-
-    if (cfg.FORCE_INIT_PAIR is not None) and (cfg.FORCE_INIT_PAIR in matches):
-        i0, j0 = cfg.FORCE_INIT_PAIR
-        log(f"[sfm] FORCE init pair = ({i0},{j0})")
-        kps0, kps1 = keypoints[i0], keypoints[j0]
-        m01 = matches[(i0, j0)]
-        p1_all, p2_all = _idx2pts(m01, kps0, kps1)
-        E, _ = cv.findEssentialMat(p1_all, p2_all, K, method=cv.RANSAC, prob=0.999, threshold=1.5)
-        _, R, t, maskP = cv.recoverPose(E, p1_all, p2_all, K)
-        best.update(score=float(len(m01)), pair=(i0, j0), R=R, t=t, mask=maskP.ravel().astype(bool))
-
-    if best["pair"] is None:
-        if stats:
-            stats.sort(key=lambda x: x[-1], reverse=True)
-            top = "\n".join([f"   cand ({a},{b}): matches={mm}, inl={ii}, cheirality={ch}, score={sc:.1f}"
-                             for (a, b, mm, _, ii, ch, sc) in stats[:8]])
-            log("[sfm] Init candidates (top):\n" + top)
-        raise RuntimeError("[sfm] Initialization failed.")
-
-    i0, j0 = best["pair"]
-    log(f"[sfm] init pair = ({i0},{j0}) score={best['score']:.1f}")
-    kps0, kps1 = keypoints[i0], keypoints[j0]
-    m01 = matches[(i0, j0)]
-    p1_all, p2_all = _idx2pts(m01, kps0, kps1)
-    R = best["R"]; t = best["t"]; mask = best["mask"]
-
-    # Init triangulation
-    poses_R = {i0: np.eye(3), j0: R}
-    poses_t = {i0: np.zeros((3, 1)), j0: t}
-
-    p1_in = p1_all[mask]; p2_in = p2_all[mask]
-    X_init = _triangulate(K, poses_R[i0], poses_t[i0], poses_R[j0], poses_t[j0], p1_in, p2_in)
-    front = _in_front(poses_R[i0], poses_t[i0], X_init) & _in_front(poses_R[j0], poses_t[j0], X_init)
-
-    if not np.any(front):
-        R_inv = R.T
-        t_inv = -R_inv @ t
-        X_try = _triangulate(K, poses_R[i0], poses_t[i0], R_inv, t_inv, p1_in, p2_in)
-        front2 = _in_front(poses_R[i0], poses_t[i0], X_try) & _in_front(R_inv, t_inv, X_try)
-        if np.any(front2):
-            R, t = R_inv, t_inv
-            poses_R[j0], poses_t[j0] = R, t
-            X_init, front = X_try, front2
-
-    X_init = X_init[front]
-    log(f"[sfm] init inliers={int(mask.sum())} cheirality={int(front.sum())}")
-    log(f"[sfm] X_init={len(X_init)}")
+    # --- Initialization with the pair ---
+    (i0, j0), poses_R, poses_t, track3d, TDB = _initialize_with_pair(best, keypoints, matches, K, on_log=on_log)
     prog(60, "SfM – Initialization")
 
-    # Track DB
-    track3d: Dict[Tuple[int, int], int] = {}
-    TDB = TrackDB(K, cfg)
-
-    idx_inliers = np.where(mask)[0][front]
-    for k, mi in enumerate(idx_inliers):
-        mm = m01[mi]
-        qa = (i0, mm.queryIdx)
-        qb = (j0, mm.trainIdx)
-        gi = TDB.new_point(X_init[k])
-        track3d[qa] = gi
-        track3d[qb] = gi
-        TDB.add_obs(gi, i0, keypoints[i0][mm.queryIdx].pt)
-        TDB.add_obs(gi, j0, keypoints[j0][mm.trainIdx].pt)
-
-    # Best-first expansion
+    # --- Best-first expansion ---
     all_frames = sorted(set([i for ij in pairs for i in ij]))
     visited = {i0, j0}
     keyframes = [i0, j0] if cfg.USE_KEYFRAMES else []
-
-    def count_corr(fi: int) -> int:
-        c = 0
-        for a in visited:
-            if (a, fi) not in matches:
-                continue
-            for mm in matches[(a, fi)]:
-                if (a, mm.queryIdx) in track3d:
-                    c += 1
-        return c
-
     remaining = [f for f in all_frames if f not in visited]
     last_kf_idx = j0 if cfg.USE_KEYFRAMES else None
+
+    def count_corr(fi: int) -> int:
+        return _count_corr_for_frame(fi, visited, matches, track3d)
 
     while remaining:
         fi = max(remaining, key=count_corr)
@@ -494,65 +754,21 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
             remaining.remove(fi)
             continue
 
-        # 2D–3D collection for PnP
-        obj_pts, img_pts = [], []
-        used_g = set()
-        for a in anchors:
-            for mm in matches[(a, fi)]:
-                qa = (a, mm.queryIdx); qb = (fi, mm.trainIdx)
-                if qa in track3d:
-                    gi = track3d[qa]
-                    if gi < len(TDB.points3d) and TDB.points3d[gi] is not None:
-                        if gi in used_g:
-                            track3d[qb] = gi
-                            TDB.add_obs(gi, fi, keypoints[fi][mm.trainIdx].pt)
-                            continue
-                        obj_pts.append(TDB.points3d[gi])
-                        img_pts.append(keypoints[fi][mm.trainIdx].pt)
-                        track3d[qb] = gi
-                        TDB.add_obs(gi, fi, keypoints[fi][mm.trainIdx].pt)
-                        used_g.add(gi)
+        obj_pts, img_pts = _collect_2d3d_for_frame(fi, anchors, keypoints, matches, track3d, TDB)
 
         # Keyframe gate
         if cfg.USE_KEYFRAMES and len(obj_pts) < max(cfg.KF_MIN_NEW_2D3D, cfg.MIN_INLIERS_PNP):
             log(f"[sfm] skip non-KF frame {fi}: 2D-3D={len(obj_pts)}")
             remaining.remove(fi)
             continue
-
         if len(obj_pts) < cfg.MIN_INLIERS_PNP:
             log(f"[sfm] try PnP frame {fi}: 2D-3D={len(obj_pts)} need≥{cfg.MIN_INLIERS_PNP}")
             remaining.remove(fi)
             continue
 
-        obj_pts = np.array(obj_pts, dtype=float)
-        img_pts = np.array(img_pts, dtype=float)
-
-        ok, rvec, tvec, inl = cv.solvePnPRansac(
-            obj_pts, img_pts, K, None,
-            reprojectionError=float(PNP_ERR_PX),
-            iterationsCount=int(PNP_ITERS),
-            confidence=0.999
-        )
-        inliers = int(len(inl)) if (inl is not None) else 0
-        accept = bool(ok and inliers >= cfg.MIN_INLIERS_PNP)
-        repro = None
-        med_repro = None
-
-        if ok and inl is not None:
-            proj, _ = cv.projectPoints(obj_pts[inl.ravel()], rvec, tvec, K, None)
-            err = np.linalg.norm(proj.squeeze() - img_pts[inl.ravel()], axis=1)
-            repro = float(np.mean(err))
-            med_repro = float(np.median(err))
-            if not accept:
-                accept = (repro <= PNP_REPROJ_ACCEPT)
-
-        if accept:
-            Rfi, _ = cv.Rodrigues(rvec); tfi = tvec.reshape(3, 1)
-            front = _in_front(Rfi, tfi, obj_pts[inl.ravel()]) if inl is not None else np.ones(len(obj_pts), bool)
-            if np.mean(front.astype(np.float32)) < 0.6:
-                accept = False
-
-        if not accept:
+        res = _estimate_pose_pnp(obj_pts, img_pts, K, cfg)
+        Rfi, tfi, inliers, repro, med_repro, inl = res
+        if Rfi is None:
             msg = f"[sfm] reject frame {fi}: inliers={inliers}"
             if repro is not None:
                 msg += f", repro≈{repro:.2f}px"
@@ -561,25 +777,14 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
             remaining.remove(fi)
             continue
 
-        # Refine pose
-        try:
-            rvec, tvec = cv.solvePnPRefineLM(
-                objectPoints=obj_pts[inl.ravel()],
-                imagePoints=img_pts[inl.ravel()],
-                cameraMatrix=K, distCoeffs=None,
-                rvec=rvec, tvec=tvec,
-                criteria=(cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_COUNT, 20, 1e-6)
-            )
-        except Exception:
-            pass
+        # Cheirality sanity check on inliers
+        front = _in_front(Rfi, tfi, obj_pts[inl.ravel()]) if inl is not None else np.ones(len(obj_pts), bool)
+        if np.mean(front.astype(np.float32)) < 0.6:
+            log(f"[sfm] reject frame {fi}: poor cheirality")
+            _rej_count += 1
+            remaining.remove(fi)
+            continue
 
-        Rfi, _ = cv.Rodrigues(rvec)
-        tfi = tvec.reshape(3, 1)
-        if repro is None:
-            proj, _ = cv.projectPoints(obj_pts[inl.ravel()], rvec, tvec, K, None)
-            err = np.linalg.norm(proj.squeeze() - img_pts[inl.ravel()], axis=1)
-            repro = float(np.mean(err))
-            med_repro = float(np.median(err))
         _acc_repro.append(repro)
         log(f"[sfm] pose {fi}: inliers={inliers} repro={repro:.2f}px (med={med_repro:.2f})")
 
@@ -598,184 +803,41 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
 
         # Local stereo seeding
         allow_new_points = (med_repro is None) or (med_repro <= cfg.FRAME_MAX_MEDIAN_REPROJ_FOR_NEW_POINTS)
-
-        neighbors = []
-        for d in range(1, SEED_SPAN + 1):
-            if (fi, fi + d) in matches: neighbors.append((fi, fi + d))
-            if (fi - d, fi) in matches: neighbors.append((fi - d, fi))
         if allow_new_points:
-            for (a, b) in neighbors:
-                mlist = matches.get((a, b), [])
-                if len(mlist) < SEED_MIN_INL:
-                    continue
-                if a not in poses_R or b not in poses_R:
-                    continue
-                pts_a, pts_b = _idx2pts(mlist, keypoints[a], keypoints[b])
-                XA = _triangulate(K, poses_R[a], poses_t[a], poses_R[b], poses_t[b], pts_a, pts_b)
-                front_seed = _in_front(poses_R[a], poses_t[a], XA) & _in_front(poses_R[b], poses_t[b], XA)
-                if not np.any(front_seed):
-                    continue
-                errA = _reproj_err(K, poses_R[a], poses_t[a], XA, pts_a)
-                errB = _reproj_err(K, poses_R[b], poses_t[b], XA, pts_b)
-                raysA = _bearing_in_world(np.linalg.inv(K), poses_R[a], pts_a)
-                raysB = _bearing_in_world(np.linalg.inv(K), poses_R[b], pts_b)
-                cosang = np.clip(np.sum(raysA * raysB, axis=1), -1, 1)
-                angdeg = np.degrees(np.arccos(cosang))
-                good = front_seed & (errA <= SEED_REPROJ) & (errB <= SEED_REPROJ) & (angdeg >= TRI_MIN_PARALLAX_DEG)
-                if not np.any(good):
-                    continue
-                for (mm, keep, X, uvA, uvB) in zip(mlist, good, XA, pts_a, pts_b):
-                    if not keep:
-                        continue
-                    qa = (a, mm.queryIdx); qb = (b, mm.trainIdx)
-                    gi = track3d.get(qa, None)
-                    if gi is not None and TDB.points3d[gi] is not None:
-                        track3d[qb] = gi
-                        TDB.add_obs(gi, b, uvB)
-                    else:
-                        gi = TDB.new_point(X)
-                        track3d[qa] = gi
-                        track3d[qb] = gi
-                        TDB.add_obs(gi, a, uvA)
-                        TDB.add_obs(gi, b, uvB)
+            _local_stereo_seed(fi, poses_R, poses_t, keypoints, matches, K, cfg, track3d, TDB)
 
-        # Triangulation using all anchors
+        # Triangulation using anchors
         if allow_new_points:
-            pairs_all, ptsA_all, ptsF_all, ANCH_all = [], [], [], []
-            for a in anchors:
-                for mm in matches[(a, fi)]:
-                    qa = (a, mm.queryIdx); qb = (fi, mm.trainIdx)
-                    if qb in track3d:
-                        gi = track3d[qb]
-                        TDB.add_obs(gi, fi, keypoints[fi][mm.trainIdx].pt)
-                        continue
-                    if qa in track3d and (TDB.points3d[track3d[qa]] is not None):
-                        gi = track3d[qa]
-                        track3d[qb] = gi
-                        TDB.add_obs(gi, fi, keypoints[fi][mm.trainIdx].pt)
-                        continue
-                    pairs_all.append((qa, qb))
-                    ptsA_all.append(keypoints[a][mm.queryIdx].pt)
-                    ptsF_all.append(keypoints[fi][mm.trainIdx].pt)
-                    ANCH_all.append(a)
-
-            if len(pairs_all) >= TRI_MIN_CORR:
-                ptsA_np = np.float32(ptsA_all)
-                ptsF_np = np.float32(ptsF_all)
-                keep_idx_global = []
-                X_global = []
-                unique_anchors = list(sorted(set(ANCH_all)))
-                for a in unique_anchors:
-                    idx = [k for k, aa in enumerate(ANCH_all) if aa == a]
-                    if len(idx) < 6:
-                        continue
-                    XA = _triangulate(K, poses_R[a], poses_t[a], poses_R[fi], poses_t[fi],
-                                      ptsA_np[idx], ptsF_np[idx])
-                    front = _in_front(poses_R[a], poses_t[a], XA) & _in_front(poses_R[fi], poses_t[fi], XA)
-                    if not np.any(front):
-                        continue
-                    errA = _reproj_err(K, poses_R[a], poses_t[a], XA, ptsA_np[idx])
-                    errF = _reproj_err(K, poses_R[fi], poses_t[fi], XA, ptsF_np[idx])
-                    raysA = _bearing_in_world(np.linalg.inv(K), poses_R[a], ptsA_np[idx])
-                    raysF = _bearing_in_world(np.linalg.inv(K), poses_R[fi], ptsF_np[idx])
-                    cosang = np.clip(np.sum(raysA * raysF, axis=1), -1, 1)
-                    angdeg = np.degrees(np.arccos(cosang))
-                    good = front & (errA <= TRI_REPROJ_MAX) & (errF <= TRI_REPROJ_MAX) & (angdeg >= TRI_MIN_PARALLAX_DEG)
-                    if not np.any(good):
-                        continue
-                    for loc_k, ok in zip(idx, good):
-                        if ok:
-                            keep_idx_global.append(loc_k)
-                    X_global.extend(list(XA[good]))
-                if len(keep_idx_global) >= TRI_MIN_CORR:
-                    for k, X in zip(keep_idx_global, X_global):
-                        qa, qb = pairs_all[k]
-                        gi = track3d.get(qa, None)
-                        uvA = ptsA_np[k]; uvF = ptsF_np[k]
-                        if gi is not None and TDB.points3d[gi] is not None:
-                            track3d[qb] = gi
-                            TDB.add_obs(gi, fi, tuple(uvF))
-                        else:
-                            gi = TDB.new_point(X)
-                            track3d[qa] = gi
-                            track3d[qb] = gi
-                            TDB.add_obs(gi, qa[0], tuple(uvA))
-                            TDB.add_obs(gi, fi, tuple(uvF))
+            _anchor_triangulation(fi, anchors, poses_R, poses_t, keypoints, matches, K, cfg, track3d, TDB)
 
         # Promote points after each frame
         TDB.promote_points(poses_R, poses_t, adapt_from_reproj=(med_repro or None))
 
-    # Optional densify pass
-    if cfg.DENSIFY_ENABLE and len(poses_R) >= 2:
-        vis = sorted(poses_R.keys())
-        for ia, a in enumerate(vis):
-            for b in vis[ia+1:]:
-                if abs(b - a) > cfg.DENSIFY_MAX_SPAN:
-                    continue
-                mlist = matches.get((a, b), [])
-                if len(mlist) < cfg.DENSIFY_MIN_MATCHES:
-                    continue
-                pts_a, pts_b = _idx2pts(mlist, keypoints[a], keypoints[b])
-                XA = _triangulate(K, poses_R[a], poses_t[a], poses_R[b], poses_t[b], pts_a, pts_b)
-                front = _in_front(poses_R[a], poses_t[a], XA) & _in_front(poses_R[b], poses_t[b], XA)
-                if not np.any(front):
-                    continue
-                errA = _reproj_err(K, poses_R[a], poses_t[a], XA, pts_a)
-                errB = _reproj_err(K, poses_R[b], poses_t[b], XA, pts_b)
-                raysA = _bearing_in_world(np.linalg.inv(K), poses_R[a], pts_a)
-                raysB = _bearing_in_world(np.linalg.inv(K), poses_R[b], pts_b)
-                ang = np.degrees(np.arccos(np.clip(np.sum(raysA * raysB, axis=1), -1, 1)))
-                good = front & (errA <= cfg.DENSIFY_MAX_REPROJ) & (errB <= cfg.DENSIFY_MAX_REPROJ) & (ang >= cfg.DENSIFY_MIN_PARALLAX_DEG)
-                if not np.any(good):
-                    continue
-                for mm, keep, X, uvA, uvB in zip(mlist, good, XA, pts_a, pts_b):
-                    if not keep:
-                        continue
-                    qa = (a, mm.queryIdx); qb = (b, mm.trainIdx)
-                    if qa in track3d or qb in track3d:
-                        continue
-                    gi = TDB.new_point(X)
-                    track3d[qa] = gi; track3d[qb] = gi
-                    TDB.add_obs(gi, a, uvA); TDB.add_obs(gi, b, uvB)
-        TDB.promote_points(poses_R, poses_t)
+    # --- Optional densify ---
+    _densify_pass(poses_R, poses_t, keypoints, matches, K, cfg, track3d, TDB)
 
-    # Optional loop constraints with light smoothing
-    if cfg.USE_LOOP_CONSTRAINTS and len(poses_R) >= 4:
-        loops = []
-        for (a, b), m in matches.items():
-            if (b - a) <= min(cfg.LOOP_MAX_SPAN, max(6, cfg.INIT_MAX_SPAN)):
-                continue
-            if len(m) >= cfg.LOOP_MIN_INLIERS and (a in poses_R) and (b in poses_R):
-                loops.append((a, b, len(m)))
-        if loops:
-            loops.sort(key=lambda x: -x[2])
-            log(f"[sfm] loop constraints used: {len(loops)} (top: {loops[:3]})")
-            if cfg.POSE_SMOOTHING:
-                _smooth_poses(poses_R, poses_t, lam=float(cfg.SMOOTH_LAMBDA))
+    # --- Optional loops + smoothing ---
+    _maybe_apply_loops_and_smooth(poses_R, poses_t, matches, cfg, on_log=on_log)
 
-    # Output
-    pts = TDB.valid_points_array()
-    log(f"[sfm] raw_points(after validation)={len(pts)}")
-    if len(pts) == 0:
-        raise RuntimeError("SfM produced 0 valid points — insufficient parallax/quality or thresholds too strict.")
+    # --- Output ---
+    pts = _finalize_output(TDB, poses_R, poses_t, poses_out_dir, on_log=on_log)
     prog(95, "SfM – Collect points")
-
-    if poses_out_dir is not None and len(poses_R) > 0:
-        _save_camera_poses_npz_csv(poses_R, poses_t, poses_out_dir, on_log=on_log)
 
     metrics = {
         'num_points': int(len(pts)),
         'frames_used': int(len(poses_R)),
         'avg_reproj': (float(np.mean(_acc_repro)) if len(_acc_repro) > 0 else None),
         'rejected_frames': int(_rej_count),
-        'init_pair': tuple(map(int, (i0, j0)))
+        'init_pair': tuple(map(int, best["pair"]))
     }
     if return_metrics:
         return pts, poses_R, poses_t, metrics
     return pts, poses_R, poses_t
 
 
-# Ensemble wrapper
+# =========================
+# Ensemble wrapper (unchanged except for minor progress logging)
+# =========================
 
 def run_sfm_multi(keypoints, descriptors, shapes, pairs, matches, K,
                   n_runs: int = 5,
