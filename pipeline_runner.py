@@ -8,6 +8,7 @@ from feature_extraction import extract_features
 from image_matching import build_pairs
 from sfm_incremental import run_sfm, SfMConfig
 from meshing import save_point_cloud, reconstruct_solid_mesh_from_ply
+from image_masking import preprocess_images
 
 
 # config utils
@@ -71,7 +72,8 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
 
     ma = cfg.get("matching", {})
     setenv("MATCH_BACKEND", ma.get("backend"))
-    setenv("MATCH_RATIO", pick_num(ma.get("ratio", 0.8)))
+    setenv("MATCH_RATIO", pick_num(ma.get("ratio", 0.82)))
+    setenv("MATCH_MAX_KP", pick_num(ma.get("max_kp", 0)))
 
     sf = cfg.get("sfm", {})
     setenv("SFM_INIT_RATIO", pick_num(sf.get("init_ratio", 0.5)))
@@ -120,6 +122,19 @@ class PipelineRunner:
         if not imgs:
             raise RuntimeError("No frames were extracted.")
         log(f"[frames] saved: {len(imgs)}")
+
+        # optional Preprocessing/Masking
+        cfg_path = _maybe_find_config(self.base_dir)  # existiert oben schon
+        cfg = _load_yaml_or_json(cfg_path) if cfg_path else {}
+        mask_cfg = cfg.get("masking", {})
+        if bool(mask_cfg.get("enable", False)):
+            log("[mask] preprocessing enabled")
+            method = str(mask_cfg.get("method", "auto"))
+            overwrite = bool(mask_cfg.get("overwrite_images", False))  # gleiche Orte & Namen
+            params = dict(mask_cfg.get("params", {}))
+            mask_dir = os.path.join(paths.features, "masks")
+            preprocess_images(imgs, out_mask_dir=mask_dir, overwrite_images=overwrite,
+                              method=method, params=params, save_debug=True)
 
         # 2) features
         kps, descs, shapes, meta = extract_features(imgs, paths.features, log, prog)

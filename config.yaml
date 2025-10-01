@@ -1,20 +1,32 @@
 # Feature extraction
 features:
-  backend: superpoint          # superpoint | sift
-  device: cuda                 # cuda | cpu (must match the matching device)
-  use_mask: false
-  max_kp: 12000
-  debug_every: 30              # 0 = off; e.g., 30 saves every 30th mask
+  backend: superpoint
+  device: cuda
+  use_mask: true            # aktiviert das strikte Mask-Filtering in feature_extraction.py
+  max_kp: 10000
+  debug_every: 30
+
+# Masking / Preprocessing
+masking:
+  enable: true
+  method: rembg            # rembg | sam2
+  overwrite_images: false
+  params:
+    # rembg:
+    alpha_thr: 0.2
+    save_debug: true
+    # sam2:
+    keep: largest          # largest | best_score
 
 # Matching
 matching:
-  backend: lightglue           # lightglue | classic
-  ratio: 0.82                  # only for classic SNN; ignored by lightglue
-
+  backend: lightglue
+  ratio: 0.82
+  max_kp: 10000
 # SfM
 sfm:
-  init_ratio: 0.3              # fraction of neighbors for initial pair (0..1)
-  init_max_span: 4             # max frame distance for the start pair
+  init_ratio: 0.3
+  init_max_span: 4
   densify: true
   use_keyframes: true
   use_loops: true
