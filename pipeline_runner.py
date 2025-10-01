@@ -185,3 +185,5 @@ class PipelineRunner:
             log(f"[ui] Solid mesh: {solid_mesh}")
         except Exception as e:
             log(f"[mesh] solid reconstruction failed: {e}")
+
+        return sparse_ply, paths
