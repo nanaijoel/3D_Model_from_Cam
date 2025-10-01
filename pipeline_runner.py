@@ -7,7 +7,7 @@ from frame_extractor import extract_and_save_frames
 from feature_extraction import extract_features
 from image_matching import build_pairs
 from sfm_incremental import run_sfm, SfMConfig
-from meshing import save_point_cloud, reconstruct_solid_mesh_from_ply, voxel_close_mesh
+from meshing import save_point_cloud, reconstruct_solid_mesh_from_ply
 
 
 # config utils
@@ -185,17 +185,3 @@ class PipelineRunner:
             log(f"[ui] Solid mesh: {solid_mesh}")
         except Exception as e:
             log(f"[mesh] solid reconstruction failed: {e}")
-
-        # 7b) voxel-closed from the Poisson mesh
-        voxel_mesh = os.path.join(mesh_dir, "voxel_closed_mesh.ply")
-        log("[mesh] voxel-close mesh (make fully closed volume)")
-        try:
-            voxel_close_mesh(
-                solid_mesh, voxel_mesh,
-                grid=180, smooth=16, simplify=0,
-                on_log=log, on_progress=prog
-            )
-            log(f"[ui] Voxel-closed mesh: {voxel_mesh}")
-        except Exception as e:
-            log(f"[mesh] voxel_close failed: {e}")
-        return sparse_ply, paths

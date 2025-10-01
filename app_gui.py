@@ -50,7 +50,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.txt_project.setPlaceholderText("Project name (e.g., buddha_better)")
 
         self.spin_frames = QtWidgets.QSpinBox()
-        self.spin_frames.setRange(50, 2000)
+        self.spin_frames.setRange(50, 200)
         self.spin_frames.setValue(120)
         self.spin_frames.setSuffix(" Frames")
 
