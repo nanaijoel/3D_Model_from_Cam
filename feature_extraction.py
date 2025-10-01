@@ -1,8 +1,3 @@
-# feature_extraction.py
-# Masken werden NICHT intern erzeugt.
-# Vorhandene Masken werden aus out_dir/masks/<basename>_mask.png geladen
-# und bei allen Backends angewendet (SIFT via detectAndCompute, learned via Post-Filter).
-
 import os
 from typing import Callable, List, Tuple, Optional
 import inspect
@@ -11,7 +6,7 @@ import numpy as np
 import torch
 
 
-# ------------------------ kleine Helfer ------------------------
+# helper
 def _make_lg_extractor(kind: str, device: str, max_kp: int, log=print):
     """
     Erzeugt SuperPoint/DISK/ALIKED mit per ENV steuerbaren Parametern.
@@ -60,7 +55,7 @@ def _kp_to_np(kps: List[cv.KeyPoint]) -> np.ndarray:
 
 
 def _to_tensor(img_gray: np.ndarray) -> torch.Tensor:
-    """Graubild → LightGlue-Input-Format"""
+    """Graubild - LightGlue-Input-Format"""
     t = torch.from_numpy(img_gray).float() / 255.0
     return t[None, None, :, :]
 
@@ -197,7 +192,7 @@ def extract_features(
     cuda_available = torch.cuda.is_available()
     device = device_env if device_env in ("cuda", "cpu") else ("cuda" if cuda_available else "cpu")
 
-    # --- Backends vorbereiten ---
+    # Backends
     sp = None  # LightGlue Feature-Extractor (SuperPoint/DISK/ALIKED)
     sift = None
     lg_name = None
@@ -233,7 +228,7 @@ def extract_features(
 
     meta["lg_feature_name"] = lg_name
 
-    # --- Hauptschleife ---
+    # main loop
     N = len(images)
     for i, path in enumerate(images):
         img_bgr = cv.imread(path, cv.IMREAD_COLOR)
