@@ -5,7 +5,6 @@ import cv2 as cv
 import numpy as np
 import torch
 
-# helpers
 
 def _rootsift(des):
     if des is None or len(des) == 0:
@@ -14,35 +13,33 @@ def _rootsift(des):
     des /= (des.sum(axis=1, keepdims=True) + 1e-7)
     return np.sqrt(des)
 
+
 def _kp_to_np(kps):
     out = np.zeros((len(kps), 7), np.float32)
     for i, k in enumerate(kps):
         out[i] = (k.pt[0], k.pt[1], k.size, k.angle, k.response, k.octave, k.class_id)
     return out
 
-# SuperPoint glue
 
 def _to_tensor(img_gray: np.ndarray) -> torch.Tensor:
-    # uint8 [H,W] -> float [1,1,H,W] in [0,1]
     t = torch.from_numpy(img_gray).float() / 255.0
     return t[None, None, :, :]
+
 
 def _sp_to_cv_kp(sp_kp: torch.Tensor, scores: torch.Tensor) -> List[cv.KeyPoint]:
     kps = []
     xy = sp_kp.detach().cpu().numpy()
     sc = scores.detach().cpu().numpy()
     for (x, y), s in zip(xy, sc):
-        # cv.KeyPoint(x, y, size, angle, response, octave, class_id)
         kps.append(cv.KeyPoint(float(x), float(y), 3.0, -1.0, float(s), 0, -1))
     return kps
 
-# API: extract
 
 def extract_features(
-    images: List[str],
-    out_dir: str,
-    on_log: Optional[Callable[[str], None]] = None,
-    on_progress: Optional[Callable[[int, str], None]] = None
+        images: List[str],
+        out_dir: str,
+        on_log: Optional[Callable[[str], None]] = None,
+        on_progress: Optional[Callable[[int, str], None]] = None
 ) -> Tuple[list, list, list, dict]:
     """
     Returns:
@@ -50,10 +47,16 @@ def extract_features(
       descriptors: List[np.ndarray] (float32 for learned, float32 RootSIFT for SIFT)
       shapes: List[(H,W)]
       meta: dict with backend + optional tensors for LightGlue (keypoint scores, image_size)
-    Backend is chosen via env FEATURE_BACKEND = 'superpoint' | 'sift'
+
+    Backend via env FEATURE_BACKEND:
+      'superpoint' | 'disk' | 'aliked' (alle über lightglue, GPU-fähig) | 'sift' (CPU)
     """
-    def log(m):  on_log and on_log(m)
-    def prog(p, s): on_progress and on_progress(int(p), s)
+
+    def log(m):
+        on_log and on_log(m)
+
+    def prog(p, s):
+        on_progress and on_progress(int(p), s)
 
     backend = os.getenv("FEATURE_BACKEND", "sift").lower()
     use_mask = os.getenv("FEATURE_USE_MASK", "0").lower() in ("1", "true", "yes", "on")
@@ -73,7 +76,6 @@ def extract_features(
     else:
         device = "cuda" if cuda_available else "cpu"
 
-    # Optional, simple foreground mask
     def _make_statue_mask(img_bgr: np.ndarray) -> np.ndarray:
         hsv = cv.cvtColor(img_bgr, cv.COLOR_BGR2HSV)
         H, S, V = cv.split(hsv)
@@ -88,16 +90,40 @@ def extract_features(
         fg = cv.morphologyEx(fg, cv.MORPH_CLOSE, k, iterations=2)
         return fg
 
-    # choose extractor
+    # --- Backend wählen ---
     sp = None
+    sift = None
+
     if backend == "superpoint":
         try:
-            from lightglue import SuperPoint  # stable SP impl that matches LightGlue expectations
+            from lightglue import SuperPoint
             sp = SuperPoint(max_num_keypoints=max_kp).to(device).eval()
-            log(f"[features] SuperPoint (lightglue) on {device} "
-                f"(cuda_available={cuda_available}), max_kp={max_kp}")
+            log(f"[features] SuperPoint (lightglue) on {device} (cuda_available={cuda_available}), max_kp={max_kp}")
+            meta["lg_feature_name"] = "superpoint"
         except Exception as e:
             log(f"[features] WARN: SuperPoint (lightglue) failed: {e}. Falling back to SIFT.")
+            backend = "sift"
+
+    elif backend == "disk":
+        try:
+            from lightglue import DISK
+            sp = DISK(max_num_keypoints=max_kp).to(device).eval()
+            log(f"[features] DISK (lightglue) on {device}, max_kp={max_kp}")
+            meta["lg_feature_name"] = "disk"
+            backend = "superpoint"  # wir benutzen unten den einheitlichen 'sp'-Pfad
+        except Exception as e:
+            log(f"[features] WARN: DISK failed: {e}. Falling back to SIFT.")
+            backend = "sift"
+
+    elif backend in ("aliked", "alike", "aliked-lightglue"):
+        try:
+            from lightglue import ALIKED
+            sp = ALIKED(max_num_keypoints=max_kp).to(device).eval()
+            log(f"[features] ALIKED (lightglue) on {device}, max_kp={max_kp}")
+            meta["lg_feature_name"] = "aliked"
+            backend = "superpoint"
+        except Exception as e:
+            log(f"[features] WARN: ALIKED failed: {e}. Falling back to SIFT.")
             backend = "sift"
 
     if backend == "sift":
@@ -110,12 +136,15 @@ def extract_features(
         )
         log(f"[features] SIFT (RootSIFT), max_kp={max_kp}")
 
+    # --- Hauptschleife ---
     N = len(images)
     for i, path in enumerate(images):
         img_bgr = cv.imread(path, cv.IMREAD_COLOR)
         if img_bgr is None:
             log(f"[features] WARN: cannot read {path}")
-            keypoints.append([]); descriptors.append(None); shapes.append((0, 0))
+            keypoints.append([])
+            descriptors.append(None)
+            shapes.append((0, 0))
             continue
 
         gray = cv.cvtColor(img_bgr, cv.COLOR_BGR2GRAY)
@@ -125,18 +154,16 @@ def extract_features(
             with torch.no_grad():
                 tin = _to_tensor(gray).to(device)
                 out = sp({"image": tin})
-                # Possible key name differences between versions:
-                # 'scores' (lightglue>=0.0) vs 'keypoint_scores' (some variants)
-                kp_t = out["keypoints"][0]                           # [N,2] (x,y)
+
+                kp_t = out["keypoints"][0]                 # [N,2] (x,y)
                 sc_t = out.get("scores", None)
                 if sc_t is None:
                     sc_t = out.get("keypoint_scores", None)
                 if sc_t is None:
                     raise KeyError("SuperPoint output has neither 'scores' nor 'keypoint_scores'.")
-                sc_t = sc_t[0]                                       # [N]
+                sc_t = sc_t[0]                             # [N]
+                desc_t = out["descriptors"][0].transpose(0, 1)  # [N,C]
 
-                desc_t = out["descriptors"][0].transpose(0, 1)       # [N,C]
-                # image_size is [B,2] with [H, W]
                 img_size_t = out.get("image_size", None)
                 if img_size_t is not None:
                     H, W = int(img_size_t[0, 0].item()), int(img_size_t[0, 1].item())
@@ -170,10 +197,10 @@ def extract_features(
                 dbg = cv.addWeighted(dbg, 0.85, cv.cvtColor(mask, cv.COLOR_GRAY2BGR), 0.15, 0)
             cv.imwrite(os.path.join(out_dir, f"debug_{i:04d}.jpg"), dbg)
 
-        if N:
-            prog(30 + (i + 1) / max(1, N) * 10, f"Feature Extraction ({backend})")
 
-        # persist per-frame
+        if N:
+            prog(30 + (i + 1) / max(1, N) * 10, f"Feature Extraction ({meta.get('lg_feature_name', backend)})")
+
         np.savez(
             os.path.join(out_dir, f"features_{i:04d}.npz"),
             kps=_kp_to_np(keypoints[-1]),
@@ -182,11 +209,10 @@ def extract_features(
         )
 
     total_kp = sum(len(k) for k in keypoints)
-    log(f"[features] done: {total_kp} keypoints | backend={backend} | "
+    log(f"[features] done: {total_kp} keypoints | backend={meta.get('lg_feature_name', backend)} | "
         f"torch={torch.__version__} cuda_avail={cuda_available}")
 
-    # meta consistency for classic backend
-    if backend != "superpoint":
+    if meta.get("lg_feature_name") is None or backend != "superpoint":
         meta["sp_scores"] = None
         meta["sp_sizes"] = None
 

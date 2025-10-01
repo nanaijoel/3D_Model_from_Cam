@@ -1,6 +1,6 @@
 # Feature extraction
 features:
-  backend: superpoint          # superpoint | sift
+  backend: aliked          # superpoint | sift | disk | aliked
   device: cuda                 # cuda | cpu (must match the matching device)
   use_mask: false
   max_kp: 12000
