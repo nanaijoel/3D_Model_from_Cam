@@ -6,9 +6,8 @@ from typing import Callable, List, Dict, Tuple, Optional, DefaultDict
 from dataclasses import dataclass
 from collections import defaultdict
 
-# =========================
+
 # Config
-# =========================
 
 @dataclass
 class SfMConfig:
@@ -73,9 +72,8 @@ class SfMConfig:
     SMOOTH_LAMBDA: float = 0.25
 
 
-# =========================
+
 # Helpers
-# =========================
 
 def _idx2pts(matches, kps1, kps2):
     pts1 = np.float32([kps1[m.queryIdx].pt for m in matches])
@@ -157,9 +155,8 @@ def _pairwise_max_parallax_deg(Kinv, poses_R, poses_t, obs_list):
     return best
 
 
-# =========================
+
 # Track database
-# =========================
 
 class TrackDB:
     """Manages 3D points, observations and promotion (multi-view validation)."""
@@ -254,9 +251,8 @@ class TrackDB:
                         dtype=float)
 
 
-# =========================
+
 # Keyframes and smoothing utilities
-# =========================
 
 def _should_be_keyframe(K, poses_R, poses_t, last_kf_idx: int, fi: int,
                         anchors: List[int], kps, matches, track3d, tdb: TrackDB, cfg: SfMConfig) -> bool:
@@ -325,9 +321,6 @@ def _smooth_poses(poses_R: Dict[int, np.ndarray], poses_t: Dict[int, np.ndarray]
         poses_t[i] = -poses_R[i] @ C
 
 
-# =========================
-# NEW: SfM pipeline subroutines
-# =========================
 
 def _init_window_bounds(N: int, cfg: SfMConfig):
     mid = (cfg.INIT_WINDOW_CENTER if cfg.INIT_WINDOW_CENTER is not None else (N // 2))
@@ -699,9 +692,6 @@ def _finalize_output(TDB: TrackDB, poses_R, poses_t, poses_out_dir, on_log=None)
         _save_camera_poses_npz_csv(poses_R, poses_t, poses_out_dir, on_log=on_log)
     return pts
 
-# =========================
-# Main: run_sfm (refactored)
-# =========================
 
 def run_sfm(keypoints: List[List[cv.KeyPoint]],
             descriptors: List[np.ndarray],
@@ -728,16 +718,16 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
 
     cfg = config or SfMConfig()
 
-    # --- Init pair selection ---
+    # Init pair selection
     N = len(shapes)
     mid, w = _init_window_bounds(N, cfg)
     best = _select_init_pair(pairs, matches, keypoints, K, cfg, mid, w, on_log=on_log)
 
-    # --- Initialization with the pair ---
+    # Initialization with the pair
     (i0, j0), poses_R, poses_t, track3d, TDB = _initialize_with_pair(best, keypoints, matches, K, on_log=on_log)
     prog(60, "SfM – Initialization")
 
-    # --- Best-first expansion ---
+    # Best-first expansion
     all_frames = sorted(set([i for ij in pairs for i in ij]))
     visited = {i0, j0}
     keyframes = [i0, j0] if cfg.USE_KEYFRAMES else []
@@ -813,13 +803,13 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
         # Promote points after each frame
         TDB.promote_points(poses_R, poses_t, adapt_from_reproj=(med_repro or None))
 
-    # --- Optional densify ---
+    # Optional densify
     _densify_pass(poses_R, poses_t, keypoints, matches, K, cfg, track3d, TDB)
 
-    # --- Optional loops + smoothing ---
+    # Optional loops + smoothing
     _maybe_apply_loops_and_smooth(poses_R, poses_t, matches, cfg, on_log=on_log)
 
-    # --- Output ---
+    # Output
     pts = _finalize_output(TDB, poses_R, poses_t, poses_out_dir, on_log=on_log)
     prog(95, "SfM – Collect points")
 
@@ -835,9 +825,7 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
     return pts, poses_R, poses_t
 
 
-# =========================
-# Ensemble wrapper (unchanged except for minor progress logging)
-# =========================
+# Ensemble wrapper
 
 def run_sfm_multi(keypoints, descriptors, shapes, pairs, matches, K,
                   n_runs: int = 5,
