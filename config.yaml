@@ -1,6 +1,6 @@
 # Feature extraction
 features:
-  backend: superpoint          # superpoint | sift | disk
+  backend: superpoint          # superpoint | sift
   device: cuda                 # cuda | cpu (must match the matching device)
   use_mask: false
   max_kp: 12000
@@ -14,9 +14,9 @@ matching:
 # SfM
 sfm:
   init_ratio: 0.3              # fraction of neighbors for initial pair (0..1)
-  init_max_span: 8             # max frame distance for the start pair
+  init_max_span: 4             # max frame distance for the start pair
   densify: true
   use_keyframes: true
   use_loops: true
   pose_smoothing: true
-  smooth_lambda: 0.2
+  smooth_lambda: 0.001

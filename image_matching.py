@@ -25,44 +25,27 @@ def build_pairs(
     meta: Optional[dict] = None
 ) -> Tuple[List[Pair], Dict[Pair, List[cv.DMatch]]]:
     """
-    MATCH_BACKEND:
-      - 'lightglue' -> LightGlue (erwartet learned Features wie SuperPoint/DISK/ALIKED)
-      - sonst       -> klassisch BF + Ratio-Test
-
-    Steuerung (ENV):
-      MATCH_RATIO           (float, default 0.82)   – nur classic
-      MATCH_MAX_NEIGHBOR    (int,   default 8)
-      MATCH_EXTRA_PAIRS     (0/1,   default 1)
-      MATCH_LG_FEATURES     ('superpoint'|'disk'|'aliked'|…), default: FEATURE_BACKEND oder meta['lg_feature_name']
-      FEATURE_DEVICE        ('cuda'|'cpu'|auto)
+    MATCH_BACKEND == 'lightglue'  -> uses LightGlue (expects SuperPoint/DISK-like descriptors)
+    otherwise: classic BF + ratio test.
     """
     def log(m):  on_log and on_log(m)
     def prog(p, s): on_progress and on_progress(int(p), s)
 
     backend = os.getenv("MATCH_BACKEND", "classic").lower()
     ratio = float(os.getenv("MATCH_RATIO", "0.82"))
-    max_neighbor = int(float(os.getenv("MATCH_MAX_NEIGHBOR", "8")))
-    extra_pairs = int(float(os.getenv("MATCH_EXTRA_PAIRS", "1")))
-    # Wunsch-Feature aus ENV; wenn meta gesetzt ist, gewinnt meta (kommt direkt aus der Feature-Stage)
-    lg_feat_env = os.getenv("MATCH_LG_FEATURES", os.getenv("FEATURE_BACKEND", "superpoint")).lower()
-    lg_feat = (meta.get("lg_feature_name") if meta else None) or lg_feat_env
-    # normalize aliases
-    if lg_feat in ("", "sp"): lg_feat = "superpoint"
-    if lg_feat in ("alike", "aliked-lightglue"): lg_feat = "aliked"
 
     N = len(descriptors)
     idxs = list(range(N))
 
-    # --- Paargraph (lokale Nachbarn + optionale Langstreckenanker) ---
+    # simple neighborhood pairs
     pairs: List[Pair] = []
     for i in idxs:
-        for d in range(1, max(2, max_neighbor) + 1):
+        for d in range(1, 5):
             j = i + d
             if j < N:
                 pairs.append((i, j))
-    if extra_pairs and N > 8:
-        stride = max(1, N // max(6, min(12, N)))
-        for i in range(0, N, stride):
+    if N > 8:
+        for i in range(0, N, max(1, N // 8)):
             j = N - 1
             if i < j:
                 pairs.append((i, j))
@@ -71,88 +54,87 @@ def build_pairs(
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
 
-    # --- LightGlue Pfad ---
+    # LightGlue
     if backend == "lightglue":
-        # LightGlue ist nur sinnvoll mit learned Features; wenn nicht verfügbar, Classic nehmen
-        if meta is None or keypoints is None or meta.get("sp_scores", None) is None:
-            log("[match] WARN: Keine LightGlue-Feature-Meta gefunden – fallback auf classic BF.")
-        else:
-            from lightglue import LightGlue
+        from lightglue import LightGlue
 
-            device_env = os.getenv("FEATURE_DEVICE", "").lower().strip()
-            device = device_env if device_env in ("cuda", "cpu") else ("cuda" if torch.cuda.is_available() else "cpu")
-            matcher = LightGlue(features=lg_feat).to(device).eval()
-            log(f"[match] LightGlue on {device} (features={lg_feat})")
+        # device selection (same convention as features)
+        device_env = os.getenv("FEATURE_DEVICE", "").lower().strip()
+        device = device_env if device_env in ("cuda", "cpu") else ("cuda" if torch.cuda.is_available() else "cpu")
+        matcher = LightGlue(features="superpoint").to(device).eval()
+        log(f"[match] LightGlue on {device}")
 
-            sp_scores = meta.get("sp_scores", None)
-            sp_sizes  = meta.get("sp_sizes", None)
+        assert keypoints is not None and meta is not None, \
+            "[match] LightGlue requires keypoints and meta (scores, image_size) from SuperPoint."
 
-            def to_torch_feat(i: int):
-                kps = keypoints[i]
-                des = descriptors[i]
-                if des is None or len(kps) == 0 or des.size == 0:
-                    return None
+        sp_scores = meta.get("sp_scores", None)
+        sp_sizes  = meta.get("sp_sizes", None)
 
-                # [N,2] (x,y)
-                kp_xy = np.array([[kp.pt[0], kp.pt[1]] for kp in kps], dtype=np.float32, order="C")
-                kp_xy_t = torch.from_numpy(kp_xy)[None, ...].to(device)               # [1,N,2]
+        def to_torch_feat(i: int):
+            kps = keypoints[i]
+            des = descriptors[i]
+            if des is None or len(kps) == 0 or des.size == 0:
+                return None
 
-                # descriptors: LightGlue erwartet [B,C,N]
-                desc = des.astype(np.float32, copy=False)                             # [N,C]
-                desc_t = torch.from_numpy(desc).T.contiguous()[None, ...].to(device)  # [1,C,N]
+            # [N,2] (x,y)
+            kp_xy = np.array([[kp.pt[0], kp.pt[1]] for kp in kps], dtype=np.float32, order="C")
+            kp_xy_t = torch.from_numpy(kp_xy)[None, ...].to(device)               # [1,N,2]
 
-                # scores (optional aber hilfreich)
-                if sp_scores is not None and len(sp_scores) > i and sp_scores[i] is not None:
-                    sc = torch.from_numpy(sp_scores[i].astype(np.float32, copy=False))[None, ...].to(device)  # [1,N]
+            # descriptors: LightGlue expects [B,C,N]
+            desc = des.astype(np.float32, copy=False)                             # [N,C]
+            desc_t = torch.from_numpy(desc).T.contiguous()[None, ...].to(device)  # [1,C,N]
+
+            # scores (optional but helpful)
+            if sp_scores is not None and len(sp_scores) > i and sp_scores[i] is not None:
+                sc = torch.from_numpy(sp_scores[i].astype(np.float32, copy=False))[None, ...].to(device)  # [1,N]
+            else:
+                sc = torch.ones((1, kp_xy.shape[0]), dtype=torch.float32, device=device)
+
+            # image size [B,2] = [H,W]
+            if sp_sizes is not None and len(sp_sizes) > i and sp_sizes[i] is not None:
+                H, W = sp_sizes[i]
+            else:
+                # fallback: rough estimate from keypoints
+                H = int(max(1, max(int(k.pt[1]) for k in kps)))
+                W = int(max(1, max(int(k.pt[0]) for k in kps)))
+            size_t = torch.tensor([[int(H), int(W)]], dtype=torch.int32, device=device)  # [1,2]
+
+            return {
+                "keypoints": kp_xy_t,     # [1,N,2]
+                "descriptors": desc_t,    # [1,C,N]
+                "scores": sc,             # [1,N]
+                "image_size": size_t      # [1,2]
+            }
+
+        torch.set_grad_enabled(False)
+        with torch.no_grad():
+            for t, (i, j) in enumerate(pairs):
+                Fi = to_torch_feat(i)
+                Fj = to_torch_feat(j)
+                if Fi is None or Fj is None:
+                    matches[(i, j)] = []
                 else:
-                    sc = torch.ones((1, kp_xy.shape[0]), dtype=torch.float32, device=device)
-
-                # image size [B,2] = [H,W]
-                if sp_sizes is not None and len(sp_sizes) > i and sp_sizes[i] is not None:
-                    H, W = sp_sizes[i]
-                else:
-                    # Fallback: grobe Schätzung aus KPs
-                    H = int(max(1, max(int(k.pt[1]) for k in kps)))
-                    W = int(max(1, max(int(k.pt[0]) for k in kps)))
-                size_t = torch.tensor([[int(H), int(W)]], dtype=torch.int32, device=device)  # [1,2]
-
-                return {
-                    "keypoints": kp_xy_t,     # [1,N,2]
-                    "descriptors": desc_t,    # [1,C,N]
-                    "scores": sc,             # [1,N]
-                    "image_size": size_t      # [1,2]
-                }
-
-            torch.set_grad_enabled(False)
-            with torch.no_grad():
-                for t, (i, j) in enumerate(pairs):
-                    Fi = to_torch_feat(i)
-                    Fj = to_torch_feat(j)
-                    if Fi is None or Fj is None:
+                    out = matcher({"image0": Fi, "image1": Fj})
+                    m0 = out["matches0"][0].detach().cpu().numpy()  # [N0], indices in image1 or -1
+                    valid = np.where(m0 >= 0)[0]
+                    if valid.size == 0:
                         matches[(i, j)] = []
                     else:
-                        out = matcher({"image0": Fi, "image1": Fj})
-                        m0 = out["matches0"][0].detach().cpu().numpy()  # [N0], index in image1 oder -1
-                        valid = np.where(m0 >= 0)[0]
-                        if valid.size == 0:
-                            matches[(i, j)] = []
-                        else:
-                            dj = m0[valid]
-                            ms = [cv.DMatch(_queryIdx=int(qi), _trainIdx=int(int(tj)), _imgIdx=0, _distance=0.0)
-                                  for qi, tj in zip(valid.tolist(), dj.tolist())]
-                            matches[(i, j)] = ms
+                        dj = m0[valid]
+                        ms = [cv.DMatch(_queryIdx=int(qi), _trainIdx=int(int(tj)), _imgIdx=0, _distance=0.0)
+                              for qi, tj in zip(valid.tolist(), dj.tolist())]
+                        matches[(i, j)] = ms
 
-                    if save_dir:
-                        arr = np.array([[m.queryIdx, m.trainIdx] for m in matches[(i, j)]], dtype=np.int32)
-                        np.savez_compressed(os.path.join(save_dir, f"match_{i:04d}_{j:04d}.npz"),
-                                            idx_i=i, idx_j=j, matches=arr)
-                    if N:
-                        prog(40 + (t + 1) / max(1, len(pairs)) * 15, "Image Matching (lightglue)")
-            return pairs, matches
+                if save_dir:
+                    arr = np.array([[m.queryIdx, m.trainIdx] for m in matches[(i, j)]], dtype=np.int32)
+                    np.savez_compressed(os.path.join(save_dir, f"match_{i:04d}_{j:04d}.npz"),
+                                        idx_i=i, idx_j=j, matches=arr)
+                if N:
+                    prog(40 + (t + 1) / max(1, len(pairs)) * 15, "Image Matching (lightglue)")
+        return pairs, matches
 
-    # --- Classic (BF + Ratio) ---
+    # Classic (BF + ratio)
     log("[match] classic BF matcher")
-    # Alle unsere Deskriptoren sind float (learned/SIFT-RootSIFT) -> NORM_L2
     bf = cv.BFMatcher(cv.NORM_L2, crossCheck=False)
 
     for t, (i, j) in enumerate(pairs):
