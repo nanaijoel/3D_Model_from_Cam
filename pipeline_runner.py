@@ -56,7 +56,7 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
 
     def pick_num(x, default=0):
         if isinstance(x, dict):
-            for k in ("iters","n","value","val","amount","k","grid","target"):
+            for k in ("iters","n","value","val","amount","k","grid","target","radius","r","thr","threshold","std","sigma","resize"):
                 if k in x and isinstance(x[k], (int, float)):
                     return x[k]
             return default
@@ -73,6 +73,32 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("FEATURE_MAX_KP", pick_num(fe.get("max_kp", 4096)))
     setenv("FEATURE_DEBUG_EVERY", pick_num(fe.get("debug_every", 0)))
 
+    # optional gray preproc
+    pp = fe.get("preproc", {})
+    setenv("FEATURE_PREPROC_CLAHE", pick_bool(pp.get("clahe", True)))
+    setenv("FEATURE_PREPROC_CLAHE_CLIP", pick_num(pp.get("clahe_clip", 3.0)))
+    setenv("FEATURE_PREPROC_CLAHE_TILES", int(pick_num(pp.get("clahe_tiles", 8))))
+    setenv("FEATURE_PREPROC_UNSHARP", pick_bool(pp.get("unsharp", True)))
+    setenv("FEATURE_PREPROC_UNSHARP_SIGMA", pick_num(pp.get("unsharp_sigma", 1.0)))
+    setenv("FEATURE_PREPROC_UNSHARP_AMOUNT", pick_num(pp.get("unsharp_amount", 1.5)))
+    setenv("FEATURE_PREPROC_NOISE", pick_bool(pp.get("noise", True)))
+    setenv("FEATURE_PREPROC_NOISE_STD", pick_num(pp.get("noise_std", 1.5)))
+    setenv("FEATURE_MASK_DILATE", int(pick_num(pp.get("mask_dilate", 5))))
+
+    # LightGlue extractor params
+    lg = fe.get("lg", {})
+    setenv("FEATURE_LG_DET_THR", pick_num(lg.get("detection_threshold", 0.001)))
+    setenv("FEATURE_LG_NMS", int(pick_num(lg.get("nms", 3))))
+    setenv("FEATURE_LG_RESIZE", int(pick_num(lg.get("resize", 1024))))
+    setenv("FEATURE_LG_REMOVE_BORDERS", int(pick_num(lg.get("remove_borders", 2))))
+    setenv("FEATURE_LG_FORCE_NUM", pick_bool(lg.get("force_num", False)))
+
+    # SIFT tuning (fallback/explicit)
+    sf = fe.get("sift", {})
+    setenv("FEATURE_SIFT_CONTRAST", pick_num(sf.get("contrast", 0.004)))
+    setenv("FEATURE_SIFT_EDGE", int(pick_num(sf.get("edge", 12))))
+    setenv("FEATURE_SIFT_SIGMA", pick_num(sf.get("sigma", 1.2)))
+
     # Matching ENV
     ma = cfg.get("matching", {})
     setenv("MATCH_BACKEND", ma.get("backend"))  # "lightglue" | "classic"
@@ -80,14 +106,15 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     if "features" in ma:
         setenv("MATCH_FEATURES", str(ma["features"]).lower())  # "superpoint"|"disk"|"aliked"|"sift"
 
-    sf = cfg.get("sfm", {})
-    setenv("SFM_INIT_RATIO", pick_num(sf.get("init_ratio", 0.5)))
-    setenv("SFM_INIT_MAX_SPAN", pick_num(sf.get("init_max_span", 6)))
-    setenv("SFM_DENSIFY", pick_bool(sf.get("densify", True)))
-    setenv("SFM_USE_KEYFRAMES", pick_bool(sf.get("use_keyframes", True)))
-    setenv("SFM_USE_LOOP_CONSTRAINTS", pick_bool(sf.get("use_loops", True)))
-    setenv("SFM_POSE_SMOOTHING", pick_bool(sf.get("pose_smoothing", True)))
-    setenv("SFM_SMOOTH_LAMBDA", pick_num(sf.get("smooth_lambda", 0.25)))
+    # SfM ENV (unchanged)
+    sfm = cfg.get("sfm", {})
+    setenv("SFM_INIT_RATIO", pick_num(sfm.get("init_ratio", 0.5)))
+    setenv("SFM_INIT_MAX_SPAN", pick_num(sfm.get("init_max_span", 6)))
+    setenv("SFM_DENSIFY", pick_bool(sfm.get("densify", True)))
+    setenv("SFM_USE_KEYFRAMES", pick_bool(sfm.get("use_keyframes", True)))
+    setenv("SFM_USE_LOOP_CONSTRAINTS", pick_bool(sfm.get("use_loops", True)))
+    setenv("SFM_POSE_SMOOTHING", pick_bool(sfm.get("pose_smoothing", True)))
+    setenv("SFM_SMOOTH_LAMBDA", pick_num(sfm.get("smooth_lambda", 0.25)))
 
 def _dump_resolved_config(project_root: str) -> str:
     keys = [k for k in os.environ.keys() if k.startswith(("FEATURE_", "MATCH_", "SFM_"))]
@@ -104,7 +131,6 @@ def _dump_resolved_config(project_root: str) -> str:
 
 
 # ---------------- pipeline runner (sparse.ply only) ----------------
-
 class PipelineRunner:
     def __init__(self, base_dir: str, on_log: Callable[[str], None], on_progress: Callable[[int, str], None]):
         self.base_dir = base_dir
@@ -162,20 +188,18 @@ class PipelineRunner:
             device=device,
             backend=os.getenv("MATCH_BACKEND", "lightglue"),
             on_log=log,
-            save_dir=paths.matches    # schreibt optional projects/.../matches/matches.npz
+            save_dir=paths.matches
         )
 
         # ---- Convert to SfM format: dict[(i,j)] -> List[cv.DMatch]
         def _as_sfm_matches(pairs_arr: np.ndarray, matches_any) -> Dict[Tuple[int, int], list]:
             mdict: Dict[Tuple[int, int], list] = {}
-            # pairs_arr: (P,2), matches_any: List[(M,2)]
             for (i, j), m in zip(pairs_arr.tolist(), matches_any):
                 if isinstance(m, list):
                     m = np.array(m, dtype=np.int32) if len(m) else np.empty((0, 2), np.int32)
                 if m is None or m.size == 0:
                     mdict[(i, j)] = []
                     continue
-                # m: (M,2) -> (queryIdx, trainIdx)
                 mdict[(i, j)] = [
                     cv.DMatch(_queryIdx=int(q), _trainIdx=int(t), _imgIdx=0, _distance=0.0)
                     for q, t in m.astype(np.int32)
@@ -209,7 +233,7 @@ class PipelineRunner:
 
         res = run_sfm(
             kps, descs, shapes,
-            pairs_np, matches_for_sfm,   # dict[(i,j)] -> List[cv.DMatch]
+            pairs_np, matches_for_sfm,
             K, log, prog,
             poses_out_dir=poses_dir, config=cfg_sfm
         )

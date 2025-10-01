@@ -5,13 +5,42 @@
 
 import os
 from typing import Callable, List, Tuple, Optional
-
+import inspect
 import cv2 as cv
 import numpy as np
 import torch
 
 
 # ------------------------ kleine Helfer ------------------------
+def _make_lg_extractor(kind: str, device: str, max_kp: int, log=print):
+    """
+    Erzeugt SuperPoint/DISK/ALIKED mit per ENV steuerbaren Parametern.
+    Nur Argumente, die der jeweilige Konstruktor unterstützt, werden übergeben.
+    """
+    det_thr = float(os.getenv("FEATURE_LG_DET_THR", "0.001"))  # kleiner => mehr Punkte
+    nms_r   = int(os.getenv("FEATURE_LG_NMS", "3"))
+    resize  = int(os.getenv("FEATURE_LG_RESIZE", "1024"))
+    rm_b    = int(os.getenv("FEATURE_LG_REMOVE_BORDERS", "2"))
+    force_n = os.getenv("FEATURE_LG_FORCE_NUM", "0").lower() in ("1","true","yes")
+
+    conf = dict(
+        max_num_keypoints=max_kp,
+        detection_threshold=det_thr,
+        nms_radius=nms_r,
+        resize=resize,
+        remove_borders=rm_b,
+        force_num_keypoints=force_n,
+    )
+
+    from lightglue import SuperPoint, DISK, ALIKED
+    cls = {"superpoint": SuperPoint, "disk": DISK, "aliked": ALIKED}[kind]
+    sig = inspect.signature(cls.__init__)
+    conf = {k: v for k, v in conf.items() if k in sig.parameters}
+
+    extractor = cls(**conf).to(device).eval()
+    log(f"[features] {kind.upper()} with conf={conf} on {device}")
+    return extractor
+
 
 def _rootsift(des: Optional[np.ndarray]) -> Optional[np.ndarray]:
     """Wandelt SIFT-Deskriptoren in RootSIFT."""
@@ -53,10 +82,8 @@ def _ensure_desc_is_NC(des_np: np.ndarray, n_kp: int) -> np.ndarray:
     """
     if des_np.ndim != 2:
         return des_np
-    # Falls Achse 0 wie 128/256 aussieht und Achse 1 == N: transponieren
     if des_np.shape[0] in (64, 96, 128, 256) and des_np.shape[1] == n_kp:
         return des_np.T
-    # Falls Achse 0 == N: alles gut
     return des_np
 
 
@@ -85,7 +112,6 @@ def _filter_kp_des_scores(
             keep_idx.append(i)
 
     if not keep_idx:
-        # nichts behalten
         empty_des = None
         if des is not None and des.ndim == 2:
             empty_des = np.empty((0, des.shape[1]), des.dtype)
@@ -99,8 +125,38 @@ def _filter_kp_des_scores(
     return kps_f, des_f, sc_f
 
 
-# ------------------------ Hauptfunktion ------------------------
+def _boost_gray(gray0: np.ndarray) -> np.ndarray:
+    """
+    Optionales Vorprocessing: CLAHE + Unsharp + leichtes Dithering.
+    Alles per ENV steuerbar.
+    """
+    use_clahe   = os.getenv("FEATURE_PREPROC_CLAHE", "1").lower() in ("1","true","yes")
+    use_unsharp = os.getenv("FEATURE_PREPROC_UNSHARP", "1").lower() in ("1","true","yes")
+    use_noise   = os.getenv("FEATURE_PREPROC_NOISE", "1").lower() in ("1","true","yes")
 
+    gray = gray0.copy()
+
+    if use_clahe:
+        clip = float(os.getenv("FEATURE_PREPROC_CLAHE_CLIP", "3.0"))
+        tiles = int(os.getenv("FEATURE_PREPROC_CLAHE_TILES", "8"))
+        clahe = cv.createCLAHE(clipLimit=clip, tileGridSize=(tiles, tiles))
+        gray = clahe.apply(gray)
+
+    if use_unsharp:
+        sigma = float(os.getenv("FEATURE_PREPROC_UNSHARP_SIGMA", "1.0"))
+        amount = float(os.getenv("FEATURE_PREPROC_UNSHARP_AMOUNT", "1.5"))
+        blur = cv.GaussianBlur(gray, (0, 0), sigma)
+        gray = cv.addWeighted(gray, amount, blur, -(amount - 1.0), 0)
+
+    if use_noise:
+        amp = float(os.getenv("FEATURE_PREPROC_NOISE_STD", "1.5"))
+        noise = (np.random.randn(*gray.shape).astype(np.float32) * amp)
+        gray = cv.add(gray.astype(np.float32), noise, dtype=cv.CV_8U)
+
+    return gray
+
+
+# ------------------------ Hauptfunktion ------------------------
 def extract_features(
     images: List[str],
     out_dir: str,
@@ -114,7 +170,6 @@ def extract_features(
       shapes:      List[(H,W)]
       meta:        dict with backend + (sp_scores, sp_sizes) für LightGlue
     """
-
     def log(m: str):
         if on_log:
             on_log(m)
@@ -124,10 +179,11 @@ def extract_features(
             on_progress(int(p), s)
 
     backend_cfg = os.getenv("FEATURE_BACKEND", "sift").lower()
-    use_mask = os.getenv("FEATURE_USE_MASK", "0").lower() in ("1", "true", "yes", "on")
-    max_kp = int(os.getenv("FEATURE_MAX_KP", "4096"))
-    debug_every = int(os.getenv("FEATURE_DEBUG_EVERY", "0"))
+    use_mask = os.getenv("FEATURE_USE_MASK", "0").lower() in ("1","true","yes","on")
+    max_kp = int(float(os.getenv("FEATURE_MAX_KP", "4096")))
+    debug_every = int(float(os.getenv("FEATURE_DEBUG_EVERY", "0")))
     device_env = os.getenv("FEATURE_DEVICE", "").lower().strip()
+    mask_dilate = int(float(os.getenv("FEATURE_MASK_DILATE", "5")))
 
     os.makedirs(out_dir, exist_ok=True)
     mask_dir = os.path.join(out_dir, "masks")
@@ -149,43 +205,29 @@ def extract_features(
     backend = backend_cfg
     if backend == "superpoint":
         try:
-            from lightglue import SuperPoint
-            sp = SuperPoint(max_num_keypoints=max_kp).to(device).eval()
-            lg_name = "superpoint"
-            log(f"[features] SuperPoint (lightglue) on {device} (cuda_available={cuda_available}), max_kp={max_kp}")
+            sp = _make_lg_extractor("superpoint", device, max_kp, log); lg_name = "superpoint"
         except Exception as e:
-            log(f"[features] WARN: SuperPoint init failed: {e}. Falling back to SIFT.")
-            backend = "sift"
+            log(f"[features] WARN: SuperPoint init failed: {e}. Falling back to SIFT."); backend = "sift"
 
     elif backend == "disk":
         try:
-            from lightglue import DISK
-            sp = DISK(max_num_keypoints=max_kp).to(device).eval()
-            lg_name = "disk"
-            backend = "superpoint"  # gemeinsamer Pfad unten
-            log(f"[features] DISK (lightglue) on {device}, max_kp={max_kp}")
+            sp = _make_lg_extractor("disk", device, max_kp, log); lg_name = "disk"; backend = "superpoint"
         except Exception as e:
-            log(f"[features] WARN: DISK init failed: {e}. Falling back to SIFT.")
-            backend = "sift"
+            log(f"[features] WARN: DISK init failed: {e}. Falling back to SIFT."); backend = "sift"
 
     elif backend in ("aliked", "alike", "aliked-lightglue"):
         try:
-            from lightglue import ALIKED
-            sp = ALIKED(max_num_keypoints=max_kp).to(device).eval()
-            lg_name = "aliked"
-            backend = "superpoint"  # gemeinsamer Pfad unten
-            log(f"[features] ALIKED (lightglue) on {device}, max_kp={max_kp}")
+            sp = _make_lg_extractor("aliked", device, max_kp, log); lg_name = "aliked"; backend = "superpoint"
         except Exception as e:
-            log(f"[features] WARN: ALIKED init failed: {e}. Falling back to SIFT.")
-            backend = "sift"
+            log(f"[features] WARN: ALIKED init failed: {e}. Falling back to SIFT."); backend = "sift"
 
     if backend == "sift":
         sift = cv.SIFT_create(
             nfeatures=max_kp,
-            nOctaveLayers=3,
-            contrastThreshold=0.02,
-            edgeThreshold=14,
-            sigma=1.2
+            nOctaveLayers=4,
+            contrastThreshold=float(os.getenv("FEATURE_SIFT_CONTRAST", "0.004")),
+            edgeThreshold=int(float(os.getenv("FEATURE_SIFT_EDGE", "12"))),
+            sigma=float(os.getenv("FEATURE_SIFT_SIGMA", "1.2"))
         )
         log(f"[features] SIFT (RootSIFT), max_kp={max_kp}")
 
@@ -202,7 +244,8 @@ def extract_features(
             shapes.append((0, 0))
             continue
 
-        gray = cv.cvtColor(img_bgr, cv.COLOR_BGR2GRAY)
+        gray0 = cv.cvtColor(img_bgr, cv.COLOR_BGR2GRAY)
+        gray = _boost_gray(gray0)
 
         # Maske laden (falls aktiviert und vorhanden)
         mask = None
@@ -242,11 +285,13 @@ def extract_features(
                     des_np = desc_t.detach().cpu().numpy().astype(np.float32)
                     sc_np = sc_t.detach().cpu().numpy().astype(np.float32)
 
-                    # ---- WICHTIG: Deskriptoren auf [N, C] bringen ----
+                    # Deskriptoren auf [N, C]
                     des_np = _ensure_desc_is_NC(des_np, n_kp=len(kps))
 
-                    # ---- Maskenfilter anwenden (KP, Des, Scores gemeinsam) ----
-                    kps, des_np, sc_np = _filter_kp_des_scores(kps, des_np, sc_np, mask, dilate=10)
+                    # Maskenfilter anwenden
+                    kps, des_np, sc_np = _filter_kp_des_scores(
+                        kps, des_np, sc_np, mask, dilate=mask_dilate if mask is not None else 0
+                    )
 
                 keypoints.append(kps)
                 descriptors.append(des_np)
@@ -273,10 +318,12 @@ def extract_features(
             prog(30 + (i + 1) / max(1, N) * 10, f"Feature Extraction ({lg_name or backend})")
 
         # Persistenter Dump (für spätere Schritte)
+        des_last = descriptors[-1]
+        des_last = des_last.astype(np.float32).reshape(-1, des_last.shape[-1]) if des_last is not None else np.empty((0,128),np.float32)
         np.savez(
             os.path.join(out_dir, f"features_{i:04d}.npz"),
             kps=_kp_to_np(keypoints[-1]),
-            des=descriptors[-1].astype(np.float32).reshape(-1, descriptors[-1].shape[-1]),
+            des=des_last,
             shape=np.array(shapes[-1], dtype=np.int32)
         )
 
@@ -284,7 +331,6 @@ def extract_features(
     log(f"[features] done: {total_kp} keypoints | backend={lg_name or backend} | "
         f"torch={torch.__version__} cuda_avail={cuda_available}")
 
-    # Für SIFT braucht Matching diese Extras nicht
     if lg_name is None:
         meta["sp_scores"] = None
         meta["sp_sizes"] = None

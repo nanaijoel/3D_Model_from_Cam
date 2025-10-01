@@ -1,10 +1,38 @@
+# config.yaml
+
 # Feature extraction
 features:
-  backend: disk
+  backend: superpoint          # superpoint | disk | aliked | sift
   device: cuda
   use_mask: true
-  max_kp: 10000
+  max_kp: 12000
   debug_every: 30
+
+  # LightGlue/learned extractor tuning
+  lg:
+    detection_threshold: 0.0008   # kleiner => mehr Keypoints
+    nms: 2                        # kleiner => dichter
+    resize: 1024                  # längere Bildkante fürs Netz
+    remove_borders: 2
+    force_num: true               # versucht max_num_keypoints zu erzwingen
+
+  # Optionales Gray-Preprocessing (wirkt nur auf Detektion, nicht auf Originalbilder)
+  preproc:
+    clahe: true
+    clahe_clip: 3.0
+    clahe_tiles: 8
+    unsharp: true
+    unsharp_sigma: 1.0
+    unsharp_amount: 1.5
+    noise: true
+    noise_std: 1.5
+    mask_dilate: 8                # für Masken-Kanten; 5–8 ist gut
+
+  # SIFT-Fallback / -Explizit
+  sift:
+    contrast: 0.004
+    edge: 12
+    sigma: 1.2
 
 # Masking / Preprocessing
 masking:
@@ -21,7 +49,7 @@ masking:
 # Matching
 matching:
   backend: lightglue
-  features: disk
+  features: superpoint          # superpoint | disk | aliked | sift
   ratio: 0.82
 
 # SfM
