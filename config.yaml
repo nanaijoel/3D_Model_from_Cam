@@ -1,8 +1,8 @@
 # Feature extraction
 features:
-  backend: superpoint
+  backend: disk
   device: cuda
-  use_mask: true            # aktiviert das strikte Mask-Filtering in feature_extraction.py
+  use_mask: true
   max_kp: 10000
   debug_every: 30
 
@@ -13,7 +13,7 @@ masking:
   overwrite_images: false
   params:
     # rembg:
-    alpha_thr: 0.2
+    alpha_thr: 0.1
     save_debug: true
     # sam2:
     keep: largest          # largest | best_score
@@ -21,8 +21,9 @@ masking:
 # Matching
 matching:
   backend: lightglue
+  features: disk
   ratio: 0.82
-  max_kp: 10000
+
 # SfM
 sfm:
   init_ratio: 0.3

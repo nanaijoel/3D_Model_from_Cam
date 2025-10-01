@@ -1,5 +1,8 @@
+# pipeline_runner.py
+
 import os, json
 import numpy as np
+import cv2 as cv
 from typing import Callable, Tuple, Any, Dict
 
 from io_paths import make_project_paths
@@ -11,7 +14,7 @@ from meshing import save_point_cloud, reconstruct_solid_mesh_from_ply
 from image_masking import preprocess_images
 
 
-# config utils
+# ---------------- config utils ----------------
 
 def _load_yaml_or_json(path: str) -> Dict[str, Any]:
     ext = os.path.splitext(path)[1].lower()
@@ -66,14 +69,16 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     fe = cfg.get("features", {})
     setenv("FEATURE_BACKEND", fe.get("backend"))
     setenv("FEATURE_DEVICE", fe.get("device"))
-    setenv("FEATURE_USE_MASK", pick_bool(fe.get("use_mask", False)))
+    setenv("FEATURE_USE_MASK", fe.get("use_mask"))  # "true"/"false" aus config ok
     setenv("FEATURE_MAX_KP", pick_num(fe.get("max_kp", 4096)))
     setenv("FEATURE_DEBUG_EVERY", pick_num(fe.get("debug_every", 0)))
 
+    # Matching ENV
     ma = cfg.get("matching", {})
-    setenv("MATCH_BACKEND", ma.get("backend"))
+    setenv("MATCH_BACKEND", ma.get("backend"))  # "lightglue" | "classic"
     setenv("MATCH_RATIO", pick_num(ma.get("ratio", 0.82)))
-    setenv("MATCH_MAX_KP", pick_num(ma.get("max_kp", 0)))
+    if "features" in ma:
+        setenv("MATCH_FEATURES", str(ma["features"]).lower())  # "superpoint"|"disk"|"aliked"|"sift"
 
     sf = cfg.get("sfm", {})
     setenv("SFM_INIT_RATIO", pick_num(sf.get("init_ratio", 0.5)))
@@ -97,7 +102,8 @@ def _dump_resolved_config(project_root: str) -> str:
             json.dump(kv, f, indent=2, ensure_ascii=False)
     return out_path
 
-# pipeline runner (sparse.ply only)
+
+# ---------------- pipeline runner (sparse.ply only) ----------------
 
 class PipelineRunner:
     def __init__(self, base_dir: str, on_log: Callable[[str], None], on_progress: Callable[[int, str], None]):
@@ -116,6 +122,8 @@ class PipelineRunner:
             cfg = _load_yaml_or_json(cfg_path)
             _apply_env_from_config(cfg)
             log(f"[pipeline] config loaded: {cfg_path}")
+        else:
+            cfg = {}
 
         # 1) frames
         imgs = extract_and_save_frames(video_path, target_frames, paths.raw_frames, log, prog)
@@ -124,8 +132,6 @@ class PipelineRunner:
         log(f"[frames] saved: {len(imgs)}")
 
         # optional Preprocessing/Masking
-        cfg_path = _maybe_find_config(self.base_dir)  # existiert oben schon
-        cfg = _load_yaml_or_json(cfg_path) if cfg_path else {}
         mask_cfg = cfg.get("masking", {})
         if bool(mask_cfg.get("enable", False)):
             log("[mask] preprocessing enabled")
@@ -133,18 +139,52 @@ class PipelineRunner:
             overwrite = bool(mask_cfg.get("overwrite_images", False))  # gleiche Orte & Namen
             params = dict(mask_cfg.get("params", {}))
             mask_dir = os.path.join(paths.features, "masks")
-            preprocess_images(imgs, out_mask_dir=mask_dir, overwrite_images=overwrite,
-                              method=method, params=params, save_debug=True)
+            preprocess_images(
+                imgs,
+                out_mask_dir=mask_dir,
+                overwrite_images=overwrite,
+                method=method,
+                params=params,
+                save_debug=True
+            )
 
         # 2) features
         kps, descs, shapes, meta = extract_features(imgs, paths.features, log, prog)
         if not kps or not shapes:
             raise RuntimeError("Feature extraction returned no keypoints.")
 
-        # 3) matching
-        pairs, matches = build_pairs(descs, log, prog, save_dir=paths.matches, keypoints=kps, meta=meta)
+        # 3) matching – build_pairs liest direkt aus paths.features
+        ratio = float(os.getenv("MATCH_RATIO", "0.82"))
+        device = os.getenv("FEATURE_DEVICE", "cuda")
+        pairs_np, matches_list = build_pairs(
+            paths.features,
+            ratio=ratio,
+            device=device,
+            backend=os.getenv("MATCH_BACKEND", "lightglue"),
+            on_log=log,
+            save_dir=paths.matches    # schreibt optional projects/.../matches/matches.npz
+        )
 
-        # 4) intrinsics (simple)
+        # ---- Convert to SfM format: dict[(i,j)] -> List[cv.DMatch]
+        def _as_sfm_matches(pairs_arr: np.ndarray, matches_any) -> Dict[Tuple[int, int], list]:
+            mdict: Dict[Tuple[int, int], list] = {}
+            # pairs_arr: (P,2), matches_any: List[(M,2)]
+            for (i, j), m in zip(pairs_arr.tolist(), matches_any):
+                if isinstance(m, list):
+                    m = np.array(m, dtype=np.int32) if len(m) else np.empty((0, 2), np.int32)
+                if m is None or m.size == 0:
+                    mdict[(i, j)] = []
+                    continue
+                # m: (M,2) -> (queryIdx, trainIdx)
+                mdict[(i, j)] = [
+                    cv.DMatch(_queryIdx=int(q), _trainIdx=int(t), _imgIdx=0, _distance=0.0)
+                    for q, t in m.astype(np.int32)
+                ]
+            return mdict
+
+        matches_for_sfm = _as_sfm_matches(pairs_np, matches_list)
+
+        # 4) intrinsics (simpel)
         h, w = shapes[0]
         focal = 0.87 * float(max(w, h))
         pp = (w / 2.0, h / 2.0)
@@ -166,10 +206,15 @@ class PipelineRunner:
             POSE_SMOOTHING=_parse_bool(os.getenv("SFM_POSE_SMOOTHING", "true"), True),
             SMOOTH_LAMBDA=float(os.getenv("SFM_SMOOTH_LAMBDA", "0.25")),
         )
-        res = run_sfm(kps, descs, shapes, pairs, matches, K, log, prog,
-                      poses_out_dir=poses_dir, config=cfg_sfm)
 
-        # 6) save sparse (no reduction) -> projects/<name>/sparse.ply
+        res = run_sfm(
+            kps, descs, shapes,
+            pairs_np, matches_for_sfm,   # dict[(i,j)] -> List[cv.DMatch]
+            K, log, prog,
+            poses_out_dir=poses_dir, config=cfg_sfm
+        )
+
+        # 6) save sparse
         if not (isinstance(res, tuple) and len(res) >= 1):
             raise RuntimeError("SfM did not return a points array.")
         points3d = np.asarray(res[0], dtype=np.float64).reshape(-1, 3)
@@ -178,11 +223,9 @@ class PipelineRunner:
         log(f"[sfm] raw_points(after validation)={points3d.shape[0]:d}")
         log(f"[ui] Done: {sparse_ply}")
 
-        # 7) meshing (simple, no config)
+        # 7) meshing (Poisson)
         mesh_dir = os.path.join(paths.root, "mesh")
         os.makedirs(mesh_dir, exist_ok=True)
-
-        # 7a) Poisson mesh
         solid_mesh = os.path.join(mesh_dir, "solid_mesh_poisson.ply")
         log("[mesh] reconstruct solid mesh (poisson)")
         try:

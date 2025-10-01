@@ -1,228 +1,257 @@
-import os
-import traceback
-from typing import Callable, Dict, List, Tuple, Optional
+# image_matching.py
+# LightGlue/Classic Matching für bereits extrahierte Features (*.npz in features_dir).
+# Rückgabe: (pairs, matches) und optionales Speichern nach projects/.../matches/matches.npz
 
-import cv2 as cv
+import os
+from typing import List, Tuple, Optional, Dict
+
 import numpy as np
+import cv2 as cv
 import torch
 
-Pair = Tuple[int, int]
+PAIR = Tuple[int, int]
 
 
-def _ratio_test(matches, ratio: float):
-    good = []
-    for m, n in matches:
-        if m.distance < ratio * n.distance:
-            good.append(m)
-    return good
+def _log(msg: str, fn=None):
+    if fn:
+        fn(msg)
 
 
-def _sanitize_np(a: np.ndarray, want_float: bool = True, make_contig: bool = True) -> np.ndarray:
-    if want_float and a.dtype != np.float32:
-        a = a.astype(np.float32, copy=False)
-    if not want_float and a.dtype != np.int32:
-        a = a.astype(np.int32, copy=False)
-    if make_contig and not a.flags.c_contiguous:
-        a = np.ascontiguousarray(a)
-    # NaN/Inf filtern
-    if want_float and (not np.isfinite(a).all()):
-        a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
-    return a
+def _safe_load_npz(path: str) -> Dict[str, np.ndarray]:
+    """Lädt unsere Feature-Datei robust (kps, des, shape, optional scores)."""
+    d = np.load(path, allow_pickle=True)  # allow_pickle für evtl. spätere Erweiterungen
+    out = {
+        "kps": d["kps"],                            # (N,7)
+        "des": d["des"].astype(np.float32),         # (N,D) oder (0,D)
+        "shape": tuple(d["shape"].tolist())         # (H,W)
+    }
+    # optional: scores (N,) falls vorhanden
+    if "scores" in d.files:
+        out["scores"] = d["scores"].astype(np.float32)
+    return out
 
 
-def _build_pairs(N: int) -> List[Pair]:
-    pairs: List[Pair] = []
-    for i in range(N):
-        for d in range(1, 5):
-            j = i + d
-            if j < N:
-                pairs.append((i, j))
-    if N > 8:
-        for i in range(0, N, max(1, N // 8)):
-            j = N - 1
-            if i < j:
-                pairs.append((i, j))
-    return pairs
+def _kps_to_xy(kps_np: np.ndarray) -> np.ndarray:
+    if kps_np.size == 0:
+        return np.empty((0, 2), np.float32)
+    return kps_np[:, :2].astype(np.float32)
+
+
+def _infer_features_name_from_dim(dim: int) -> Optional[str]:
+    if dim == 256: return "superpoint"
+    if dim == 128: return "disk"      # ggf. andere 128-D Varianten
+    if dim == 64:  return "aliked"
+    return None
+
+
+def _expected_dim_from_name(name: str) -> int:
+    return {"superpoint": 256, "disk": 128, "aliked": 128}[name]
+
+
+def _call_lightglue_try_both_apis(
+    lg,
+    k0: np.ndarray, d0: np.ndarray, s0: np.ndarray, hw0: Tuple[int, int],
+    k1: np.ndarray, d1: np.ndarray, s1: np.ndarray, hw1: Tuple[int, int],
+    device: str,
+) -> np.ndarray:
+    """
+    Ruft LightGlue auf und extrahiert Matches.
+    Probiert zuerst die "suffixed keys"-API, dann die "image0/image1"-API.
+    Gibt (M,2) int32 zurück.
+    """
+    H0, W0 = hw0
+    H1, W1 = hw1
+    t_k0 = torch.from_numpy(k0)[None].to(device)       # [1,N0,2]
+    t_k1 = torch.from_numpy(k1)[None].to(device)       # [1,N1,2]
+    t_d0 = torch.from_numpy(d0)[None].to(device)       # [1,N0,C]
+    t_d1 = torch.from_numpy(d1)[None].to(device)       # [1,N1,C]
+    t_s0 = torch.from_numpy(s0)[None].to(device)       # [1,N0]
+    t_s1 = torch.from_numpy(s1)[None].to(device)       # [1,N1]
+    t_sz0 = torch.tensor([[H0, W0]], dtype=torch.float32, device=device)
+    t_sz1 = torch.tensor([[H1, W1]], dtype=torch.float32, device=device)
+
+    with torch.no_grad():
+        # 1) Suffixed-API
+        try:
+            out = lg({
+                "keypoints0": t_k0, "keypoints1": t_k1,
+                "descriptors0": t_d0, "descriptors1": t_d1,
+                "scores0": t_s0, "scores1": t_s1,
+                "image_size0": t_sz0, "image_size1": t_sz1,
+            })
+            # Neue/alte Rückgabeformate abfangen
+            if "matches" in out:  # [B,M,2]
+                m = out["matches"][0].detach().cpu().numpy().astype(np.int32)
+                return m
+            if "matches0" in out:  # [1,N0] mit -1
+                mvec = out["matches0"][0].detach().cpu().numpy()
+                valid0 = np.where(mvec >= 0)[0].astype(np.int32)
+                if valid0.size == 0:
+                    return np.empty((0, 2), np.int32)
+                valid1 = mvec[valid0].astype(np.int32)
+                return np.stack([valid0, valid1], axis=1).astype(np.int32)
+        except Exception:
+            # Fallback auf zweite API
+            pass
+
+        # 2) image0/image1-API
+        try:
+            out = lg({
+                "image0": {
+                    "keypoints": t_k0,
+                    "descriptors": t_d0,
+                    "scores": t_s0,
+                    "image_size": t_sz0,
+                },
+                "image1": {
+                    "keypoints": t_k1,
+                    "descriptors": t_d1,
+                    "scores": t_s1,
+                    "image_size": t_sz1,
+                },
+            })
+            if "matches" in out:  # [B,M,2]
+                m = out["matches"][0].detach().cpu().numpy().astype(np.int32)
+                return m
+            if "matches0" in out:
+                mvec = out["matches0"][0].detach().cpu().numpy()
+                valid0 = np.where(mvec >= 0)[0].astype(np.int32)
+                if valid0.size == 0:
+                    return np.empty((0, 2), np.int32)
+                valid1 = mvec[valid0].astype(np.int32)
+                return np.stack([valid0, valid1], axis=1).astype(np.int32)
+        except Exception:
+            pass
+
+    # Wenn alles fehlschlägt:
+    return np.empty((0, 2), np.int32)
 
 
 def build_pairs(
-    descriptors: List[np.ndarray],
-    on_log: Optional[Callable[[str], None]] = None,
-    on_progress: Optional[Callable[[int, str], None]] = None,
-    save_dir: Optional[str] = None,
-    keypoints: Optional[List[List[cv.KeyPoint]]] = None,
-    meta: Optional[dict] = None
-) -> Tuple[List[Pair], Dict[Pair, List[cv.DMatch]]]:
-    def log(m):  on_log and on_log(m)
-    def prog(p, s): on_progress and on_progress(int(p), s)
+    features_dir: str,
+    ratio: float = 0.82,
+    device: Optional[str] = None,
+    backend: str = "lightglue",
+    on_log=None,
+    save_dir: Optional[str] = None
+) -> Tuple[np.ndarray, List[np.ndarray]]:
+    _log(f"[match] scan features in {features_dir}", on_log)
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    backend = os.getenv("MATCH_BACKEND", "classic").lower()
-    ratio = float(os.getenv("MATCH_RATIO", "0.82"))
-    N = len(descriptors)
-    pairs = _build_pairs(N)
-    matches: Dict[Pair, List[cv.DMatch]] = {}
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
+    # --- Feature-Dateien finden
+    fnames = sorted([f for f in os.listdir(features_dir) if f.startswith("features_") and f.endswith(".npz")])
+    paths = [os.path.join(features_dir, f) for f in fnames]
+    N = len(paths)
+    if N < 2:
+        _log("[match] not enough frames", on_log)
+        return np.empty((0, 2), np.int32), []
 
-    # --------- LightGlue backend ----------
-    if backend == "lightglue":
+    # --- Descriptor-Dim bestimmen
+    first_dim = None
+    for p in paths:
+        f = _safe_load_npz(p)
+        if f["des"].ndim == 2 and f["des"].shape[0] > 0:
+            first_dim = int(f["des"].shape[1])
+            break
+    if first_dim is None:
+        _log("[match] all frames are empty -> no pairs", on_log)
+        return np.empty((0, 2), np.int32), []
+
+    env_feat = os.getenv("MATCH_FEATURES", "").strip().lower()
+    if env_feat in ("superpoint", "disk", "aliked"):
+        features_name = env_feat
+    else:
+        features_name = _infer_features_name_from_dim(first_dim) or "superpoint"
+    exp_dim = _expected_dim_from_name(features_name)
+
+    # --- Matcher vorbereiten
+    lg = None
+    classic = None
+    if backend.lower() == "lightglue":
         try:
             from lightglue import LightGlue
+            lg = LightGlue(features=features_name).to(device).eval()
+            _log(f"[match] LightGlue on {device} (features='{features_name}')", on_log)
         except Exception as e:
-            log(f"[match] ERROR: LightGlue import failed: {e}")
-            return pairs, {p: [] for p in pairs}
+            _log(f"[match] WARN: LightGlue init failed ({e})", on_log)
 
-        # device wählen wie in features
-        device_env = os.getenv("FEATURE_DEVICE", "").lower().strip()
-        device = device_env if device_env in ("cuda", "cpu") else ("cuda" if torch.cuda.is_available() else "cpu")
+    if lg is None and exp_dim == 128:
+        classic = cv.BFMatcher(cv.NORM_L2, crossCheck=False)
+        _log(f"[match] Classic BF (SNN, ratio={ratio}) for 128-D", on_log)
+    elif lg is None:
+        raise RuntimeError("LightGlue not available and descriptors are not 128-D; cannot match.")
 
-        assert keypoints is not None and meta is not None, \
-            "[match] LightGlue requires keypoints and meta (scores, image_size) from features."
+    # --- Nachbarschafts-Paare (span=3)
+    span = 3
+    pair_list: List[PAIR] = []
+    for i in range(N):
+        for j in range(i + 1, min(N, i + 1 + span)):
+            pair_list.append((i, j))
 
-        lg_feat = meta.get("lg_feature_name", "superpoint")
-        if lg_feat not in ("superpoint", "disk", "aliked"):
-            lg_feat = "superpoint"
+    pairs_out: List[List[int]] = []
+    matches_out: List[np.ndarray] = []
 
-        # optional limitieren (zu viele KPs killen LG-Performance/Memory)
-        max_kp_match = int(os.getenv("MATCH_MAX_KP", os.getenv("FEATURE_MAX_KP", "4096")))
+    # --- Matching
+    for (i, j) in pair_list:
+        Fi = _safe_load_npz(paths[i])
+        Fj = _safe_load_npz(paths[j])
 
-        matcher = LightGlue(features=lg_feat).to(device).eval()
-        log(f"[match] LightGlue on {device} (features='{lg_feat}', max_kp_match={max_kp_match})")
+        k0 = _kps_to_xy(Fi["kps"])
+        k1 = _kps_to_xy(Fj["kps"])
+        d0 = Fi["des"]
+        d1 = Fj["des"]
 
-        sp_scores = meta.get("sp_scores", None)
-        sp_sizes  = meta.get("sp_sizes", None)
-
-        def to_feat(i: int):
-            kps = keypoints[i]
-            des = descriptors[i]
-            if des is None or len(kps) == 0 or (isinstance(des, np.ndarray) and des.shape[0] == 0):
-                return None, 0
-
-            # --- Keypoints → [N,2] ---
-            kp_xy = np.array([[kp.pt[0], kp.pt[1]] for kp in kps], dtype=np.float32)
-            kp_xy = _sanitize_np(kp_xy, want_float=True)
-
-            # --- Descriptors: [N,C] erwartet (haben wir aus features so gespeichert) ---
-            des = _sanitize_np(des, want_float=True)
-            if des.ndim != 2 or des.shape[0] != kp_xy.shape[0]:
-                # robust kürzen auf gemeinsame Länge
-                M = min(des.shape[0], kp_xy.shape[0])
-                if M <= 0:
-                    return None, 0
-                des = des[:M]
-                kp_xy = kp_xy[:M]
-
-            # --- Scores: [N] ---
-            if sp_scores is not None and len(sp_scores) > i and sp_scores[i] is not None and sp_scores[i].shape[0] > 0:
-                sc_arr = sp_scores[i].astype(np.float32, copy=False)
-                if sc_arr.shape[0] != kp_xy.shape[0]:
-                    M = min(sc_arr.shape[0], kp_xy.shape[0])
-                    sc_arr = sc_arr[:M]; kp_xy = kp_xy[:M]; des = des[:M]
-            else:
-                sc_arr = np.ones((kp_xy.shape[0],), np.float32)
-
-            # --- optionale Limitierung nach Score (Top-K) ---
-            if max_kp_match > 0 and kp_xy.shape[0] > max_kp_match:
-                idx = np.argsort(-sc_arr)[:max_kp_match]  # top nach Score
-                kp_xy = kp_xy[idx]
-                des   = des[idx]
-                sc_arr = sc_arr[idx]
-
-            # --- torch Tensors in gewünschtem Layout ---
-            kp_t = torch.from_numpy(kp_xy)[None, ...].to(device)                 # [1,N,2]
-            desc_t = torch.from_numpy(des.T).contiguous()[None, ...].to(device)  # [1,C,N]
-            sc_t = torch.from_numpy(sc_arr)[None, ...].to(device)                # [1,N]
-
-            if sp_sizes is not None and len(sp_sizes) > i and sp_sizes[i] is not None:
-                H, W = sp_sizes[i]
-            else:
-                # Fallback (nicht kritisch)
-                H = int(max(1, np.max(kp_xy[:, 1])))
-                W = int(max(1, np.max(kp_xy[:, 0])))
-            size_t = torch.tensor([[int(H), int(W)]], dtype=torch.int32, device=device)  # [1,2]
-
-            feat = {"keypoints": kp_t, "descriptors": desc_t, "scores": sc_t, "image_size": size_t}
-            return feat, kp_xy.shape[0]
-
-        torch.set_grad_enabled(False)
-        with torch.no_grad():
-            for t, (i, j) in enumerate(pairs):
-                try:
-                    Fi, ni = to_feat(i)
-                    Fj, nj = to_feat(j)
-                    if Fi is None or Fj is None or ni == 0 or nj == 0:
-                        matches[(i, j)] = []
-                    else:
-                        # ---- Achtung: API je nach Version ----
-                        # Einige Versionen erwarten matcher({"image0": Fi, "image1": Fj}),
-                        # andere matcher.match(Fi, Fj). Wir probieren beides.
-                        out = None
-                        try:
-                            out = matcher({"image0": Fi, "image1": Fj})
-                        except Exception:
-                            out = matcher.match(Fi, Fj)
-
-                        m0 = out["matches0"][0].detach().cpu().numpy()
-                        valid = np.where(m0 >= 0)[0]
-                        if valid.size == 0:
-                            matches[(i, j)] = []
-                        else:
-                            dj = m0[valid]
-                            ms = [cv.DMatch(_queryIdx=int(qi), _trainIdx=int(int(tj)), _imgIdx=0, _distance=0.0)
-                                  for qi, tj in zip(valid.tolist(), dj.tolist())]
-                            matches[(i, j)] = ms
-
-                except Exception:
-                    # ausführliches Logging + Fallback auf classic für dieses Paar
-                    err = traceback.format_exc()
-                    log(f"[match] ERROR pair ({i},{j}):\n{err}")
-
-                    # --- Fallback Classic ---
-                    di = descriptors[i]; dj = descriptors[j]
-                    if di is None or dj is None or len(di) == 0 or len(dj) == 0:
-                        matches[(i, j)] = []
-                    else:
-                        di = _sanitize_np(di, want_float=True)
-                        dj = _sanitize_np(dj, want_float=True)
-                        bf = cv.BFMatcher(cv.NORM_L2, crossCheck=False)
-                        try:
-                            knn = bf.knnMatch(di, dj, k=2)
-                            good = _ratio_test(knn, ratio)
-                            matches[(i, j)] = good
-                        except Exception as e2:
-                            log(f"[match] classic fallback failed for ({i},{j}): {e2}")
-                            matches[(i, j)] = []
-
-                if save_dir:
-                    arr = np.array([[m.queryIdx, m.trainIdx] for m in matches[(i, j)]], dtype=np.int32)
-                    np.savez_compressed(os.path.join(save_dir, f"match_{i:04d}_{j:04d}.npz"),
-                                        idx_i=i, idx_j=j, matches=arr)
-                prog(40 + (t + 1) / max(1, len(pairs)) * 15, "Image Matching (lightglue)")
-
-        return pairs, matches
-
-    # --------- Classic (BF + ratio) ----------
-    log("[match] classic BF matcher")
-    bf = cv.BFMatcher(cv.NORM_L2, crossCheck=False)
-
-    for t, (i, j) in enumerate(pairs):
-        di = descriptors[i]; dj = descriptors[j]
-        if di is None or dj is None or len(di) == 0 or len(dj) == 0:
-            matches[(i, j)] = []
-            prog(40 + (t + 1) / max(1, len(pairs)) * 15, "Image Matching (classic)")
+        # Leere Frames/Dimension prüfen
+        if d0.ndim != 2 or d1.ndim != 2 or d0.shape[0] == 0 or d1.shape[0] == 0:
+            _log(f"[match] skip pair ({i},{j}): empty descriptors", on_log)
+            pairs_out.append([i, j])
+            matches_out.append(np.empty((0, 2), np.int32))
+            continue
+        if d0.shape[1] != exp_dim or d1.shape[1] != exp_dim:
+            _log(f"[match] skip pair ({i},{j}): descriptor dim mismatch "
+                 f"({d0.shape[1]} vs {d1.shape[1]}, expected {exp_dim})", on_log)
+            pairs_out.append([i, j])
+            matches_out.append(np.empty((0, 2), np.int32))
             continue
 
-        di = _sanitize_np(di, want_float=True)
-        dj = _sanitize_np(dj, want_float=True)
+        # Scores (falls nicht vorhanden -> 1en)
+        s0 = Fi.get("scores", np.ones((len(k0),), np.float32))
+        s1 = Fj.get("scores", np.ones((len(k1),), np.float32))
+        H0, W0 = Fi["shape"]
+        H1, W1 = Fj["shape"]
 
-        knn = bf.knnMatch(di, dj, k=2)
-        good = _ratio_test(knn, ratio)
-        matches[(i, j)] = good
+        if lg is not None:
+            m = _call_lightglue_try_both_apis(
+                lg, k0, d0, s0, (H0, W0),
+                k1, d1, s1, (H1, W1),
+                device
+            )
+        else:
+            # Classic BF + Ratio-Test
+            knn = classic.knnMatch(d0, d1, k=2)
+            good = []
+            for a, b in knn:
+                if a.distance < ratio * b.distance:
+                    good.append([a.queryIdx, a.trainIdx])
+            m = np.array(good, dtype=np.int32) if good else np.empty((0, 2), np.int32)
 
-        if save_dir:
-            np.savez_compressed(os.path.join(save_dir, f"match_{i:04d}_{j:04d}.npz"),
-                                idx_i=i, idx_j=j,
-                                matches=np.array([[m.queryIdx, m.trainIdx] for m in good], dtype=np.int32))
-        prog(40 + (t + 1) / max(1, len(pairs)) * 15, "Image Matching (classic)")
+        pairs_out.append([i, j])
+        matches_out.append(m)
 
-    return pairs, matches
+    pairs_arr = np.array(pairs_out, dtype=np.int32)
+
+    if save_dir:
+        save_pairs(save_dir, pairs_arr, matches_out)
+
+    return pairs_arr, matches_out
+
+
+def save_pairs(out_dir: str, pairs: np.ndarray, matches: List[np.ndarray]) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+    # variable-length arrays -> dtype=object!
+    matches_obj = np.empty(len(matches), dtype=object)
+    matches_obj[:] = matches
+    np.savez(os.path.join(out_dir, "matches.npz"),
+             pairs=pairs.astype(np.int32),
+             matches=matches_obj)

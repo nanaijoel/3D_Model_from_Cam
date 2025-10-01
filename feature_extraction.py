@@ -276,7 +276,7 @@ def extract_features(
         np.savez(
             os.path.join(out_dir, f"features_{i:04d}.npz"),
             kps=_kp_to_np(keypoints[-1]),
-            des=descriptors[-1],
+            des=descriptors[-1].astype(np.float32).reshape(-1, descriptors[-1].shape[-1]),
             shape=np.array(shapes[-1], dtype=np.int32)
         )
 
