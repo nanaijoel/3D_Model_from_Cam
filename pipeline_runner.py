@@ -157,6 +157,7 @@ class PipelineRunner:
             raise RuntimeError("No frames were extracted.")
         log(f"[frames] saved: {len(imgs)}")
 
+        prog(20, "Image preprocessing /  masking.")
         # optional Preprocessing/Masking
         mask_cfg = cfg.get("masking", {})
         if bool(mask_cfg.get("enable", False)):
@@ -210,7 +211,7 @@ class PipelineRunner:
 
         # 4) intrinsics (simpel)
         h, w = shapes[0]
-        focal = 0.87 * float(max(w, h))
+        focal = 0.92 * float(max(w, h))
         pp = (w / 2.0, h / 2.0)
         K = np.array([[focal, 0, pp[0]], [0, focal, pp[1]], [0, 0, 1]], dtype=float)
         log(f"[pipeline] intrinsics: f={focal:.1f}, cx={pp[0]:.1f}, cy={pp[1]:.1f}")
@@ -228,7 +229,7 @@ class PipelineRunner:
             USE_KEYFRAMES=_parse_bool(os.getenv("SFM_USE_KEYFRAMES", "true"), True),
             USE_LOOP_CONSTRAINTS=_parse_bool(os.getenv("SFM_USE_LOOP_CONSTRAINTS", "true"), True),
             POSE_SMOOTHING=_parse_bool(os.getenv("SFM_POSE_SMOOTHING", "true"), True),
-            SMOOTH_LAMBDA=float(os.getenv("SFM_SMOOTH_LAMBDA", "0.25")),
+            SMOOTH_LAMBDA=float(os.getenv("SFM_SMOOTH_LAMBDA", "0.01")),
         )
 
         res = run_sfm(

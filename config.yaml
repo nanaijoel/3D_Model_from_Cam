@@ -6,25 +6,25 @@ features:
   device: cuda
   use_mask: true
   max_kp: 12000
-  debug_every: 30
+  debug_every: 20
 
   # LightGlue/learned extractor tuning
   lg:
-    detection_threshold: 0.0008   # kleiner => mehr Keypoints
-    nms: 2                        # kleiner => dichter
-    resize: 1024                  # längere Bildkante fürs Netz
-    remove_borders: 2
+    detection_threshold: 0.0004   # kleiner => mehr Keypoints
+    nms: 4                        # kleiner => dichter
+    resize: 1536                 # längere Bildkante fürs Netz
+    remove_borders: 0
     force_num: true               # versucht max_num_keypoints zu erzwingen
 
   # Optionales Gray-Preprocessing (wirkt nur auf Detektion, nicht auf Originalbilder)
   preproc:
-    clahe: true
+    clahe: false
     clahe_clip: 3.0
     clahe_tiles: 8
-    unsharp: true
+    unsharp: false
     unsharp_sigma: 1.0
     unsharp_amount: 1.5
-    noise: true
+    noise: false
     noise_std: 1.5
     mask_dilate: 8                # für Masken-Kanten; 5–8 ist gut
 
@@ -41,7 +41,7 @@ masking:
   overwrite_images: false
   params:
     # rembg:
-    alpha_thr: 0.1
+    alpha_thr: 0.5
     save_debug: true
     # sam2:
     keep: largest          # largest | best_score
@@ -60,4 +60,4 @@ sfm:
   use_keyframes: true
   use_loops: true
   pose_smoothing: true
-  smooth_lambda: 0.001
+  smooth_lambda: 0.01

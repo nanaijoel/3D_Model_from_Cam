@@ -1,7 +1,6 @@
 # image_masking.py
 import os
 from typing import List, Tuple, Optional, Dict
-
 import cv2 as cv
 import numpy as np
 
@@ -126,6 +125,7 @@ def preprocess_images(
     params: Optional[Dict] = None,
     save_debug: bool = True
 ) -> Tuple[List[str], List[str]]:
+
     """
     Erzeugt pro Bild genau EINE Maske:
       projects/<name>/features/masks/<basename>_mask.png
@@ -157,7 +157,6 @@ def preprocess_images(
         mpath = os.path.join(out_mask_dir, f"{base}_mask.png")
         cv.imwrite(mpath, m)
         mask_paths.append(mpath)
-
         # Debug-Overlay optional
         if save_debug:
             dbg = img.copy()

@@ -27,7 +27,7 @@ def extract_and_save_frames(video_path: str, target_frames: int, out_dir: str,
         fn = os.path.join(out_dir, f"frame_{i:04d}_src_{idx:06d}.png")
         cv.imwrite(fn, frame)
         saved.append(fn)
-        prog(int(5 + (i+1)/len(idxs)*25), "Extract frames")
+        prog(int(5 + (i+1)/len(idxs)*15), "Extract frames")
     cap.release()
     if len(saved) < 3:
         raise RuntimeError("Too few valid frames after sampling.")

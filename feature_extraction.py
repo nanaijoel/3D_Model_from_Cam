@@ -38,7 +38,7 @@ def _make_lg_extractor(kind: str, device: str, max_kp: int, log=print):
     conf = {k: v for k, v in conf.items() if k in sig.parameters}
 
     extractor = cls(**conf).to(device).eval()
-    log(f"[features] {kind.upper()} with conf={conf} on {device}")
+    log(f"[features] {kind.upper()} on {device}")
     return extractor
 
 
