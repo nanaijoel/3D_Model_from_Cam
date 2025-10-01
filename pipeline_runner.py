@@ -131,10 +131,10 @@ class PipelineRunner:
 
         # 4) intrinsics (simple)
         h, w = shapes[0]
-        focal = 0.9 * float(max(w, h))
+        focal = 0.95 * float(max(w, h))
         pp = (w / 2.0, h / 2.0)
         K = np.array([[focal, 0, pp[0]], [0, focal, pp[1]], [0, 0, 1]], dtype=float)
-        log(f"[pipeline] intrinsics: f≈{focal:.1f}, cx={pp[0]:.1f}, cy={pp[1]:.1f}")
+        log(f"[pipeline] intrinsics: f={focal:.1f}, cx={pp[0]:.1f}, cy={pp[1]:.1f}")
 
         poses_dir = os.path.join(paths.root, "poses")
         os.makedirs(poses_dir, exist_ok=True)

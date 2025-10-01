@@ -31,5 +31,5 @@ def extract_and_save_frames(video_path: str, target_frames: int, out_dir: str,
     cap.release()
     if len(saved) < 3:
         raise RuntimeError("Too few valid frames after sampling.")
-    log(f"[frames] saved: {len(saved)}")
+
     return saved
