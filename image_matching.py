@@ -188,7 +188,7 @@ def build_pairs(
         raise RuntimeError("LightGlue not available and descriptors are not 128-D; cannot match.")
 
     # --- Nachbarschafts-Paare
-    span = 6
+    span = 5
     pair_list: List[PAIR] = []
     for i in range(N):
         for j in range(i + 1, min(N, i + 1 + span)):

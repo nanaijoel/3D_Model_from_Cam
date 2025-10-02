@@ -261,14 +261,26 @@ class PipelineRunner:
             reconstruct_solid_mesh_from_ply(
                 sparse_ply, solid_mesh,
                 method="poisson",
-                depth=10, scale=1.1, no_linear_fit=False,
-                dens_quantile=0.015,
-                bbox_expand=0.03,
-                pre_filter=False, voxel=0.0,
-                normals_k=40, smooth=16, simplify=0,
+                depth=11,
+                scale=1.10,
+                no_linear_fit=False,
+                dens_quantile=0.0,  # nichts wegtrimmen
+                alpha=0.0,
+                bbox_expand=0.02,
+                pre_filter=False,  # nur die ganz leichte Filterung aus save_point_cloud bleibt
+                pre_filter_neighbors=24,
+                pre_filter_std=1.2,
+                pre_filter_radius=False,  # Radius-Filter AUS (kann dünne Details killen)
+                voxel=0.0,  # KEIN zusätzliches Downsample
+                normals_k=40,
+                smooth=6,  # etwas weniger glätten -> schärfere Kanten
+                simplify=0,
                 color_transfer=False,
+                poses_npz=None,  # KEINE Kamera-Orientierung der Normalen
+                remove_small_comp=False,  # keine Teile entfernen
                 on_log=log, on_progress=prog
             )
+
             log(f"[ui] Solid mesh: {solid_mesh}")
         except Exception as e:
             log(f"[mesh] solid reconstruction failed: {e}")

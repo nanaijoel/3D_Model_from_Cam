@@ -2,7 +2,7 @@
 
 # Feature extraction
 features:
-  backend: disk          # robust & dicht; DISK/ALIKED optional testbar
+  backend: superpoint          # robust & dicht; DISK/ALIKED optional testbar
   device: cuda
   use_mask: true               # nur Statue matchen, weniger False-Matches im BG
   max_kp: 20000                # viele Keypoints für lückenlose Flächen
@@ -49,7 +49,7 @@ masking:
 # Matching
 matching:
   backend: lightglue
-  features: disk          # konsistent zum Extractor
+  features: superpoint          # konsistent zum Extractor
   ratio: 0.82                    # nur BF-Fallback; bei LG wirkungslos
   depth_confidence: -1           # Early-Stop AUS → volle Tiefe (max Genauigkeit)
   width_confidence: -1           # Pruning AUS → volle Breite (mehr Matches)
