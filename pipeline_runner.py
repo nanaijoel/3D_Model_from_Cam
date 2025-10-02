@@ -103,6 +103,10 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     ma = cfg.get("matching", {})
     setenv("MATCH_BACKEND", ma.get("backend"))  # "lightglue" | "classic"
     setenv("MATCH_RATIO", pick_num(ma.get("ratio", 0.82)))
+    setenv("MATCH_DEPTH", ma.get("depth_confidence"))  # z.B. 0.90 | -1 (disable)
+    setenv("MATCH_WIDTH", ma.get("width_confidence"))  # z.B. 0.97 | -1
+    setenv("MATCH_FILTER", ma.get("filter_threshold"))  # z.B. 0.05..0.3
+
     if "features" in ma:
         setenv("MATCH_FEATURES", str(ma["features"]).lower())  # "superpoint"|"disk"|"aliked"|"sift"
 

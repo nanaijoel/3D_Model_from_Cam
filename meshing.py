@@ -144,7 +144,7 @@ def reconstruct_solid_mesh_from_ply(
     method: str = "poisson",      # "poisson" | "alpha"
     depth: int = 12,
     scale: float = 1.1,
-    no_linear_fit: bool = False,
+    no_linear_fit: bool = True,
     dens_quantile: float = 0.02,
     alpha: float = 0.0,
     bbox_expand: float = 0.02,

@@ -171,7 +171,12 @@ def build_pairs(
     if backend.lower() == "lightglue":
         try:
             from lightglue import LightGlue
-            lg = LightGlue(features=features_name).to(device).eval()
+            lg = LightGlue(
+                features=features_name,
+                depth_confidence=float(os.getenv("MATCH_DEPTH", "0.95")),
+                width_confidence=float(os.getenv("MATCH_WIDTH", "0.99")),
+                filter_threshold=float(os.getenv("MATCH_FILTER", "0.10")),
+            ).to(device).eval()
             _log(f"[match] LightGlue on {device} (features='{features_name}')", on_log)
         except Exception as e:
             _log(f"[match] WARN: LightGlue init failed ({e})", on_log)

@@ -1,32 +1,32 @@
-# config.yaml
+# config.yaml  — Buddha: maximal dicht & löcherfrei
 
 # Feature extraction
 features:
-  backend: superpoint          # superpoint | disk | aliked | sift
+  backend: disk          # robust & dicht; DISK/ALIKED optional testbar
   device: cuda
-  use_mask: true
-  max_kp: 12000
+  use_mask: true               # nur Statue matchen, weniger False-Matches im BG
+  max_kp: 20000                # viele Keypoints für lückenlose Flächen
   debug_every: 20
 
   # LightGlue/learned extractor tuning
   lg:
-    detection_threshold: 0.0004   # kleiner => mehr Keypoints
-    nms: 4                        # kleiner => dichter
-    resize: 1536                 # längere Bildkante fürs Netz
-    remove_borders: 0
-    force_num: true               # versucht max_num_keypoints zu erzwingen
+    detection_threshold: 0.0003  # niedriger => mehr (auch schwächere) Punkte
+    nms: 2                       # dichter beieinanderliegende Punkte zulassen
+    resize: 1280                 # moderat; kein unnötiges Upscaling
+    remove_borders: 2            # Kanten nicht hart abschneiden
+    force_num: true              # versucht max_kp zu erreichen
 
-  # Optionales Gray-Preprocessing (wirkt nur auf Detektion, nicht auf Originalbilder)
+  # Optionales Gray-Preprocessing (wirkt nur auf Detektion)
   preproc:
     clahe: true
-    clahe_clip: 10.0
-    clahe_tiles: 8
-    unsharp: false
+    clahe_clip: 4.0              # starke, aber noch stabile Kontrastanhebung
+    clahe_tiles: 8               # lokale Anpassung gut für Details
+    unsharp: true                # Kanten leicht betonen (feine Reliefs)
     unsharp_sigma: 1.0
-    unsharp_amount: 1.5
-    noise: false
+    unsharp_amount: 1.3
+    noise: false                 # kein Dithering – Stabilität vor Zufall
     noise_std: 1.5
-    mask_dilate: 8                # für Masken-Kanten; 5–8 ist gut
+    mask_dilate: 6               # Maske etwas erweitern, um Randlöcher zu vermeiden
 
   # SIFT-Fallback / -Explizit
   sift:
@@ -37,20 +37,23 @@ features:
 # Masking / Preprocessing
 masking:
   enable: true
-  method: rembg            # rembg | sam2
+  method: rembg                  # robuste Objektmaske ohne Alphahalo
   overwrite_images: false
   params:
-    # rembg:
-    alpha_thr: 0.5
+    # rembg (nur falls umgestellt):
+    alpha_thr: 0.4
     save_debug: true
     # sam2:
-    keep: largest          # largest | best_score
+    keep: largest                # größtes Segment = Statue
 
 # Matching
 matching:
   backend: lightglue
-  features: superpoint          # superpoint | disk | aliked | sift
-  ratio: 0.82
+  features: disk          # konsistent zum Extractor
+  ratio: 0.82                    # nur BF-Fallback; bei LG wirkungslos
+  depth_confidence: -1           # Early-Stop AUS → volle Tiefe (max Genauigkeit)
+  width_confidence: -1           # Pruning AUS → volle Breite (mehr Matches)
+  filter_threshold: 0.06         # niedriger => mehr Matches, RANSAC räumt auf
 
 # SfM
 sfm:
