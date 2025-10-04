@@ -5,14 +5,18 @@ import numpy as np
 import cv2 as cv
 from typing import Callable, Tuple, Any, Dict
 
+from image_masking import preprocess_images
 from io_paths import make_project_paths
 from frame_extractor import extract_and_save_frames
 from feature_extraction import extract_features
 from image_matching import build_pairs
 from sfm_incremental import run_sfm, SfMConfig
-from meshing import save_point_cloud, reconstruct_solid_mesh_from_ply
-from image_masking import preprocess_images
-
+from meshing import (
+    save_point_cloud,
+    reconstruct_solid_mesh_from_ply,
+    reconstruct_visual_hull_from_masks,
+    filter_cloud_by_masks,
+)
 
 # ---------------- config utils ----------------
 
@@ -69,7 +73,7 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     fe = cfg.get("features", {})
     setenv("FEATURE_BACKEND", fe.get("backend"))
     setenv("FEATURE_DEVICE", fe.get("device"))
-    setenv("FEATURE_USE_MASK", fe.get("use_mask"))  # "true"/"false" aus config ok
+    setenv("FEATURE_USE_MASK", fe.get("use_mask"))
     setenv("FEATURE_MAX_KP", pick_num(fe.get("max_kp", 4096)))
     setenv("FEATURE_DEBUG_EVERY", pick_num(fe.get("debug_every", 0)))
 
@@ -101,14 +105,13 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
 
     # Matching ENV
     ma = cfg.get("matching", {})
-    setenv("MATCH_BACKEND", ma.get("backend"))  # "lightglue" | "classic"
+    setenv("MATCH_BACKEND", ma.get("backend"))
     setenv("MATCH_RATIO", pick_num(ma.get("ratio", 0.82)))
-    setenv("MATCH_DEPTH", ma.get("depth_confidence"))  # z.B. 0.90 | -1 (disable)
-    setenv("MATCH_WIDTH", ma.get("width_confidence"))  # z.B. 0.97 | -1
-    setenv("MATCH_FILTER", ma.get("filter_threshold"))  # z.B. 0.05..0.3
-
+    setenv("MATCH_DEPTH", ma.get("depth_confidence"))
+    setenv("MATCH_WIDTH", ma.get("width_confidence"))
+    setenv("MATCH_FILTER", ma.get("filter_threshold"))
     if "features" in ma:
-        setenv("MATCH_FEATURES", str(ma["features"]).lower())  # "superpoint"|"disk"|"aliked"|"sift"
+        setenv("MATCH_FEATURES", str(ma["features"]).lower())
 
     # SfM ENV (unchanged)
     sfm = cfg.get("sfm", {})
@@ -134,7 +137,7 @@ def _dump_resolved_config(project_root: str) -> str:
     return out_path
 
 
-# ---------------- pipeline runner (sparse.ply only) ----------------
+# ---------------- pipeline runner ----------------
 class PipelineRunner:
     def __init__(self, base_dir: str, on_log: Callable[[str], None], on_progress: Callable[[int, str], None]):
         self.base_dir = base_dir
@@ -146,7 +149,7 @@ class PipelineRunner:
         paths = make_project_paths(self.base_dir, project_name)
         log(f"[pipeline] Project: {paths.root}")
 
-        # config
+        # --- config
         cfg_path = _maybe_find_config(self.base_dir)
         if cfg_path:
             cfg = _load_yaml_or_json(cfg_path)
@@ -155,19 +158,19 @@ class PipelineRunner:
         else:
             cfg = {}
 
-        # 1) frames
+        # --- 1) frames
         imgs = extract_and_save_frames(video_path, target_frames, paths.raw_frames, log, prog)
         if not imgs:
             raise RuntimeError("No frames were extracted.")
         log(f"[frames] saved: {len(imgs)}")
 
-        prog(20, "Image preprocessing /  masking.")
-        # optional Preprocessing/Masking
+        # --- 2) optional masking / preprocessing
+        prog(20, "Image preprocessing / masking")
         mask_cfg = cfg.get("masking", {})
         if bool(mask_cfg.get("enable", False)):
             log("[mask] preprocessing enabled")
             method = str(mask_cfg.get("method", "auto"))
-            overwrite = bool(mask_cfg.get("overwrite_images", False))  # gleiche Orte & Namen
+            overwrite = bool(mask_cfg.get("overwrite_images", False))
             params = dict(mask_cfg.get("params", {}))
             mask_dir = os.path.join(paths.features, "masks")
             preprocess_images(
@@ -179,12 +182,12 @@ class PipelineRunner:
                 save_debug=True
             )
 
-        # 2) features
+        # --- 3) features
         kps, descs, shapes, meta = extract_features(imgs, paths.features, log, prog)
         if not kps or not shapes:
             raise RuntimeError("Feature extraction returned no keypoints.")
 
-        # 3) matching – build_pairs liest direkt aus paths.features
+        # --- 4) matching
         ratio = float(os.getenv("MATCH_RATIO", "0.82"))
         device = os.getenv("FEATURE_DEVICE", "cuda")
         pairs_np, matches_list = build_pairs(
@@ -196,7 +199,7 @@ class PipelineRunner:
             save_dir=paths.matches
         )
 
-        # ---- Convert to SfM format: dict[(i,j)] -> List[cv.DMatch]
+        # ---- convert to SfM format
         def _as_sfm_matches(pairs_arr: np.ndarray, matches_any) -> Dict[Tuple[int, int], list]:
             mdict: Dict[Tuple[int, int], list] = {}
             for (i, j), m in zip(pairs_arr.tolist(), matches_any):
@@ -213,7 +216,7 @@ class PipelineRunner:
 
         matches_for_sfm = _as_sfm_matches(pairs_np, matches_list)
 
-        # 4) intrinsics (simpel)
+        # --- 5) intrinsics (pinhole guess)
         h, w = shapes[0]
         focal = 0.92 * float(max(w, h))
         pp = (w / 2.0, h / 2.0)
@@ -225,7 +228,7 @@ class PipelineRunner:
         snap = _dump_resolved_config(paths.root)
         log(f"[pipeline] saved resolved config -> {snap}")
 
-        # 5) SfM
+        # --- 6) SfM
         cfg_sfm = SfMConfig(
             INIT_WINDOW_RATIO=float(os.getenv("SFM_INIT_RATIO", "0.5")),
             INIT_MAX_SPAN=int(float(os.getenv("SFM_INIT_MAX_SPAN", "6"))),
@@ -243,46 +246,103 @@ class PipelineRunner:
             poses_out_dir=poses_dir, config=cfg_sfm
         )
 
-        # 6) save sparse
+        # --- 7) save sparse cloud
         if not (isinstance(res, tuple) and len(res) >= 1):
             raise RuntimeError("SfM did not return a points array.")
         points3d = np.asarray(res[0], dtype=np.float64).reshape(-1, 3)
-        sparse_ply = os.path.join(paths.root, "mesh/sparse.ply")
+        mesh_dir = os.path.join(paths.root, "mesh")
+        os.makedirs(mesh_dir, exist_ok=True)
+        sparse_ply = os.path.join(mesh_dir, "sparse.ply")
         save_point_cloud(points3d, sparse_ply, on_log=log, on_progress=prog)
         log(f"[sfm] raw_points(after validation)={points3d.shape[0]:d}")
         log(f"[ui] Done: {sparse_ply}")
 
-        # 7) meshing (Poisson)
-        mesh_dir = os.path.join(paths.root, "mesh")
-        os.makedirs(mesh_dir, exist_ok=True)
-        solid_mesh = os.path.join(mesh_dir, "solid_mesh_poisson.ply")
-        log("[mesh] reconstruct solid mesh (poisson)")
+        # --- 8) optional: mask-basiertes Filtern der sparse cloud (BG weg)
+        mask_dir = os.path.join(paths.features, "masks")
+        poses_npz = os.path.join(paths.root, "poses", "camera_poses.npz")
+        sparse_for_meshing = sparse_ply
+        if os.path.isdir(mask_dir) and os.path.isfile(poses_npz):
+            try:
+                Hm, Wm = shapes[0]
+                sparse_fg = os.path.join(mesh_dir, "sparse_fg.ply")
+                filter_cloud_by_masks(
+                    ply_in=sparse_ply,
+                    masks_dir=mask_dir,
+                    poses_npz=poses_npz,
+                    K=K,
+                    image_hw=(Hm, Wm),
+                    out_path=sparse_fg,
+                    min_views=3,
+                    on_log=log, on_progress=prog
+                )
+                sparse_for_meshing = sparse_fg
+            except Exception as e:
+                log(f"[mesh] mask-filter failed: {e}")
+
+        # --- 9) Visual Hull (wenn Masken existieren)
+        vh_out = os.path.join(mesh_dir, "solid_mesh_visual_hull.ply")
+        if os.path.isdir(mask_dir) and os.path.isfile(poses_npz):
+            try:
+                # Maskengröße verifizieren (robust)
+                any_mask = None
+                for fn in sorted(os.listdir(mask_dir)):
+                    if fn.endswith("_mask.png"):
+                        any_mask = cv.imread(os.path.join(mask_dir, fn), cv.IMREAD_GRAYSCALE)
+                        if any_mask is not None:
+                            break
+                if any_mask is None:
+                    raise RuntimeError("No masks found for visual hull.")
+                Hm, Wm = any_mask.shape[:2]
+
+                log("[mesh] reconstruct clean mesh (Visual Hull)")
+                reconstruct_visual_hull_from_masks(
+                    masks_dir=mask_dir,
+                    poses_npz=poses_npz,
+                    K=K,
+                    image_hw=(Hm, Wm),
+                    mesh_out=vh_out,
+                    voxel=0.0,          # auto (0.5% diag)
+                    min_views=0.85,     # Anteil der verwendeten Masken
+                    bbox_expand=0.03,
+                    smooth_iters=10,
+                    simplify_tris=150_000,
+                    max_views=40,
+                    on_log=log, on_progress=prog
+                )
+                log(f"[ui] Visual hull: {vh_out}")
+            except Exception as e:
+                log(f"[mesh] visual hull failed: {e}")
+
+        # --- 10) Poisson-Refine (auf gefilterter sparse)
+        solid_mesh = os.path.join(mesh_dir, "solid_mesh_clean.ply")
         try:
             reconstruct_solid_mesh_from_ply(
-                sparse_ply, solid_mesh,
+                sparse_for_meshing,
+                solid_mesh,
                 method="poisson",
                 depth=11,
                 scale=1.10,
                 no_linear_fit=False,
-                dens_quantile=0.0,  # nichts wegtrimmen
+                dens_quantile=0.18,
                 alpha=0.0,
                 bbox_expand=0.02,
-                pre_filter=False,  # nur die ganz leichte Filterung aus save_point_cloud bleibt
+                pre_filter=True,
                 pre_filter_neighbors=24,
                 pre_filter_std=1.2,
-                pre_filter_radius=False,  # Radius-Filter AUS (kann dünne Details killen)
-                voxel=0.0,  # KEIN zusätzliches Downsample
-                normals_k=40,
-                smooth=6,  # etwas weniger glätten -> schärfere Kanten
+                pre_filter_radius=False,
+                voxel=0.0,
+                normals_k=50,
+                smooth=6,
                 simplify=0,
                 color_transfer=False,
-                poses_npz=None,  # KEINE Kamera-Orientierung der Normalen
-                remove_small_comp=False,  # keine Teile entfernen
+                poses_npz=poses_npz if os.path.isfile(poses_npz) else None,
+                remove_small_comp=True,
+                min_comp_tris_ratio=0.002,
+                min_comp_area_ratio=0.001,
                 on_log=log, on_progress=prog
             )
-
             log(f"[ui] Solid mesh: {solid_mesh}")
         except Exception as e:
-            log(f"[mesh] solid reconstruction failed: {e}")
+            log(f"[mesh] reconstruction failed: {e}")
 
         return sparse_ply, paths

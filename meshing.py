@@ -3,6 +3,8 @@ import os
 from typing import Optional
 import numpy as np
 import open3d as o3d
+import cv2 as cv
+
 
 
 # ------------------------------------------------------------
@@ -387,3 +389,310 @@ def reconstruct_solid_mesh_from_ply(
     on_log and on_log(f"[mesh] solid saved -> {mesh_out} (V={len(mesh.vertices)}, F={len(mesh.triangles)})")
     on_progress and on_progress(100, "Watertight Mesh")
     return mesh_out
+
+
+# --- Visual Hull aus Masken + Posen -----------------------------------------
+
+def reconstruct_visual_hull_from_masks(
+    masks_dir: str,
+    poses_npz: str,
+    K: np.ndarray,
+    image_hw: tuple[int, int],
+    mesh_out: str,
+    *,
+    voxel: float = 0.0,             # 0 ➜ auto (0.5% der Diagonale)
+    min_views: float = 0.85,        # float in (0,1] = Anteil der genutzten Masken; int = absolute Zahl
+    bbox_expand: float = 0.05,      # Sicherheitsrand um sparse.ply
+    smooth_iters: int = 8,
+    simplify_tris: int = 150_000,
+    max_views: int = 40,            # wir sampeln höchstens so viele Masken gleichmäßig
+    on_log=None, on_progress=None,
+) -> str:
+    """
+    Visual-Hull aus Masken + Posen. Erwartet Masken in:
+      <project>/features/masks/frame_XXXX*_mask.png
+    'image_hw' = (H,W) des Bild-/Maskenrasters (OHNE Rotation).
+    """
+    def log(m):
+        on_log and on_log(m)
+    def prog(p, s):
+        on_progress and on_progress(int(p), s)
+
+    log("[vh] build visual hull")
+
+    # --- 0) Bounds aus sparse.ply ableiten (robust, kompakt)
+    project_mesh_dir = os.path.dirname(mesh_out)
+    sparse_ply = os.path.join(project_mesh_dir, "sparse.ply")
+    pcd = o3d.io.read_point_cloud(sparse_ply)
+    if (pcd is None) or (len(pcd.points) == 0):
+        raise RuntimeError("No sparse.ply available for bounding box.")
+    bb = pcd.get_axis_aligned_bounding_box()
+    bb = bb.scale(1.0 + float(bbox_expand), bb.get_center())
+    mins = bb.get_min_bound(); maxs = bb.get_max_bound()
+    diag = float(np.linalg.norm(maxs - mins))
+
+    # --- 1) Voxelauflösung bestimmen + Caps (RAM-sicher)
+    if not (voxel and voxel > 0):
+        voxel = 0.005 * diag  # 0.5% der Diagonale (auto)
+
+    def axis_count(span, vox):
+        return max(8, int(np.ceil(span / max(vox, 1e-9))))
+
+    nx = axis_count(maxs[0]-mins[0], voxel)
+    ny = axis_count(maxs[1]-mins[1], voxel)
+    nz = axis_count(maxs[2]-mins[2], voxel)
+
+    max_axis  = 220           # Cap pro Achse
+    max_total = 8_000_000     # Cap Gesamtanzahl Voxel
+
+    scale_axis = max(nx / max_axis, ny / max_axis, nz / max_axis, 1.0)
+    if scale_axis > 1.0:
+        voxel *= scale_axis
+        nx = axis_count(maxs[0]-mins[0], voxel)
+        ny = axis_count(maxs[1]-mins[1], voxel)
+        nz = axis_count(maxs[2]-mins[2], voxel)
+
+    total = nx * ny * nz
+    if total > max_total:
+        factor = (total / max_total) ** (1/3)
+        voxel *= factor
+        nx = axis_count(maxs[0]-mins[0], voxel)
+        ny = axis_count(maxs[1]-mins[1], voxel)
+        nz = axis_count(maxs[2]-mins[2], voxel)
+
+    xs = np.linspace(mins[0], maxs[0], nx, dtype=np.float32)
+    ys = np.linspace(mins[1], maxs[1], ny, dtype=np.float32)
+    zs = np.linspace(mins[2], maxs[2], nz, dtype=np.float32)
+    dx = float(xs[1]-xs[0]) if nx > 1 else float(voxel)
+    dy = float(ys[1]-ys[0]) if ny > 1 else float(voxel)
+    dz = float(zs[1]-zs[0]) if nz > 1 else float(voxel)
+
+    H, W = map(int, image_hw)
+    K = np.asarray(K, float)
+
+    log(f"[vh] bbox diag={diag:.3f}  voxel={float(voxel):.5f}  grid=({nx},{ny},{nz})  total≈{nx*ny*nz:,}")
+
+    # --- 2) Posen laden (R,t: world->cam)
+    data = np.load(poses_npz, allow_pickle=True)
+    frame_idx = data.get("frame_idx")
+    Rs = data.get("R")
+    ts = data.get("t")
+    if frame_idx is None or Rs is None or ts is None:
+        raise RuntimeError("poses npz must contain frame_idx, R, t")
+
+    pose_map = {int(i): (R.astype(np.float32), t.astype(np.float32)) for i, R, t in zip(frame_idx, Rs, ts)}
+
+    # --- 3) Masken sammeln (nur Frames mit Pose) und ggf. subsamplen
+    all_names = sorted([f for f in os.listdir(masks_dir) if f.endswith("_mask.png")])
+    mask_items = []
+    for name in all_names:
+        try:
+            fi = int(name.split("_")[1])  # frame_XXXX_...
+        except Exception:
+            continue
+        if fi not in pose_map:
+            continue
+        path = os.path.join(masks_dir, name)
+        m = cv.imread(path, cv.IMREAD_GRAYSCALE)
+        if m is None:
+            continue
+        if m.shape[:2] != (H, W):
+            m = cv.resize(m, (W, H), interpolation=cv.INTER_NEAREST)
+        mask_items.append((fi, (m > 0)))
+
+    if not mask_items:
+        raise RuntimeError("No masks found that match available poses.")
+
+    # gleichmäßig auf max_views runter sampeln
+    if len(mask_items) > max_views:
+        step = len(mask_items) / float(max_views)
+        picked = [mask_items[int(round(i*step))] for i in range(max_views)]
+        # uniq & sort
+        seen, picked2 = set(), []
+        for fi, m in picked:
+            if fi in seen:
+                continue
+            seen.add(fi); picked2.append((fi, m))
+        mask_items = sorted(picked2, key=lambda x: x[0])
+
+    nviews = len(mask_items)
+    if nviews < 3:
+        raise RuntimeError(f"Too few masks for visual hull (got {nviews}).")
+
+    # adaptiver Mindest-Vote
+    if isinstance(min_views, float) and (0 < min_views <= 1.0):
+        need_votes = int(np.ceil(min_views * nviews))
+    else:
+        need_votes = int(min_views)
+    need_votes = int(np.clip(need_votes, 2, nviews))
+    log(f"[vh] nviews={nviews}  min_votes={need_votes}")
+
+    # zugehörige Projektionsmatrizen exakt passend zu mask_items
+    Pmats = []
+    for fi, _ in mask_items:
+        R, t = pose_map[fi]
+        P = K @ np.hstack([R, t])  # 3x4
+        Pmats.append(P.astype(np.float32))
+
+    # --- 4) Voting (slabweise) ins 3D-Occupancy-Grid
+    occ = np.zeros((nx, ny, nz), dtype=np.uint8)
+    Y, Z = np.meshgrid(ys, zs, indexing='ij')  # (ny, nz)
+
+    def proj(P, X):
+        Xh = np.hstack([X, np.ones((X.shape[0], 1), np.float32)])
+        u = (P @ Xh.T).T
+        u = u[:, :2] / np.maximum(u[:, 2:3], 1e-9)
+        return u
+
+    for ix, x in enumerate(xs):
+        prog(40 + 40*(ix+1)/len(xs), "Visual hull")
+        slab = np.stack([
+            np.full_like(Y, x, dtype=np.float32),
+            Y.astype(np.float32),
+            Z.astype(np.float32)
+        ], axis=-1).reshape(-1, 3)
+
+        votes = np.zeros((slab.shape[0],), dtype=np.int32)
+        for (fi, m), P in zip(mask_items, Pmats):
+            uv = proj(P, slab)
+            valid = (uv[:,0] >= 0) & (uv[:,0] < W) & (uv[:,1] >= 0) & (uv[:,1] < H)
+            if not np.any(valid):
+                continue
+            iu = np.clip(np.round(uv[valid,0]).astype(np.int32), 0, W-1)
+            iv = np.clip(np.round(uv[valid,1]).astype(np.int32), 0, H-1)
+            votes[valid] += m[iv, iu].astype(np.int32)  # bool -> 0/1
+
+        keep = (votes >= need_votes)
+        if np.any(keep):
+            occ[ix].reshape(-1)[:] = keep.astype(np.uint8)
+
+    if occ.sum() == 0:
+        raise RuntimeError("Visual hull produced empty occupancy.")
+
+    # --- 5) Marching Cubes über occ (robust & schnell)
+    mesh = None
+    try:
+        from skimage import measure
+        verts, faces, _, _ = measure.marching_cubes(
+            occ.astype(np.uint8), level=0.5, spacing=(dx, dy, dz)
+        )
+        # marching_cubes liefert Koords relativ zu (0,0,0) des Grids -> in Welt verschieben
+        verts = verts + np.array([mins[0], mins[1], mins[2]], dtype=np.float32)
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(verts.astype(np.float64))
+        mesh.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
+        mesh.remove_duplicated_vertices(); mesh.remove_degenerate_triangles()
+    except Exception as e:
+        log(f"[vh] marching_cubes unavailable ({e}); fallback to alpha-shape")
+        # Fallback: Alpha-Shape auf Voxelzentren (langsamer, aber funktioniert)
+        pts = []
+        for ix in range(nx):
+            yy, zz = np.where(occ[ix] > 0)
+            if yy.size == 0:
+                continue
+            px = xs[ix]
+            pts.append(np.stack([np.full_like(yy, px, dtype=np.float32), ys[yy], zs[zz]], axis=1))
+        pts = np.vstack(pts)
+        pcd_hull = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
+        # einfache Normalen (für spätere Glättung nicht zwingend nötig)
+        pcd_hull.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=20))
+        mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd_hull, alpha=1.8*float(voxel))
+
+    # Cleanup, Glätten, Vereinfachen
+    mesh.remove_duplicated_triangles()
+    mesh.remove_degenerate_triangles()
+    mesh.remove_non_manifold_edges()
+    mesh.remove_unreferenced_vertices()
+
+    if smooth_iters > 0:
+        mesh = mesh.filter_smooth_taubin(number_of_iterations=int(smooth_iters))
+    if simplify_tris > 0 and len(mesh.triangles) > simplify_tris:
+        mesh = mesh.simplify_quadric_decimation(int(simplify_tris))
+
+    mesh.compute_vertex_normals()
+
+    # schreiben
+    os.makedirs(os.path.dirname(mesh_out) or ".", exist_ok=True)
+    ok = o3d.io.write_triangle_mesh(mesh_out, mesh)
+    if not ok:
+        raise RuntimeError(f"Failed to write hull mesh: {mesh_out}")
+
+    log(f"[vh] mesh -> {mesh_out} (V={len(mesh.vertices)}, F={len(mesh.triangles)})")
+    prog(85, "Visual hull mesh")
+    return mesh_out
+
+
+# ---- cloud filter by silhouette votes ----
+def filter_cloud_by_masks(
+    ply_in: str, masks_dir: str, poses_npz: str, K: np.ndarray,
+    image_hw: tuple[int,int], out_path: str, min_views: int = 3,
+    on_log=None, on_progress=None
+) -> str:
+    import cv2 as cv, numpy as np, os
+    import open3d as o3d
+    on_log and on_log(f"[mesh] filter cloud by masks (min_views={min_views})")
+
+    # load cloud
+    pcd = o3d.io.read_point_cloud(ply_in)
+    if (pcd is None) or (len(pcd.points) == 0):
+        raise RuntimeError("Input cloud is empty.")
+    P = np.asarray(pcd.points, np.float32)
+
+    # intrinsics & image size
+    H, W = image_hw
+    K = np.asarray(K, np.float32)
+
+    # load poses
+    data = np.load(poses_npz, allow_pickle=True)
+    Rs, ts, frame_idx = data["R"], data["t"], data["frame_idx"]
+    # collect masks in dict
+    mdict = {}
+    for fi in frame_idx:
+        fi = int(fi)
+        cand = [f for f in os.listdir(masks_dir)
+                if f.startswith(f"frame_{fi:04d}_") and f.endswith("_mask.png")]
+        if not cand:
+            continue
+        m = cv.imread(os.path.join(masks_dir, sorted(cand)[0]), cv.IMREAD_GRAYSCALE)
+        if m is None:
+            continue
+        if m.shape[:2] != (H, W):
+            m = cv.resize(m, (W, H), interpolation=cv.INTER_NEAREST)
+        mdict[fi] = (m > 0)
+
+    if len(mdict) < max(3, min_views):
+        on_log and on_log("[mesh] warn: too few masks; returning original cloud.")
+        o3d.io.write_point_cloud(out_path, pcd)
+        return out_path
+
+    # projection helpers
+    Ps = [K @ np.hstack([R, t]) for R, t in zip(Rs, ts)]
+    votes = np.zeros(len(P), np.int32)
+
+    # process in chunks to keep RAM low
+    B = 200000
+    for s in range(0, len(P), B):
+        on_progress and on_progress(70 + int(10*s/len(P)), "Mask filter")
+        X = P[s:s+B]
+        Xh = np.concatenate([X, np.ones((len(X),1), np.float32)], axis=1).T  # 4xB
+        for Pmat, fi in zip(Ps, frame_idx):
+            if int(fi) not in mdict:
+                continue
+            uvw = (Pmat @ Xh).T   # Bx3
+            wpos = uvw[:,2] > 1e-6
+            u = uvw[wpos,0] / uvw[wpos,2]
+            v = uvw[wpos,1] / uvw[wpos,2]
+            valid = (u>=0)&(u<W)&(v>=0)&(v<H)
+            if not np.any(valid):
+                continue
+            mu = np.clip(np.round(u[valid]).astype(np.int32), 0, W-1)
+            mv = np.clip(np.round(v[valid]).astype(np.int32), 0, H-1)
+            m = mdict[int(fi)]
+            idx = np.where(wpos)[0][valid]
+            votes[s + idx] += m[mv, mu].astype(np.int32)
+
+    keep = votes >= int(min_views)  # m ist bool→0/1
+    pcd_f = pcd.select_by_index(np.where(keep)[0])
+    on_log and on_log(f"[mesh] mask-filter: kept {len(pcd_f.points)}/{len(pcd.points)} points")
+    o3d.io.write_point_cloud(out_path, pcd_f)
+    return out_path
