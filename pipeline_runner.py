@@ -12,7 +12,6 @@ from image_matching import build_pairs
 from sfm_incremental import run_sfm, SfMConfig
 from meshing import (
     save_point_cloud,
-    reconstruct_visual_hull_from_masks,
 )
 
 # ---------------- config utils ----------------
@@ -256,54 +255,6 @@ class PipelineRunner:
         log(f"[sfm] raw_points(after validation)={points3d.shape[0]:d}")
         log(f"[ui] Done: {sparse_ply}")
 
-        # --- 8) Visual Hull (ONLY, wenn Masken+Posen vorhanden sind)
-        vh_out = os.path.join(mesh_dir, "visual_hull.ply")
-        mask_dir = os.path.join(paths.features, "masks")
-        poses_npz = os.path.join(paths.root, "poses", "camera_poses.npz")
-
-        if os.path.isdir(mask_dir) and os.path.isfile(poses_npz):
-            try:
-                # Maskengröße robust bestimmen
-                any_mask = None
-                for fn in sorted(os.listdir(mask_dir)):
-                    if fn.endswith("_mask.png"):
-                        any_mask = cv.imread(os.path.join(mask_dir, fn), cv.IMREAD_GRAYSCALE)
-                        if any_mask is not None:
-                            break
-                if any_mask is None:
-                    raise RuntimeError("No masks found for visual hull.")
-                Hm, Wm = any_mask.shape[:2]
-
-                log("[mesh] reconstruct visual hull")
-                reconstruct_visual_hull_from_masks(
-                    masks_dir=mask_dir,
-                    poses_npz=poses_npz,
-                    K=K,
-                    image_hw=(Hm, Wm),
-                    mesh_out=vh_out,
-
-                    # --- Feine Parameter für realistische Hulls ---
-                    voxel=0.0,  # auto (≈ 0.5 % der Bounding-Box-Diagonale)
-                    min_views=0.9,  # Mindestanteil der Masken, die „inside“ stimmen müssen
-                    bbox_expand=0.01,  # Sicherheitsrand um sparse.ply (3 %)
-                    smooth_iters=1,  # sanfte Glättung (Taubin)
-                    simplify_tris=25000,  # Ziel-Dreieckszahl für Vereinfachung
-                    max_views=90,  # Anzahl verwendeter Masken (gleichmäßig über Frames)
-
-                    # --- Neu hinzugefügte, wichtige Hebel ---
-                    mask_clean=True,  # Masken automatisch vorfiltern (median + open/close)
-                    snap_to_sparse=True,  # Hull an gesäuberte sparse.ply-Cloud „ansnappen“
-                    snap_radius_mul=1.5,  # Snap-Radius = 1.5 × voxelgröße
-                    snap_weight=0.5,  # Gewichtung (0.5 = 50 % Richtung sparse.ply)
-
-                    # --- Logging & Fortschritt (wie gehabt) ---
-                    on_log=log,
-                    on_progress=prog
-                )
-            except Exception as e:
-                log(f"[mesh] visual hull failed: {e}")
-        else:
-            log("[mesh] visual hull skipped (no masks or no poses.npz)")
         prog(100, "finished")
         # Rückgabe: Pfad zur sparse.ply + paths-Objekt
         return sparse_ply, paths

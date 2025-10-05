@@ -2,15 +2,15 @@
 
 # Feature extraction
 features:
-  backend: superpoint       # robust & dicht; DISK/ALIKED optional testbar
+  backend: disk       # robust & dicht; DISK/ALIKED optional testbar
   device: cuda
   use_mask: true               # nur Statue matchen, weniger False-Matches im BG
-  max_kp: 20000                # viele Keypoints für lückenlose Flächen
+  max_kp: 25000                # viele Keypoints für lückenlose Flächen
   debug_every: 20
 
   # LightGlue/learned extractor tuning
   lg:
-    detection_threshold: 0.0003  # niedriger => mehr (auch schwächere) Punkte
+    detection_threshold: 0.0001  # niedriger => mehr (auch schwächere) Punkte
     nms: 2                       # dichter beieinanderliegende Punkte zulassen
     resize: 1536                 # moderat; kein unnötiges Upscaling
     remove_borders: 2            # Kanten nicht hart abschneiden
@@ -20,7 +20,7 @@ features:
   preproc:
     clahe: true
     clahe_clip: 4.0              # starke, aber noch stabile Kontrastanhebung
-    clahe_tiles: 8               # lokale Anpassung gut für Details
+    clahe_tiles: 16              # lokale Anpassung gut für Details
     unsharp: true                # Kanten leicht betonen (feine Reliefs)
     unsharp_sigma: 1.0
     unsharp_amount: 1.3
@@ -49,11 +49,11 @@ masking:
 # Matching
 matching:
   backend: lightglue
-  features: superpoint        # konsistent zum Extractor
+  features: disk        # konsistent zum Extractor
   ratio: 0.82                    # nur BF-Fallback; bei LG wirkungslos
   depth_confidence: -1           # Early-Stop AUS → volle Tiefe (max Genauigkeit)
   width_confidence: -1           # Pruning AUS → volle Breite (mehr Matches)
-  filter_threshold: 0.06         # niedriger => mehr Matches, RANSAC räumt auf
+  filter_threshold: 0.09         # niedriger => mehr Matches, RANSAC räumt auf
 
 # SfM
 sfm:
