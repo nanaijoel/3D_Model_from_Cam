@@ -1,5 +1,4 @@
 # pipeline_runner.py
-
 import os, json
 import numpy as np
 import cv2 as cv
@@ -13,9 +12,7 @@ from image_matching import build_pairs
 from sfm_incremental import run_sfm, SfMConfig
 from meshing import (
     save_point_cloud,
-    reconstruct_solid_mesh_from_ply,
     reconstruct_visual_hull_from_masks,
-    filter_cloud_by_masks,
 )
 
 # ---------------- config utils ----------------
@@ -113,7 +110,7 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     if "features" in ma:
         setenv("MATCH_FEATURES", str(ma["features"]).lower())
 
-    # SfM ENV (unchanged)
+    # SfM ENV
     sfm = cfg.get("sfm", {})
     setenv("SFM_INIT_RATIO", pick_num(sfm.get("init_ratio", 0.5)))
     setenv("SFM_INIT_MAX_SPAN", pick_num(sfm.get("init_max_span", 6)))
@@ -200,14 +197,15 @@ class PipelineRunner:
         )
 
         # ---- convert to SfM format
-        def _as_sfm_matches(pairs_arr: np.ndarray, matches_any) -> Dict[Tuple[int, int], list]:
-            mdict: Dict[Tuple[int, int], list] = {}
+        def _as_sfm_matches(pairs_arr: np.ndarray, matches_any) -> Dict[tuple[int, int], list]:
+            mdict: Dict[tuple[int, int], list] = {}
             for (i, j), m in zip(pairs_arr.tolist(), matches_any):
                 if isinstance(m, list):
                     m = np.array(m, dtype=np.int32) if len(m) else np.empty((0, 2), np.int32)
                 if m is None or m.size == 0:
                     mdict[(i, j)] = []
                     continue
+                import cv2 as cv
                 mdict[(i, j)] = [
                     cv.DMatch(_queryIdx=int(q), _trainIdx=int(t), _imgIdx=0, _distance=0.0)
                     for q, t in m.astype(np.int32)
@@ -246,10 +244,11 @@ class PipelineRunner:
             poses_out_dir=poses_dir, config=cfg_sfm
         )
 
-        # --- 7) save sparse cloud
+        # --- 7) save sparse cloud (ONLY)
         if not (isinstance(res, tuple) and len(res) >= 1):
             raise RuntimeError("SfM did not return a points array.")
         points3d = np.asarray(res[0], dtype=np.float64).reshape(-1, 3)
+
         mesh_dir = os.path.join(paths.root, "mesh")
         os.makedirs(mesh_dir, exist_ok=True)
         sparse_ply = os.path.join(mesh_dir, "sparse.ply")
@@ -257,33 +256,14 @@ class PipelineRunner:
         log(f"[sfm] raw_points(after validation)={points3d.shape[0]:d}")
         log(f"[ui] Done: {sparse_ply}")
 
-        # --- 8) optional: mask-basiertes Filtern der sparse cloud (BG weg)
+        # --- 8) Visual Hull (ONLY, wenn Masken+Posen vorhanden sind)
+        vh_out = os.path.join(mesh_dir, "visual_hull.ply")
         mask_dir = os.path.join(paths.features, "masks")
         poses_npz = os.path.join(paths.root, "poses", "camera_poses.npz")
-        sparse_for_meshing = sparse_ply
-        if os.path.isdir(mask_dir) and os.path.isfile(poses_npz):
-            try:
-                Hm, Wm = shapes[0]
-                sparse_fg = os.path.join(mesh_dir, "sparse_fg.ply")
-                filter_cloud_by_masks(
-                    ply_in=sparse_ply,
-                    masks_dir=mask_dir,
-                    poses_npz=poses_npz,
-                    K=K,
-                    image_hw=(Hm, Wm),
-                    out_path=sparse_fg,
-                    min_views=3,
-                    on_log=log, on_progress=prog
-                )
-                sparse_for_meshing = sparse_fg
-            except Exception as e:
-                log(f"[mesh] mask-filter failed: {e}")
 
-        # --- 9) Visual Hull (wenn Masken existieren)
-        vh_out = os.path.join(mesh_dir, "solid_mesh_visual_hull.ply")
         if os.path.isdir(mask_dir) and os.path.isfile(poses_npz):
             try:
-                # Maskengröße verifizieren (robust)
+                # Maskengröße robust bestimmen
                 any_mask = None
                 for fn in sorted(os.listdir(mask_dir)):
                     if fn.endswith("_mask.png"):
@@ -294,55 +274,36 @@ class PipelineRunner:
                     raise RuntimeError("No masks found for visual hull.")
                 Hm, Wm = any_mask.shape[:2]
 
-                log("[mesh] reconstruct clean mesh (Visual Hull)")
+                log("[mesh] reconstruct visual hull")
                 reconstruct_visual_hull_from_masks(
                     masks_dir=mask_dir,
                     poses_npz=poses_npz,
                     K=K,
                     image_hw=(Hm, Wm),
                     mesh_out=vh_out,
-                    voxel=0.0,          # auto (0.5% diag)
-                    min_views=0.85,     # Anteil der verwendeten Masken
-                    bbox_expand=0.03,
-                    smooth_iters=10,
-                    simplify_tris=150_000,
-                    max_views=40,
-                    on_log=log, on_progress=prog
+
+                    # --- Feine Parameter für realistische Hulls ---
+                    voxel=0.0,  # auto (≈ 0.5 % der Bounding-Box-Diagonale)
+                    min_views=0.9,  # Mindestanteil der Masken, die „inside“ stimmen müssen
+                    bbox_expand=0.01,  # Sicherheitsrand um sparse.ply (3 %)
+                    smooth_iters=1,  # sanfte Glättung (Taubin)
+                    simplify_tris=25000,  # Ziel-Dreieckszahl für Vereinfachung
+                    max_views=90,  # Anzahl verwendeter Masken (gleichmäßig über Frames)
+
+                    # --- Neu hinzugefügte, wichtige Hebel ---
+                    mask_clean=True,  # Masken automatisch vorfiltern (median + open/close)
+                    snap_to_sparse=True,  # Hull an gesäuberte sparse.ply-Cloud „ansnappen“
+                    snap_radius_mul=1.5,  # Snap-Radius = 1.5 × voxelgröße
+                    snap_weight=0.5,  # Gewichtung (0.5 = 50 % Richtung sparse.ply)
+
+                    # --- Logging & Fortschritt (wie gehabt) ---
+                    on_log=log,
+                    on_progress=prog
                 )
-                log(f"[ui] Visual hull: {vh_out}")
             except Exception as e:
                 log(f"[mesh] visual hull failed: {e}")
-
-        # --- 10) Poisson-Refine (auf gefilterter sparse)
-        solid_mesh = os.path.join(mesh_dir, "solid_mesh_clean.ply")
-        try:
-            reconstruct_solid_mesh_from_ply(
-                sparse_for_meshing,
-                solid_mesh,
-                method="poisson",
-                depth=11,
-                scale=1.10,
-                no_linear_fit=False,
-                dens_quantile=0.18,
-                alpha=0.0,
-                bbox_expand=0.02,
-                pre_filter=True,
-                pre_filter_neighbors=24,
-                pre_filter_std=1.2,
-                pre_filter_radius=False,
-                voxel=0.0,
-                normals_k=50,
-                smooth=6,
-                simplify=0,
-                color_transfer=False,
-                poses_npz=poses_npz if os.path.isfile(poses_npz) else None,
-                remove_small_comp=True,
-                min_comp_tris_ratio=0.002,
-                min_comp_area_ratio=0.001,
-                on_log=log, on_progress=prog
-            )
-            log(f"[ui] Solid mesh: {solid_mesh}")
-        except Exception as e:
-            log(f"[mesh] reconstruction failed: {e}")
-
+        else:
+            log("[mesh] visual hull skipped (no masks or no poses.npz)")
+        prog(100, "finished")
+        # Rückgabe: Pfad zur sparse.ply + paths-Objekt
         return sparse_ply, paths
