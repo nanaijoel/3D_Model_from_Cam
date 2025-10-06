@@ -1,4 +1,4 @@
-# config.yaml — Werte werden 1:1 in ENV gemappt
+# config.yaml — wird 1:1 in ENV gemappt
 
 features:
   backend: disk
@@ -57,31 +57,25 @@ sfm:
 
 mvs:
   enable: true
-  mode: "all"
+  mode: "single"         # egal: Auswahl erfolgt über Strategie unten
   params:
     device: cuda
-    scale: 0.60          # etwas größer hilft Details
-    max_views: 20        # zu viele Quellen schaden (Occlusions)
-    n_planes: 192        # dichteres Z-Sampling
-    depth_expand: 0.12   # etwas breiterer Bereich vermeidet Clipping
-    patch: 5             # kleinere Fenster = schärfere Kanten
-    cost_thr: 0.48
-    min_valid_frac: 0.01
-    poisson_depth: 11
+    scale: 1.0
 
-    torch_dtype: float32
-    src_batch: 2
-    depth_chunk: 24
+    # ---- Frame-Auswahl ----
+    ref_strategy: "bestk"   # "bestk" | "step" | "auto"
+    ref_topk: 40            # z.B. 40 Frames rundum
+    ref_min_gap: 2          # min. Indexabstand bei bestk
+    ref_step: 3             # fallback / bei strategy=step
 
-    depth_sampling: inverse
-    depth_default: "0.30,1.60"    # besserer Fallback für Statue
-    depth_percentiles: [10, 90]   # robust gegen Ausreißer im sparse
-    mask_pad: 4                   # weniger Nachbarschaft
-    strict_masks: true
-    pctl_ktail: 3                 # etwas strenger
+    # ---- Seeds & Fill ----
+    seed_radius: 2
+    seed_min: 200
+    seed_sample: 200000     # max Sparse-Punkte für Scoring
+    beta: 4.0               # Kantensensitivität im Fill
+    fill_iters: 150
+    mask_pad: 6
 
-    # NEU – wird als ENV gesetzt:
-    photo_margin: 0.04            # MVS_PHOTO_MARGIN
-    min_support: 4                # MVS_MIN_SUPPORT
-
+    # ---- Output ----
     export_mesh: true
+    poisson_depth: 10

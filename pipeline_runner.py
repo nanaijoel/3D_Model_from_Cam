@@ -1,4 +1,4 @@
-# pipeline_runner.py
+# pipeline_runner.py — abgestimmt auf Sparse-Paint (GPU-only), ohne ref_index-Gefummel
 import os, json
 import numpy as np
 import cv2 as cv
@@ -12,8 +12,8 @@ from image_matching import build_pairs
 from sfm_incremental import run_sfm, SfMConfig
 from meshing import (
     save_point_cloud,
-    reconstruct_mvs_depth_and_mesh,           # MVS: single
-    reconstruct_mvs_depth_and_mesh_all,       # MVS: all
+    reconstruct_mvs_depth_and_mesh,
+    reconstruct_mvs_depth_and_mesh_all,
 )
 
 # ---------------- config utils ----------------
@@ -33,12 +33,10 @@ def _load_yaml_or_json(path: str) -> Dict[str, Any]:
 def _maybe_find_config(base_dir: str) -> str | None:
     for name in ("config.yaml", "config.yml", "config.json"):
         p = os.path.join(base_dir, name)
-        if os.path.isfile(p):
-            return p
+        if os.path.isfile(p): return p
     for name in ("config.yaml", "config.yml", "config.json"):
         p = os.path.join(os.getcwd(), name)
-        if os.path.isfile(p):
-            return p
+        if os.path.isfile(p): return p
     return None
 
 def _parse_bool(s: str, default: bool) -> bool:
@@ -58,7 +56,7 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
 
     def pick_num(x, default=0):
         if isinstance(x, dict):
-            for k in ("iters","n","value","val","amount","k","grid","target","radius","r","thr","threshold","std","sigma","resize"):
+            for k in ("iters","n","value","val","amount","k","grid","target","radius","r","thr","threshold","std","sigma","resize","topk","gap"):
                 if k in x and isinstance(x[k], (int, float)):
                     return x[k]
             return default
@@ -104,8 +102,6 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("MASK_ENABLE", pick_bool(mask_cfg.get("enable", False)))
     setenv("MASK_METHOD", mask_cfg.get("method"))
     setenv("MASK_OVERWRITE_IMAGES", pick_bool(mask_cfg.get("overwrite_images", False)))
-    params_mask = mask_cfg.get("params", {}) or {}
-    # passt direkt an image_masking.py; nichts weiter zu mappen
 
     # ---------- MATCHING ----------
     ma = cfg.get("matching", {})
@@ -127,48 +123,30 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("SFM_POSE_SMOOTHING", pick_bool(sfm.get("pose_smoothing", True)))
     setenv("SFM_SMOOTH_LAMBDA", pick_num(sfm.get("smooth_lambda", 0.25)))
 
-    # ---------- MVS ----------
+    # ---------- MVS / Sparse-Paint ----------
     mvs = cfg.get("mvs", {})
     setenv("MVS_ENABLE", pick_bool(mvs.get("enable", True)))
-    setenv("MVS_MODE", mvs.get("mode", "all"))
+    setenv("MVS_MODE", (mvs.get("mode", "all") or "all"))
 
     mp = mvs.get("params", {}) or {}
-
-    # device: fallback auf features.device
-    mvs_device = mp.get("device", fe.get("device", "cuda"))
-    setenv("MVS_DEVICE", mvs_device)
-
-    # Kern-Parameter
+    setenv("MVS_DEVICE", mp.get("device", fe.get("device", "cuda")))
     setenv("MVS_SCALE", mp.get("scale"))
-    setenv("MVS_MAX_VIEWS", mp.get("max_views"))
-    setenv("MVS_N_PLANES", mp.get("n_planes"))
-    setenv("MVS_DEPTH_EXPAND", mp.get("depth_expand"))
-    setenv("MVS_PATCH", mp.get("patch"))
-    setenv("MVS_COST_THR", mp.get("cost_thr"))
-    setenv("MVS_MIN_VALID_FRAC", mp.get("min_valid_frac"))
-    setenv("MVS_POISSON_DEPTH", mp.get("poisson_depth"))
-    setenv("MVS_PHOTO_MARGIN", mp.get("photo_margin"))   # z.B. 0.03–0.05
-    setenv("MVS_MIN_SUPPORT", mp.get("min_support"))     # z.B. 3–4
 
+    # Auswahlstrategie
+    setenv("MVS_REF_STRATEGY", mp.get("ref_strategy"))       # auto|bestk|step
+    setenv("MVS_REF_TOPK", mp.get("ref_topk"))               # z.B. 40
+    setenv("MVS_REF_MIN_GAP", mp.get("ref_min_gap"))         # z.B. 2
+    setenv("MVS_REF_STEP", mp.get("ref_step"))               # z.B. 3
 
-    # Sampling / Fallback
-    setenv("MVS_DEPTH_SAMPLING", mp.get("depth_sampling"))        # inverse | linear
-    setenv("MVS_DEPTH_DEFAULT", mp.get("depth_default"))          # "near,far"
-    # Optional Perzentile (falls vorhanden)
-    dp = mp.get("depth_percentiles")
-    if isinstance(dp, (list, tuple)) and len(dp) == 2:
-        setenv("MVS_DEPTH_PCT_LOW", dp[0]); setenv("MVS_DEPTH_PCT_HIGH", dp[1])
-
-    # Laufzeit-Feintuning
-    setenv("MVS_REF_STEP", mp.get("ref_step"))
-    setenv("MVS_SRC_BATCH", mp.get("src_batch"))
-    setenv("MVS_TORCH_DTYPE", mp.get("torch_dtype"))              # float16 | float32
-    setenv("MVS_AMP_ENABLE", mp.get("amp_enable"))                # true/false (optional)
-    setenv("MVS_DEPTH_CHUNK", mp.get("depth_chunk"))
+    # Seeds/Fill
+    setenv("MVS_SEED_RADIUS", mp.get("seed_radius"))
+    setenv("MVS_SEED_MIN", mp.get("seed_min"))
+    setenv("MVS_SEED_SAMPLE", mp.get("seed_sample"))
+    setenv("MVS_BETA", mp.get("beta"))
+    setenv("MVS_FILL_ITERS", mp.get("fill_iters"))
     setenv("MVS_MASK_PAD", mp.get("mask_pad"))
-    setenv("MVS_PCTL_KTAIL", mp.get("pctl_ktail"))
     setenv("MVS_EXPORT_MESH", mp.get("export_mesh"))
-    setenv("MVS_STRICT_MASKS", mp.get("strict_masks"))
+    setenv("MVS_POISSON_DEPTH", mp.get("poisson_depth"))
 
 def _dump_resolved_config(project_root: str) -> str:
     keys = [k for k in os.environ.keys() if k.startswith(("FEATURE_", "MATCH_", "SFM_", "MVS_", "MASK_"))]
@@ -182,7 +160,6 @@ def _dump_resolved_config(project_root: str) -> str:
         with open(out_path.replace(".yaml", ".json"), "w", encoding="utf-8") as f:
             json.dump(kv, f, indent=2, ensure_ascii=False)
     return out_path
-
 
 # ---------------- pipeline runner ----------------
 class PipelineRunner:
@@ -292,7 +269,7 @@ class PipelineRunner:
             poses_out_dir=poses_dir, config=cfg_sfm
         )
 
-        # --- 7) save sparse cloud (UNVERÄNDERT)
+        # --- 7) save sparse cloud
         if not (isinstance(res, tuple) and len(res) >= 1):
             raise RuntimeError("SfM did not return a points array.")
         points3d = np.asarray(res[0], dtype=np.float64).reshape(-1, 3)
@@ -304,30 +281,26 @@ class PipelineRunner:
         log(f"[sfm] raw_points(after validation)={points3d.shape[0]:d}")
         log(f"[ui] Done: {sparse_ply}")
 
-        # --- 8) Depth-MVS
-        MVS_ENABLE = _parse_bool(os.getenv("MVS_ENABLE", "true"), True)
-        if MVS_ENABLE:
-            log("MVS (plane-sweep) reconstruction")
+        # --- 8) Sparse-Paint (GPU)
+        if _parse_bool(os.getenv("MVS_ENABLE", "true"), True):
+            log("Sparse-Paint (sparse-guided depth completion)")
             try:
                 mode = os.getenv("MVS_MODE", "all").strip().lower()
                 common_kwargs = dict(
                     paths=paths, K=K,
-                    scale=float(os.getenv("MVS_SCALE","0.55")),
-                    max_views=int(os.getenv("MVS_MAX_VIEWS","26")),
-                    n_planes=int(os.getenv("MVS_N_PLANES","144")),
-                    depth_expand=float(os.getenv("MVS_DEPTH_EXPAND","0.08")),
-                    patch=int(os.getenv("MVS_PATCH","7")),
-                    cost_thr=float(os.getenv("MVS_COST_THR","0.55")),
-                    min_valid_frac=float(os.getenv("MVS_MIN_VALID_FRAC","0.01")),
+                    scale=float(os.getenv("MVS_SCALE","1.0")),
+                    max_views=0, n_planes=0, depth_expand=0.0, patch=0,
+                    cost_thr=0.0, min_valid_frac=0.0,
                     poisson_depth=int(os.getenv("MVS_POISSON_DEPTH","10")),
                     on_log=log, on_progress=prog
                 )
+                # Der Wrapper-Namen bleibt aus Kompatibilität; Auswahl passiert in meshing.py
                 if mode == "all":
                     reconstruct_mvs_depth_and_mesh_all(**common_kwargs)
                 else:
                     reconstruct_mvs_depth_and_mesh(**common_kwargs)
             except Exception as e:
-                log("[error]\nMVS failed: " + str(e))
+                log("[error]\nSparse-Paint failed: " + str(e))
 
         prog(100, "finished")
         return sparse_ply, paths
