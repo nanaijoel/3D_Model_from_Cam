@@ -1,61 +1,51 @@
-# config.yaml  — Buddha: maximal dicht & löcherfrei
+# config.yaml — Werte werden 1:1 in ENV gemappt
 
-# Feature extraction
 features:
-  backend: disk       # robust & dicht; DISK/ALIKED optional testbar
+  backend: disk
   device: cuda
-  use_mask: true               # nur Statue matchen, weniger False-Matches im BG
-  max_kp: 25000                # viele Keypoints für lückenlose Flächen
+  use_mask: true
+  max_kp: 25000
   debug_every: 20
 
-  # LightGlue/learned extractor tuning
   lg:
-    detection_threshold: 0.0001  # niedriger => mehr (auch schwächere) Punkte
-    nms: 2                       # dichter beieinanderliegende Punkte zulassen
-    resize: 1536                 # moderat; kein unnötiges Upscaling
-    remove_borders: 2            # Kanten nicht hart abschneiden
-    force_num: true              # versucht max_kp zu erreichen
+    detection_threshold: 0.0001
+    nms: 2
+    resize: 1536
+    remove_borders: 2
+    force_num: true
 
-  # Optionales Gray-Preprocessing (wirkt nur auf Detektion)
   preproc:
     clahe: true
-    clahe_clip: 4.0              # starke, aber noch stabile Kontrastanhebung
-    clahe_tiles: 16              # lokale Anpassung gut für Details
-    unsharp: true                # Kanten leicht betonen (feine Reliefs)
+    clahe_clip: 4.0
+    clahe_tiles: 16
+    unsharp: true
     unsharp_sigma: 1.0
     unsharp_amount: 1.3
-    noise: false                 # kein Dithering – Stabilität vor Zufall
+    noise: false
     noise_std: 1.5
-    mask_dilate: 6               # Maske etwas erweitern, um Randlöcher zu vermeiden
+    mask_dilate: 6
 
-  # SIFT-Fallback / -Explizit
   sift:
     contrast: 0.004
     edge: 12
     sigma: 1.2
 
-# Masking / Preprocessing
 masking:
   enable: true
-  method: rembg                  # robuste Objektmaske ohne Alphahalo
+  method: rembg
   overwrite_images: false
   params:
-    # rembg (nur falls umgestellt):
     alpha_thr: 0.4
     save_debug: true
-    # sam2:
-    keep: largest                # größtes Segment = Statue
 
-# Matching
 matching:
   backend: lightglue
-  features: disk        # konsistent zum Extractor
-  ratio: 0.82                    # nur BF-Fallback; bei LG wirkungslos
-  depth_confidence: -1           # Early-Stop AUS → volle Tiefe (max Genauigkeit)
-  width_confidence: -1           # Pruning AUS → volle Breite (mehr Matches)
-  filter_threshold: 0.09         # niedriger => mehr Matches, RANSAC räumt auf
+  features: disk
+  ratio: 0.82
+  depth_confidence: -1
+  width_confidence: -1
+  filter_threshold: 0.09
 
-# SfM
 sfm:
   init_ratio: 0.5
   init_max_span: 8
@@ -64,3 +54,34 @@ sfm:
   use_loops: true
   pose_smoothing: true
   smooth_lambda: 0.01
+
+mvs:
+  enable: true
+  mode: "all"
+  params:
+    device: cuda
+    scale: 0.60          # etwas größer hilft Details
+    max_views: 20        # zu viele Quellen schaden (Occlusions)
+    n_planes: 192        # dichteres Z-Sampling
+    depth_expand: 0.12   # etwas breiterer Bereich vermeidet Clipping
+    patch: 5             # kleinere Fenster = schärfere Kanten
+    cost_thr: 0.48
+    min_valid_frac: 0.01
+    poisson_depth: 11
+
+    torch_dtype: float32
+    src_batch: 2
+    depth_chunk: 24
+
+    depth_sampling: inverse
+    depth_default: "0.30,1.60"    # besserer Fallback für Statue
+    depth_percentiles: [10, 90]   # robust gegen Ausreißer im sparse
+    mask_pad: 4                   # weniger Nachbarschaft
+    strict_masks: true
+    pctl_ktail: 3                 # etwas strenger
+
+    # NEU – wird als ENV gesetzt:
+    photo_margin: 0.04            # MVS_PHOTO_MARGIN
+    min_support: 4                # MVS_MIN_SUPPORT
+
+    export_mesh: true
