@@ -13,8 +13,8 @@ from sfm_incremental import run_sfm, SfMConfig
 from meshing import (
     save_point_cloud,
     reconstruct_mvs_depth_and_mesh,
-    reconstruct_mvs_depth_and_mesh_all,
-)
+    reconstruct_mvs_depth_and_mesh_all)
+from fusion import fuse_selected_pointclouds
 
 # ---------------- config utils ----------------
 
@@ -137,6 +137,7 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("MVS_REF_TOPK", mp.get("ref_topk"))               # z.B. 40
     setenv("MVS_REF_MIN_GAP", mp.get("ref_min_gap"))         # z.B. 2
     setenv("MVS_REF_STEP", mp.get("ref_step"))               # z.B. 3
+    setenv("MVS_REF_BUCKETS", mp.get("ref_buckets", mp.get("ref_topk", 6)))
 
     # Seeds/Fill
     setenv("MVS_SEED_RADIUS", mp.get("seed_radius"))
@@ -147,6 +148,18 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("MVS_MASK_PAD", mp.get("mask_pad"))
     setenv("MVS_EXPORT_MESH", mp.get("export_mesh"))
     setenv("MVS_POISSON_DEPTH", mp.get("poisson_depth"))
+
+    # Fusion
+    fus = cfg.get("fusion", {})
+    setenv("FUSION_ENABLE", fus.get("enable", True))
+    setenv("FUSION_MODE", fus.get("mode", "majority"))       # any | majority | all
+    setenv("FUSION_MIN_IN_MASK", fus.get("min_in_mask"))     # optional int
+    setenv("FUSION_USE_DEPTH", fus.get("use_depth", True))
+    setenv("FUSION_DEPTH_TOL", fus.get("depth_tol", 0.03))
+    setenv("FUSION_EXPORT_MESH", fus.get("export_mesh", True))
+    setenv("FUSION_POISSON_DEPTH", fus.get("poisson_depth", 10))
+    setenv("FUSION_CHUNK", fus.get("chunk", 400000))
+
 
 def _dump_resolved_config(project_root: str) -> str:
     keys = [k for k in os.environ.keys() if k.startswith(("FEATURE_", "MATCH_", "SFM_", "MVS_", "MASK_"))]
@@ -301,6 +314,15 @@ class PipelineRunner:
                     reconstruct_mvs_depth_and_mesh(**common_kwargs)
             except Exception as e:
                 log("[error]\nSparse-Paint failed: " + str(e))
+
+        # --- 9) Fusion der points_ref_* via Silhouetten ---
+        FUSION_ENABLE = _parse_bool(os.getenv("FUSION_ENABLE", "true"), True)
+        if FUSION_ENABLE:
+            log("[fusion] start silhouette fusion")
+            try:
+                fuse_selected_pointclouds(paths, K, on_log=log, on_progress=prog)
+            except Exception as e:
+                log("[warn] fusion failed: " + str(e))
 
         prog(100, "finished")
         return sparse_ply, paths

@@ -57,25 +57,35 @@ sfm:
 
 mvs:
   enable: true
-  mode: "single"         # egal: Auswahl erfolgt über Strategie unten
+  mode: "single"
   params:
     device: cuda
     scale: 1.0
 
-    # ---- Frame-Auswahl ----
-    ref_strategy: "bestk"   # "bestk" | "step" | "auto"
-    ref_topk: 40            # z.B. 40 Frames rundum
-    ref_min_gap: 2          # min. Indexabstand bei bestk
-    ref_step: 3             # fallback / bei strategy=step
+    # ---- Frame-Auswahl (bucketed) ----
+    ref_strategy: "bucket"   # "bucket" | "bestk" | "step" | "auto"
+    ref_topk: 6              # Anzahl der Buckets = Anzahl gewünschter Posen
+    ref_min_gap: 1           # Sicherheitsabstand in Indizes (für bestk)
+    ref_step: 3              # nur für strategy=step
 
     # ---- Seeds & Fill ----
     seed_radius: 2
     seed_min: 200
-    seed_sample: 200000     # max Sparse-Punkte für Scoring
-    beta: 4.0               # Kantensensitivität im Fill
+    seed_sample: 200000
+    beta: 4.0
     fill_iters: 150
     mask_pad: 6
 
     # ---- Output ----
     export_mesh: true
     poisson_depth: 10
+
+fusion:
+  enable: true
+  mode: "majority"     # "any" | "majority" | "all"
+  min_in_mask: 2       # optional, z.B. >=2 Masken müssen den Punkt „sehen“
+  use_depth: true      # zusätzlich Depth-Konsistenz nutzen (falls depth/*.npy vorhanden)
+  depth_tol: 0.03      # akzeptiere z <= depth + tol
+  export_mesh: true
+  poisson_depth: 10
+  chunk: 400000
