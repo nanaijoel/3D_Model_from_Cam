@@ -422,38 +422,6 @@ def run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_di
 
         all_pts.append(Xw.astype(np.float32)); all_cols.append(cols.astype(np.uint8))
 
-    # Fusion
-    if all_pts:
-        P = np.concatenate(all_pts, axis=0)
-        C = np.concatenate(all_cols, axis=0) if all_cols else None
-        dense_pts_path = os.path.join(mesh_dir, "dense_points.ply")
-        if HAS_O3D:
-            pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P))
-            if C is not None and C.size == P.shape[0]*3:
-                pcd.colors = o3d.utility.Vector3dVector(C[:, ::-1] / 255.0)
-            if P.shape[0] > 5000:
-                try: pcd = pcd.voxel_down_sample(voxel_size=float(_median_nn_distance(P)*0.6))
-                except Exception: pass
-            o3d.io.write_point_cloud(dense_pts_path, pcd)
-        else:
-            save_point_cloud(P, dense_pts_path)
-        _log(f"[sparse-paint] saved dense points -> {dense_pts_path}", on_log)
-
-        if EXPORT_MESH and HAS_O3D and P.shape[0] >= 1500:
-            try:
-                pcd = o3d.io.read_point_cloud(dense_pts_path)
-                pcd.estimate_normals()
-                mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-                    pcd, depth=int(os.getenv("MVS_POISSON_DEPTH", "10"))
-                )
-                densities = np.asarray(densities)
-                keep = densities > np.quantile(densities, 0.02)
-                mesh = mesh.select_by_index(np.where(keep)[0])
-                mesh_path = os.path.join(mesh_dir, "dense_mesh.ply")
-                o3d.io.write_triangle_mesh(mesh_path, mesh)
-                _log(f"[sparse-paint] saved mesh -> {mesh_path}", on_log)
-            except Exception as e:
-                _log(f"[warn] meshing failed: {e}", on_log)
 
     _log("[ui] Done Sparse-Paint.", on_log)
 
