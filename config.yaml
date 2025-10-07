@@ -59,7 +59,7 @@ mvs:
 
     # ---- Frame-Auswahl (bucketed) ----
     ref_strategy: "bucket"   # "bucket" | "bestk" | "step"
-    ref_topk: 36             # Anzahl der gewünschten points_ref_XXXX
+    ref_topk: 60             # Anzahl der gewünschten points_ref_XXXX
     ref_min_gap: 3           # Sicherheitsabstand (nur für "bestk")
     ref_step: 3              # nur für "step"
 
@@ -75,24 +75,11 @@ mvs:
     export_mesh: false       # <- wir bauen KEIN dense_mesh hier
     poisson_depth: 10
 
-fusion:
+carve:
   enable: true
-  num_refs: 36               # 18–24 ist ein guter Sweet-Spot; 119 lohnt selten
-  mode: "majority"           # "any" | "majority" | "all"
-  min_in_mask: 2
-  use_depth: true
-  depth_tol: 0.03
-  voxel: 0.0                 # 0 = auto
-  sdf_tau_rel: 0.010         # Soft-Sparse Leitplanke (1% BB-Diagonale)
-  sdf_tau: 0.0               # 0 = aus
-  export_mesh: true
-  poisson_depth: 10
+  use_all_masks: true   # wenn false: nur die Sichten nutzen, für die points_ref_* existieren
+  mode: "all"           # "all" (streng), "majority" (robuster), "any" (locker)
+  use_depth: false      # optional z-Konsistenz gegen depth_{i}.npy (falls vorhanden)
+  depth_tol: 0.02
   chunk: 400000
 
-  # NEW: Silhouette-Fill
-  fill:
-    enable: true
-    stride: 2                # größer -> weniger Punkte, schneller
-    inpaint: true            # fülle Löcher in depth_XXXX.npy per cv.inpaint
-    inpaint_radius: 3
-    max_per_view: 150000     # Sicherheitslimit pro View

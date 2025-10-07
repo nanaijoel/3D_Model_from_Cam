@@ -14,8 +14,6 @@ from meshing import (
     save_point_cloud,
     reconstruct_mvs_depth_and_mesh,
     reconstruct_mvs_depth_and_mesh_all)
-from fusion import fuse_selected_pointclouds
-
 # ---------------- config utils ----------------
 
 def _load_yaml_or_json(path: str) -> Dict[str, Any]:
@@ -149,28 +147,15 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("MVS_EXPORT_MESH", mp.get("export_mesh"))
     setenv("MVS_POISSON_DEPTH", mp.get("poisson_depth"))
 
-    # ---------- FUSION ----------
-    # ---------- FUSION ----------
-    fu = cfg.get("fusion", {}) or {}
-    setenv("FUSION_ENABLE", pick_bool(fu.get("enable", True)))
-    setenv("FUSION_NUM_REFS", fu.get("num_refs"))
-    setenv("FUSION_MODE", fu.get("mode"))
-    setenv("FUSION_MIN_IN_MASK", fu.get("min_in_mask"))
-    setenv("FUSION_USE_DEPTH", fu.get("use_depth"))
-    setenv("FUSION_DEPTH_TOL", fu.get("depth_tol"))
-    setenv("FUSION_VOXEL", fu.get("voxel"))
-    setenv("FUSION_SDF_TAU_REL", fu.get("sdf_tau_rel"))
-    setenv("FUSION_SDF_TAU", fu.get("sdf_tau"))
-    setenv("FUSION_EXPORT_MESH", fu.get("export_mesh"))
-    setenv("FUSION_POISSON_DEPTH", fu.get("poisson_depth"))
-    setenv("FUSION_CHUNK", fu.get("chunk"))
-    # fill subdict
-    fuf = fu.get("fill", {}) or {}
-    setenv("FUSION_FILL_ENABLE", fuf.get("enable"))
-    setenv("FUSION_FILL_STRIDE", fuf.get("stride"))
-    setenv("FUSION_FILL_INPAINT", fuf.get("inpaint"))
-    setenv("FUSION_FILL_INPAINT_RADIUS", fuf.get("inpaint_radius"))
-    setenv("FUSION_FILL_MAX_PER_VIEW", fuf.get("max_per_view"))
+    # ---------- CARVE ----------
+    cv = cfg.get("carve", {}) or {}
+    setenv("CARVE_ENABLE", cv.get("enable"))
+    setenv("CARVE_USE_ALL_MASKS", cv.get("use_all_masks"))
+    setenv("CARVE_MODE", cv.get("mode"))                 # all | majority | any
+    setenv("CARVE_USE_DEPTH", cv.get("use_depth"))       # true/false
+    setenv("CARVE_DEPTH_TOL", cv.get("depth_tol"))       # 0.03
+    setenv("CARVE_CHUNK", cv.get("chunk"))
+
 
 
 
@@ -328,16 +313,6 @@ class PipelineRunner:
                     reconstruct_mvs_depth_and_mesh(**common_kwargs)
             except Exception as e:
                 log("[error]\nSparse-Paint failed: " + str(e))
-
-        # --- 9) Fusion der ausgewählten points_ref_*.ply
-        FUSION_ENABLE = _parse_bool(os.getenv("FUSION_ENABLE", "true"), True)
-        if FUSION_ENABLE:
-            log("[fusion] start")
-            try:
-                fused = fuse_selected_pointclouds(paths, K, on_log=log, on_progress=prog)
-                log(f"[ui] Fused points -> {fused}")
-            except Exception as e:
-                log("[error]\nFusion failed: " + str(e))
 
         prog(100, "finished")
         return sparse_ply, paths

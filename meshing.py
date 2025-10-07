@@ -423,7 +423,18 @@ def run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_di
         all_pts.append(Xw.astype(np.float32)); all_cols.append(cols.astype(np.uint8))
 
 
-    _log("[ui] Done Sparse-Paint.", on_log)
+    _log("[ui] Done Sparse-Paint.", on_log)    # ... am Ende von run_sparse_paint_gpu(), NACH der Schleife über refs:
+
+    # >>> NEU: Merge & Carve, falls aktiviert
+    if str(os.getenv("CARVE_ENABLE", "false")).lower() in ("1","true","yes","on"):
+        try:
+            out = merge_all_points_ref_and_carve(mesh_dir, frames_dir, masks_dir, poses_npz, on_log=on_log)
+            _log(f"[ui] Merge&Carve -> {out}", on_log)
+        except Exception as e:
+            _log(f"[carve] failed: {e}", on_log)
+
+
+
 
 # --------------------- Wrapper (API-kompatibel) ---------------------
 
@@ -481,3 +492,196 @@ def reconstruct_mvs_depth_and_mesh_all(paths, K,
     masks_dir    = os.path.join(features_dir, "masks")
     run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_dir,
                          on_log=on_log, on_progress=on_progress)
+
+# --- Merge & Carve: alle points_ref_* zusammenführen und mit Masken „schneiden“ ---
+
+def _read_points_ref_with_colors(ply_path):
+    if not os.path.isfile(ply_path):
+        return None, None
+    try:
+        import open3d as o3d
+        pc = o3d.io.read_point_cloud(ply_path)
+        if pc is None or np.asarray(pc.points).size == 0:
+            return None, None
+        P = np.asarray(pc.points, dtype=np.float64)
+        C = None
+        if len(pc.colors) > 0:
+            C = (np.asarray(pc.colors)[:, ::-1] * 255.0).astype(np.float64)  # RGB->BGR uint8
+        return P, C
+    except Exception:
+        # ASCII-Fallback
+        with open(ply_path, "r") as f:
+            header = True; n=0; has_color=False
+            while header:
+                line = f.readline()
+                if not line: break
+                if line.startswith("element vertex"): n = int(line.split()[-1])
+                if line.startswith("property uchar red"): has_color=True
+                if line.strip() == "end_header":
+                    header = False; break
+            pts=[]; cols=[]
+            for _ in range(n):
+                parts = f.readline().strip().split()
+                if len(parts) < 3: continue
+                x,y,z = map(float, parts[:3]); pts.append((x,y,z))
+                if has_color and len(parts) >= 6:
+                    r,g,b = map(float, parts[3:6]); cols.append((b,g,r))  # BGR
+        P = np.asarray(pts, np.float64)
+        C = np.asarray(cols, np.float64) if cols else None
+        return P, C
+
+def _save_colored_ply_any(P, C, out_path):
+    _mkdir(os.path.dirname(out_path) or ".")
+    try:
+        import open3d as o3d
+        pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P.astype(np.float64)))
+        if C is not None and C.shape[0] == P.shape[0]:
+            pc.colors = o3d.utility.Vector3dVector((C[:, ::-1] / 255.0).astype(np.float64))  # BGR->RGB
+        o3d.io.write_point_cloud(out_path, pc)
+        return out_path
+    except Exception:
+        with open(out_path,"w") as f:
+            f.write("ply\nformat ascii 1.0\n")
+            f.write(f"element vertex {P.shape[0]}\n")
+            f.write("property float x\nproperty float y\nproperty float z\n")
+            if C is not None:
+                f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+            f.write("end_header\n")
+            if C is None:
+                for p in P: f.write(f"{p[0]} {p[1]} {p[2]}\n")
+            else:
+                for p,c in zip(P, C.astype(np.uint8)):
+                    f.write(f"{p[0]} {p[1]} {p[2]} {int(c[2])} {int(c[1])} {int(c[0])}\n")
+        return out_path
+
+def _carve_points_with_masks(P, K, R_all, t_all, masks, depth_dir=None,
+                             mode="all", use_depth=False, depth_tol=0.03, chunk=400000, on_log=None):
+    """
+    P: Nx3 in Weltkoordinaten.
+    masks: Liste [len(views)] aus 2D-Masken (oder None).
+    mode: "all" (AND), "majority", "any".
+    use_depth: z <= depth(u,v) + tol*(1+depth)
+    """
+    V = len(masks); N = P.shape[0]
+    if V == 0 or N == 0:
+        return np.ones(N, np.bool_)
+
+    counts = np.zeros(N, np.int32)
+
+    for vi in range(V):
+        m = masks[vi]
+        if m is None:  # ohne Maske ignorieren wir diese Sicht
+            continue
+        H,W = m.shape[:2]
+        R = R_all[vi]; t = t_all[vi]
+        # optional Depth
+        D = None
+        if use_depth and depth_dir:
+            p = os.path.join(depth_dir, f"depth_{vi:04d}.npy")
+            if os.path.isfile(p):
+                try: D = np.load(p)
+                except: D = None
+        # Projizieren in Chunks
+        Cc = (-R.T @ t).reshape(3)
+        for s in range(0, N, chunk):
+            e = min(N, s+chunk)
+            Q = P[s:e]
+            Xc = (R @ (Q.T - Cc.reshape(3,1))).T
+            z  = Xc[:,2]
+            u  = K[0,0]*Xc[:,0]/np.maximum(z,1e-9) + K[0,2]
+            v  = K[1,1]*Xc[:,1]/np.maximum(z,1e-9) + K[1,2]
+            ui = np.floor(u).astype(np.int32)
+            vi2= np.floor(v).astype(np.int32)
+            inside = (z>1e-6)&(ui>=0)&(ui<W)&(vi2>=0)&(vi2<H)
+            if not np.any(inside):
+                continue
+            ui = np.clip(ui,0,W-1); vi2 = np.clip(vi2,0,H-1)
+            inside &= (m[vi2, ui] > 0)
+            if D is not None:
+                d = D[vi2, ui]
+                inside &= (z <= (d + depth_tol*(1.0 + d)))
+            counts[s:e] += inside.astype(np.int32)
+
+    if mode == "all":
+        return counts == V
+    if mode == "majority":
+        return counts >= int(np.ceil(V/2.0))
+    return counts >= 1  # "any"
+
+def merge_all_points_ref_and_carve(mesh_dir, frames_dir, masks_dir, poses_npz, on_log=None):
+    """
+    1) Lädt ALLE points_ref_*.ply im mesh_dir und merged sie.
+    2) Carvt die gemergte Cloud mit allen Masken (oder nur mit den ausgewählten Refs),
+       je nach ENV (CARVE_USE_ALL_MASKS, CARVE_MODE, CARVE_USE_DEPTH, CARVE_DEPTH_TOL).
+    3) Speichert fused_points.ply
+    """
+    _log("[carve] merge & carve start", on_log)
+    K = globals().get("GLOBAL_INTRINSICS_K", None)
+    if K is None:
+        raise RuntimeError("GLOBAL_INTRINSICS_K ist nicht gesetzt.")
+
+    # ENV
+    use_all = str(os.getenv("CARVE_USE_ALL_MASKS", "true")).lower() in ("1","true","yes","on")
+    mode    = (os.getenv("CARVE_MODE", "all") or "all").strip().lower()
+    use_depth = str(os.getenv("CARVE_USE_DEPTH", "false")).lower() in ("1","true","yes","on")
+    depth_tol = float(os.getenv("CARVE_DEPTH_TOL", "0.03"))
+    chunk   = int(float(os.getenv("CARVE_CHUNK","400000")))
+
+    # 1) alle points_ref_* laden
+    plys = sorted(glob.glob(os.path.join(mesh_dir, "points_ref_*.ply")))
+    if not plys:
+        raise RuntimeError("[carve] keine points_ref_*.ply gefunden")
+    P_list=[]; C_list=[]
+    for p in plys:
+        P,C = _read_points_ref_with_colors(p)
+        if P is None or P.size==0: continue
+        P_list.append(P.astype(np.float64))
+        C_list.append(C if C is not None and C.shape[0]==P.shape[0] else None)
+        _log(f"[carve] load {os.path.basename(p)} : {P.shape[0]} pts", on_log)
+    if not P_list:
+        raise RuntimeError("[carve] keine Punkte geladen")
+    P = np.concatenate(P_list, axis=0)
+    C = np.concatenate(C_list, axis=0) if all(c is not None for c in C_list) else None
+    _log(f"[carve] stacked: {P.shape[0]} pts", on_log)
+
+    # 2) Masken & Posen laden
+    R_all, t_all, _ = _load_poses_npz(poses_npz)
+    frame_files = _sorted_frames(frames_dir)
+    masks_all = [_mask_for_frame(masks_dir, f) for f in frame_files]
+
+    if use_all:
+        view_ids = list(range(min(len(frame_files), len(R_all))))
+    else:
+        # nur Sichten verwenden, für die es ein points_ref_* gab
+        view_ids = sorted(set(int(os.path.basename(p).split("_")[2].split(".")[0]) for p in plys))
+
+    masks = [masks_all[i] if 0 <= i < len(masks_all) else None for i in view_ids]
+    R_sel = [R_all[i] for i in view_ids]
+    t_sel = [t_all[i] for i in view_ids]
+    depth_dir = os.path.join(mesh_dir, "depth")
+
+    # 3) Carving
+    keep = _carve_points_with_masks(P, K, np.array(R_sel), np.array(t_sel), masks,
+                                    depth_dir=depth_dir, mode=mode,
+                                    use_depth=use_depth, depth_tol=depth_tol,
+                                    chunk=chunk, on_log=on_log)
+    Pk = P[keep]
+    Ck = (C[keep] if C is not None else None)
+    _log(f"[carve] after carving: {Pk.shape[0]} pts", on_log)
+
+    # optional leichtes Downsample zur Stabilisierung
+    try:
+        import open3d as o3d
+        pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(Pk))
+        if Ck is not None: pcd.colors = o3d.utility.Vector3dVector((Ck[:, ::-1] / 255.0))
+        if Pk.shape[0] > 8000:
+            vox = max(1e-4, 0.6 * _median_nn_distance(Pk))
+            pcd = pcd.voxel_down_sample(voxel_size=float(vox))
+        out = os.path.join(mesh_dir, "fused_points.ply")
+        o3d.io.write_point_cloud(out, pcd)
+    except Exception:
+        out = os.path.join(mesh_dir, "fused_points.ply")
+        _save_colored_ply_any(Pk, Ck, out)
+
+    _log(f"[carve] saved -> {out}", on_log)
+    return out
