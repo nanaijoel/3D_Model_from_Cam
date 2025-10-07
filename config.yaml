@@ -25,10 +25,13 @@ features:
     noise_std: 1.5
     mask_dilate: 6
 
-  sift:
-    contrast: 0.004
-    edge: 12
-    sigma: 1.2
+matching:
+  backend: lightglue
+  features: disk
+  ratio: 0.82
+  depth_confidence: -1
+  width_confidence: -1
+  filter_threshold: 0.09
 
 masking:
   enable: true
@@ -37,14 +40,6 @@ masking:
   params:
     alpha_thr: 0.4
     save_debug: true
-
-matching:
-  backend: lightglue
-  features: disk
-  ratio: 0.82
-  depth_confidence: -1
-  width_confidence: -1
-  filter_threshold: 0.09
 
 sfm:
   init_ratio: 0.5
@@ -63,10 +58,10 @@ mvs:
     scale: 1.0
 
     # ---- Frame-Auswahl (bucketed) ----
-    ref_strategy: "bucket"   # "bucket" | "bestk" | "step" | "auto"
-    ref_topk: 6              # Anzahl der Buckets = Anzahl gewünschter Posen
-    ref_min_gap: 1           # Sicherheitsabstand in Indizes (für bestk)
-    ref_step: 3              # nur für strategy=step
+    ref_strategy: "bucket"   # "bucket" | "bestk" | "step"
+    ref_topk: 36             # Anzahl der gewünschten points_ref_XXXX
+    ref_min_gap: 3           # Sicherheitsabstand (nur für "bestk")
+    ref_step: 3              # nur für "step"
 
     # ---- Seeds & Fill ----
     seed_radius: 2
@@ -77,15 +72,27 @@ mvs:
     mask_pad: 6
 
     # ---- Output ----
-    export_mesh: true
+    export_mesh: false       # <- wir bauen KEIN dense_mesh hier
     poisson_depth: 10
 
 fusion:
   enable: true
-  mode: "majority"     # "any" | "majority" | "all"
-  min_in_mask: 2       # optional, z.B. >=2 Masken müssen den Punkt „sehen“
-  use_depth: true      # zusätzlich Depth-Konsistenz nutzen (falls depth/*.npy vorhanden)
-  depth_tol: 0.03      # akzeptiere z <= depth + tol
+  num_refs: 36               # 18–24 ist ein guter Sweet-Spot; 119 lohnt selten
+  mode: "majority"           # "any" | "majority" | "all"
+  min_in_mask: 2
+  use_depth: true
+  depth_tol: 0.03
+  voxel: 0.0                 # 0 = auto
+  sdf_tau_rel: 0.010         # Soft-Sparse Leitplanke (1% BB-Diagonale)
+  sdf_tau: 0.0               # 0 = aus
   export_mesh: true
   poisson_depth: 10
   chunk: 400000
+
+  # NEW: Silhouette-Fill
+  fill:
+    enable: true
+    stride: 2                # größer -> weniger Punkte, schneller
+    inpaint: true            # fülle Löcher in depth_XXXX.npy per cv.inpaint
+    inpaint_radius: 3
+    max_per_view: 150000     # Sicherheitslimit pro View

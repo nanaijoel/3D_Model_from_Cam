@@ -149,16 +149,30 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("MVS_EXPORT_MESH", mp.get("export_mesh"))
     setenv("MVS_POISSON_DEPTH", mp.get("poisson_depth"))
 
-    # Fusion
-    fus = cfg.get("fusion", {})
-    setenv("FUSION_ENABLE", fus.get("enable", True))
-    setenv("FUSION_MODE", fus.get("mode", "majority"))       # any | majority | all
-    setenv("FUSION_MIN_IN_MASK", fus.get("min_in_mask"))     # optional int
-    setenv("FUSION_USE_DEPTH", fus.get("use_depth", True))
-    setenv("FUSION_DEPTH_TOL", fus.get("depth_tol", 0.03))
-    setenv("FUSION_EXPORT_MESH", fus.get("export_mesh", True))
-    setenv("FUSION_POISSON_DEPTH", fus.get("poisson_depth", 10))
-    setenv("FUSION_CHUNK", fus.get("chunk", 400000))
+    # ---------- FUSION ----------
+    # ---------- FUSION ----------
+    fu = cfg.get("fusion", {}) or {}
+    setenv("FUSION_ENABLE", pick_bool(fu.get("enable", True)))
+    setenv("FUSION_NUM_REFS", fu.get("num_refs"))
+    setenv("FUSION_MODE", fu.get("mode"))
+    setenv("FUSION_MIN_IN_MASK", fu.get("min_in_mask"))
+    setenv("FUSION_USE_DEPTH", fu.get("use_depth"))
+    setenv("FUSION_DEPTH_TOL", fu.get("depth_tol"))
+    setenv("FUSION_VOXEL", fu.get("voxel"))
+    setenv("FUSION_SDF_TAU_REL", fu.get("sdf_tau_rel"))
+    setenv("FUSION_SDF_TAU", fu.get("sdf_tau"))
+    setenv("FUSION_EXPORT_MESH", fu.get("export_mesh"))
+    setenv("FUSION_POISSON_DEPTH", fu.get("poisson_depth"))
+    setenv("FUSION_CHUNK", fu.get("chunk"))
+    # fill subdict
+    fuf = fu.get("fill", {}) or {}
+    setenv("FUSION_FILL_ENABLE", fuf.get("enable"))
+    setenv("FUSION_FILL_STRIDE", fuf.get("stride"))
+    setenv("FUSION_FILL_INPAINT", fuf.get("inpaint"))
+    setenv("FUSION_FILL_INPAINT_RADIUS", fuf.get("inpaint_radius"))
+    setenv("FUSION_FILL_MAX_PER_VIEW", fuf.get("max_per_view"))
+
+
 
 
 def _dump_resolved_config(project_root: str) -> str:
@@ -315,14 +329,15 @@ class PipelineRunner:
             except Exception as e:
                 log("[error]\nSparse-Paint failed: " + str(e))
 
-        # --- 9) Fusion der points_ref_* via Silhouetten ---
+        # --- 9) Fusion der ausgewählten points_ref_*.ply
         FUSION_ENABLE = _parse_bool(os.getenv("FUSION_ENABLE", "true"), True)
         if FUSION_ENABLE:
-            log("[fusion] start silhouette fusion")
+            log("[fusion] start")
             try:
-                fuse_selected_pointclouds(paths, K, on_log=log, on_progress=prog)
+                fused = fuse_selected_pointclouds(paths, K, on_log=log, on_progress=prog)
+                log(f"[ui] Fused points -> {fused}")
             except Exception as e:
-                log("[warn] fusion failed: " + str(e))
+                log("[error]\nFusion failed: " + str(e))
 
         prog(100, "finished")
         return sparse_ply, paths
