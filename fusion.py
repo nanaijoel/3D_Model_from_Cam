@@ -1,10 +1,10 @@
-# fusion.py
-# Silhouette- und (optional) Depth-konsistente Fusion mehrerer points_ref_*.ply
-# Ergebnis: fused_points.ply (+ optional fused_mesh.ply)
+# fusion.py — Silhouette-Carving + Depth-Gate + front-view-weighted Merge
+# - wählt gleichmäßig verteilte Keyframes (bucketed best-by-sparse)
+# - lädt points_ref_XXXX.ply (+ Farben) nur für diese Keyframes
+# - schneidet Ray-Artefakte: (a) strenges Source-Depth-Gate, (b) Multi-View-Silhouette (AND/Mehrheit)
+# - voxel-merging mit Frontalsicht-Priorität (Detail aus Vorderansicht “gewinnt”)
 
-from __future__ import annotations
-import os, glob, json
-from typing import List, Tuple
+import os, glob, math
 import numpy as np
 import cv2 as cv
 
@@ -15,289 +15,404 @@ except Exception:
     HAS_O3D = False
 
 
-# ---------- Utils ----------
+# ---------------- I/O helpers ----------------
 
-def _log(msg, on_log=None):
-    print(msg)
-    if on_log:
-        try: on_log(msg)
-        except: pass
+def _mkdir(p: str): os.makedirs(p, exist_ok=True)
 
-def _mkdir(p: str):
-    os.makedirs(p, exist_ok=True)
+def _sorted_frames(frames_dir):
+    return sorted(glob.glob(os.path.join(frames_dir, "frame_*.png")))
 
-def _read_pcd(path: str) -> Tuple[np.ndarray, np.ndarray | None]:
-    """Liest PLY. Gibt (Nx3 Punkte, Nx3 RGB[0..255] oder None) zurück."""
-    if HAS_O3D:
-        p = o3d.io.read_point_cloud(path)
-        if p is None:
-            raise FileNotFoundError(path)
-        pts = np.asarray(p.points, dtype=np.float32)
-        cols = None
-        if p.has_colors():
-            cols = (np.asarray(p.colors) * 255.0).astype(np.uint8)[:, ::-1]  # RGB->BGR
-        return pts, cols
+def _mask_for_frame(masks_dir, frame_path):
+    base = os.path.basename(frame_path)
+    stem, _ = os.path.splitext(base)
+    cands = [
+        os.path.join(masks_dir, f"{stem}_mask.png"),
+        os.path.join(masks_dir, f"{stem}_mask.jpg"),
+    ]
+    parts = stem.split("_")
+    if len(parts) >= 2 and parts[0] == "frame":
+        cands.append(os.path.join(masks_dir, f"frame_{parts[1]}_mask.png"))
+        cands.append(os.path.join(masks_dir, f"frame_{parts[1]}_mask.jpg"))
+    for c in cands:
+        if os.path.isfile(c):
+            m = cv.imread(c, cv.IMREAD_GRAYSCALE)
+            if m is not None:
+                return m
+    return None
 
-    # ASCII-Fallback (x y z [r g b])
+def _load_poses_npz(poses_npz_path):
+    npz = np.load(poses_npz_path)
+    R_all = npz["R"].astype(np.float64)             # (N,3,3) world->cam
+    t_all = npz["t"].reshape(-1,3,1).astype(np.float64)  # (N,3,1)
+    idx = npz.get("frame_idx", np.arange(len(R_all)))
+    return R_all, t_all, idx
+
+def _read_ascii_ply_points_colors(path):
+    if not os.path.isfile(path): return None, None
     with open(path, "r") as f:
-        header = True; n = 0; props = []
+        header = True; n=0; has_color=False
         while header:
             line = f.readline()
             if not line: break
-            line = line.strip()
-            if line.startswith("element vertex"):
-                n = int(line.split()[-1])
-            elif line.startswith("property"):
-                props.append(line.split()[-1])
-            elif line == "end_header":
+            if line.startswith("element vertex"): n = int(line.split()[-1])
+            if line.startswith("property uchar red"): has_color=True
+            if line.strip() == "end_header":
                 header = False
                 break
-        data = []
+        pts=[]; cols=[]
         for _ in range(n):
             parts = f.readline().strip().split()
-            data.append(parts)
-    arr = np.array(data, dtype=float)
-    pts = arr[:, :3].astype(np.float32)
-    cols = None
-    if arr.shape[1] >= 6:
-        cols = arr[:, 3:6].astype(np.uint8)  # angenommen BGR
-    return pts, cols
+            if len(parts) < 3: continue
+            x,y,z = map(float, parts[:3])
+            pts.append((x,y,z))
+            if has_color and len(parts) >= 6:
+                r,g,b = map(float, parts[3:6])       # ASCII i.d.R. RGB
+                cols.append((b,g,r))                 # -> BGR für cv-Style
+    P = np.asarray(pts, np.float64)
+    C = np.asarray(cols, np.float64) if cols else None
+    return P, C
 
-def _write_points_with_colors(path, pts: np.ndarray, cols: np.ndarray | None):
+def _read_points_ref_ply(path):
     if HAS_O3D:
-        pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts.astype(np.float32)))
-        if cols is not None and cols.shape[0] == pts.shape[0]:
-            pcd.colors = o3d.utility.Vector3dVector(cols[:, ::-1].astype(np.float32) / 255.0)  # BGR->RGB
-        o3d.io.write_point_cloud(path, pcd)
-        return
-    with open(path, "w") as f:
+        pc = o3d.io.read_point_cloud(path)
+        if pc is None or np.asarray(pc.points).size == 0:
+            return None, None
+        P = np.asarray(pc.points, dtype=np.float64)
+        C = None
+        if len(pc.colors) > 0:
+            # Open3D liefert float RGB [0..1] -> BGR uint8
+            C = (np.asarray(pc.colors)[:, ::-1] * 255.0).astype(np.float64)
+        return P, C
+    return _read_ascii_ply_points_colors(path)
+
+def _save_colored_ply(P, C, out_path):
+    _mkdir(os.path.dirname(out_path) or ".")
+    if HAS_O3D:
+        pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P.astype(np.float64)))
+        if C is not None and C.shape[0] == P.shape[0]:
+            pc.colors = o3d.utility.Vector3dVector((C[:, ::-1] / 255.0).astype(np.float64))  # BGR->RGB
+        o3d.io.write_point_cloud(out_path, pc)
+        return out_path
+    with open(out_path,"w") as f:
         f.write("ply\nformat ascii 1.0\n")
-        f.write(f"element vertex {pts.shape[0]}\n")
+        f.write(f"element vertex {P.shape[0]}\n")
         f.write("property float x\nproperty float y\nproperty float z\n")
-        if cols is not None:
-            f.write("property uchar blue\nproperty uchar green\nproperty uchar red\n")
+        if C is not None:
+            f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
         f.write("end_header\n")
-        if cols is None:
-            for p in pts:
-                f.write(f"{p[0]} {p[1]} {p[2]}\n")
+        if C is None:
+            for p in P: f.write(f"{p[0]} {p[1]} {p[2]}\n")
         else:
-            for p, c in zip(pts, cols):
-                f.write(f"{p[0]} {p[1]} {p[2]} {int(c[0])} {int(c[1])} {int(c[2])}\n")
+            for p,c in zip(P, C.astype(np.uint8)):
+                f.write(f"{p[0]} {p[1]} {p[2]} {int(c[2])} {int(c[1])} {int(c[0])}\n")
+    return out_path
 
 
-def _load_masks_for_index(masks_dir: str, frame_idx: int):
-    pat = os.path.join(masks_dir, f"frame_{frame_idx:04d}_*_mask.png")
-    cands = sorted(glob.glob(pat))
-    if not cands:
-        # evtl. alternative Namensschemata
-        cands = sorted(glob.glob(os.path.join(masks_dir, f"frame_{frame_idx:04d}_mask.png")))
-    if not cands:
-        return None
-    m = cv.imread(cands[0], cv.IMREAD_GRAYSCALE)
-    return m
+# ---------------- Kamera/Mathe ----------------
+
+def _project(K, X_cam):
+    x = X_cam[...,0]; y = X_cam[...,1]; z = np.maximum(X_cam[...,2], 1e-9)
+    u = K[0,0]*x/z + K[0,2];  v = K[1,1]*y/z + K[1,2]
+    return u, v
+
+def _cam_center(R,t): return (-R.T @ t).reshape(3)
+def _forward_dir(R):  return (R.T @ np.array([0.0,0.0,1.0])).reshape(3)
 
 
-def _load_depth_for_index(depth_dir: str, frame_idx: int):
-    npy = os.path.join(depth_dir, f"depth_{frame_idx:04d}.npy")
-    if os.path.isfile(npy):
-        try: return np.load(npy).astype(np.float32)
+# ---------------- Scoring & Auswahl ----------------
+
+def _score_frames_by_sparse(K, R_all, t_all, sparse_pts, masks):
+    N = len(masks)
+    if sparse_pts is None or sparse_pts.size == 0:
+        return np.zeros(N, dtype=np.int32)
+    scores = np.zeros(N, np.int32)
+    for i in range(N):
+        m = masks[i]
+        if m is None: continue
+        H,W = m.shape[:2]
+        Cc = _cam_center(R_all[i], t_all[i])
+        X_cam = (R_all[i] @ (sparse_pts.T - Cc.reshape(3,1))).T
+        Z = X_cam[:,2]
+        u,v = _project(K, X_cam)
+        in_img = (u>=0)&(u<W)&(v>=0)&(v<H)&(Z>1e-6)
+        if not np.any(in_img): continue
+        ui = np.clip(np.floor(u[in_img]).astype(np.int32),0,W-1)
+        vi = np.clip(np.floor(v[in_img]).astype(np.int32),0,H-1)
+        scores[i] = int(np.count_nonzero(m[vi,ui] > 0))
+    return scores
+
+def _choose_bucketed_best_from_candidates(scores_all, candidates, total_N, num_refs):
+    """
+    Teile [0..total_N) in num_refs Buckets und wähle je Bucket
+    den Kandidaten mit maximalem Score (falls keiner im Bucket: nimm
+    den Kandidaten mit minimaler Distanz zum Bucketzentrum).
+    """
+    chosen = []
+    if not candidates:
+        return chosen
+    candidates = sorted(set(int(c) for c in candidates))
+    num_refs  = max(1, int(num_refs))
+    bucket_w  = total_N / float(num_refs)
+    for b in range(num_refs):
+        a = int(round(b*bucket_w))
+        z = int(round((b+1)*bucket_w))
+        bucket = [c for c in candidates if a <= c < z]
+        if bucket:
+            best = max(bucket, key=lambda i: int(scores_all[i]))
+            chosen.append(best)
+        else:
+            # fallback: nearest candidate to bucket center
+            center = int(round((a+z)/2.0))
+            best = min(candidates, key=lambda i: abs(i-center))
+            if best not in chosen:
+                chosen.append(best)
+    return sorted(set(chosen))
+
+
+# ---------------- Silhouette/Depth-Filter ----------------
+
+def _load_depth(depth_dir, idx):
+    p = os.path.join(depth_dir, f"depth_{idx:04d}.npy")
+    if os.path.isfile(p):
+        try: return np.load(p)
         except Exception: return None
     return None
 
+def _source_depth_gate(P, src_ids, K, R_all, t_all, masks, depth_maps, tol_rel=0.03, chunk=400000):
+    """Trimmt Ray-Schweife streng im Source-View: z <= D(u,v)+(tol_rel*(1+D))."""
+    N = P.shape[0]
+    ok_all = np.zeros(N, dtype=np.bool_)
+    # Gruppiere Punkte nach Source-ID für effizientes Projizieren
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for i, sid in enumerate(src_ids): groups[int(sid)].append(i)
+    for sid, idxs in groups.items():
+        m = masks.get(sid, None); D = depth_maps.get(sid, None)
+        R = R_all[sid]; t = t_all[sid]
+        if m is None or D is None:  # ohne Maske/Depth können wir nicht prüfen -> verwerfen wir NICHT
+            ok_all[idxs] = True
+            continue
+        H,W = m.shape[:2]
+        Cc = _cam_center(R,t)
+        idxs = np.asarray(idxs, np.int64)
+        for s in range(0, idxs.size, chunk):
+            ids = idxs[s:s+chunk]
+            Q = P[ids]
+            Xc = (R @ (Q.T - Cc.reshape(3,1))).T
+            z = Xc[:,2]
+            u,v = _project(K, Xc)
+            ui = np.floor(u).astype(np.int32)
+            vi = np.floor(v).astype(np.int32)
+            inside = (z>1e-6)&(ui>=0)&(ui<W)&(vi>=0)&(vi<H)
+            if not np.any(inside):
+                continue
+            ui = np.clip(ui,0,W-1); vi = np.clip(vi,0,H-1)
+            inside &= (m[vi,ui] > 0)
+            d = D[vi,ui]
+            inside &= (z <= (d + tol_rel*(1.0 + d)))
+            ok_all[ids] = inside
+    return ok_all
 
-def _project(K, X_cam):
-    x = X_cam[:, 0]; y = X_cam[:, 1]; z = np.maximum(X_cam[:, 2], 1e-9)
-    u = K[0, 0] * x / z + K[0, 2]
-    v = K[1, 1] * y / z + K[1, 2]
-    return u, v, z
+def _multi_view_silhouette(P, K, R_list, t_list, masks_list, depth_list, mode="all", tol_rel=0.03, chunk=400000):
+    """Behalte Punkte, die in mehreren Sichten in der Silhouette liegen; optional Tiefen-Gate."""
+    V = len(R_list); N = P.shape[0]
+    counts = np.zeros(N, np.int32)
+    for v in range(V):
+        R = R_list[v]; t = t_list[v]
+        m = masks_list[v]; D = depth_list[v]
+        if m is None: continue
+        H,W = m.shape[:2]
+        Cc = _cam_center(R,t)
+        for s in range(0, N, chunk):
+            e = min(N, s+chunk)
+            Q = P[s:e]
+            Xc = (R @ (Q.T - Cc.reshape(3,1))).T
+            z = Xc[:,2]
+            u,v = _project(K, Xc)
+            ui = np.floor(u).astype(np.int32)
+            vi = np.floor(v).astype(np.int32)
+            inside = (z>1e-6)&(ui>=0)&(ui<W)&(vi>=0)&(vi<H)
+            if not np.any(inside):
+                continue
+            ui = np.clip(ui,0,W-1); vi = np.clip(vi,0,H-1)
+            inside &= (m[vi,ui] > 0)
+            if D is not None:
+                d = D[vi,ui]
+                inside &= (z <= (d + tol_rel*(1.0 + d)))
+            counts[s:e] += inside.astype(np.int32)
+    if mode == "all":
+        return counts == V
+    if mode == "majority":
+        return counts >= int(math.ceil(V/2.0))
+    return counts >= 1  # any
 
 
-# ---------- Kern: Fusion ----------
+# ---------------- Merge (Frontalsicht gewinnt) ----------------
 
-def fuse_selected_pointclouds(paths, K,
-                              on_log=None, on_progress=None):
-    """
-    - Nimmt points_ref_*.ply (aus sparse-paint).
-    - Liest ausgewählte Refs aus mesh/selected_refs.json (falls vorhanden),
-      sonst alle vorhandenen points_ref_*.ply.
-    - Prüft Silhouetten-Konsistenz in allen gewählten Masken.
-    - Optional: vergleicht reprojizierte z mit gespeicherter depth_{idx}.npy (Toleranz).
-    - Speichert fused_points.ply (+ optional fused_mesh.ply).
-    """
+def _voxel_merge_weighted(P, C, src_ids, R_all, t_all, voxel=None):
+    if P.size == 0: return P, C
+    # Voxelgröße schätzen (Median-NN)
+    if voxel is None or voxel <= 0:
+        try:
+            from scipy.spatial import cKDTree
+            idx = np.random.choice(P.shape[0], size=min(6000,P.shape[0]), replace=False)
+            Q = P[idx]; tree = cKDTree(Q); d,_ = tree.query(Q, k=2)
+            med = np.median(d[:,1]) if d.ndim>1 else np.median(d)
+        except Exception:
+            bb = P.max(0)-P.min(0); med = float(np.linalg.norm(bb))/400.0
+        voxel = max(1e-4, 0.6*float(med))
 
-    root = paths.root if hasattr(paths, "root") else paths["root"]
+    # Kamerazentren & Forward
+    src_set = set(int(s) for s in src_ids.tolist())
+    Cc = {sid: _cam_center(R_all[sid], t_all[sid]) for sid in src_set}
+    Fd = {sid: _forward_dir(R_all[sid])            for sid in src_set}
+
+    # Frontalsicht-Gewichte
+    W = np.zeros(P.shape[0], np.float64)
+    for i in range(P.shape[0]):
+        sid = int(src_ids[i])
+        v = P[i]-Cc[sid]; nv = np.linalg.norm(v)+1e-12; v = v/nv
+        f = Fd[sid]; nf = np.linalg.norm(f)+1e-12
+        W[i] = float(np.clip(np.dot(v,f)/nf, -1.0, 1.0))
+
+    # Voxel-Hash + max-by-weight
+    q = np.floor(P/voxel).astype(np.int64)
+    key = q[:,0]*73856093 ^ q[:,1]*19349663 ^ q[:,2]*83492791
+    order = np.argsort(key)
+
+    out_P=[]; out_C=[]
+    last=None; best_i=-1; best_w=-1e9
+    for idx in order:
+        k = key[idx]
+        if last is None:
+            last=k; best_i=idx; best_w=W[idx]; continue
+        if k!=last:
+            out_P.append(P[best_i])
+            if C is not None: out_C.append(C[best_i])
+            last=k; best_i=idx; best_w=W[idx]
+        else:
+            if W[idx] > best_w:
+                best_i=idx; best_w=W[idx]
+    if best_i>=0:
+        out_P.append(P[best_i]);
+        if C is not None: out_C.append(C[best_i])
+
+    Pm = np.asarray(out_P, np.float64)
+    Cm = np.asarray(out_C, np.float64) if C is not None else None
+    return Pm, Cm
+
+
+# ---------------- Haupt-Fuse ----------------
+
+def fuse_selected_pointclouds(paths, K, on_log=None, on_progress=None):
+    log = (lambda s: (on_log(s) if on_log else None))
+    root = paths.root if hasattr(paths,"root") else paths["root"]
     mesh_dir   = os.path.join(root, "mesh")
     frames_dir = os.path.join(root, "raw_frames")
     masks_dir  = os.path.join(root, "features", "masks")
     poses_npz  = os.path.join(root, "poses", "camera_poses.npz")
     depth_dir  = os.path.join(mesh_dir, "depth")
-
     _mkdir(mesh_dir)
 
-    # --- ENV / Config ---
-    mode = os.getenv("FUSION_MODE", "majority").strip().lower()   # any | majority | all
-    min_in_mask_env = os.getenv("FUSION_MIN_IN_MASK", "").strip()
-    min_in_mask = int(float(min_in_mask_env)) if min_in_mask_env != "" else -1
-    use_depth   = os.getenv("FUSION_USE_DEPTH", "true").lower() == "true"
-    depth_tol   = float(os.getenv("FUSION_DEPTH_TOL", "0.03"))   # relative/absolut? Wir nehmen absolut in Z
-    poisson_depth = int(float(os.getenv("FUSION_POISSON_DEPTH", "10")))
-    export_mesh   = os.getenv("FUSION_EXPORT_MESH", "true").lower() == "true"
-    chunk_size    = int(float(os.getenv("FUSION_CHUNK", "400000")))
+    # --- Konfig
+    num_refs   = int(float(os.getenv("FUSION_NUM_REFS", "6")))
+    mode       = os.getenv("FUSION_MODE", "all").strip().lower()         # any|majority|all
+    use_depth  = str(os.getenv("FUSION_USE_DEPTH","true")).lower() in ("1","true","yes","on")
+    tol_rel    = float(os.getenv("FUSION_DEPTH_TOL","0.03"))
+    export_mesh= str(os.getenv("FUSION_EXPORT_MESH","false")).lower() in ("1","true","yes","on")  # default aus!
+    chunk      = int(float(os.getenv("FUSION_CHUNK","400000")))
 
-    # --- Posen laden ---
-    npz = np.load(poses_npz)
-    R_all = npz["R"]               # (N,3,3) world->cam
-    t_all = npz["t"].reshape(-1, 3, 1)
+    # --- Lade Frames/Masks/Posen
+    frame_files = _sorted_frames(frames_dir)
+    if not frame_files: raise RuntimeError(f"Keine Frames in {frames_dir}")
+    masks_all = [_mask_for_frame(masks_dir, f) for f in frame_files]
+    R_all, t_all, _ = _load_poses_npz(poses_npz)
+    N = min(len(frame_files), len(R_all))
 
-    # --- Welche Refs? ---
-    sel_file = os.path.join(mesh_dir, "selected_refs.json")
-    if os.path.isfile(sel_file):
-        with open(sel_file, "r") as f:
-            refs = json.load(f)
-        refs = sorted(set(int(i) for i in refs))
+    # --- sparse.ply für Scores
+    sparse_ply = os.path.join(mesh_dir, "sparse.ply")
+    if HAS_O3D:
+        sp=o3d.io.read_point_cloud(sparse_ply)
+        sparse_pts = np.asarray(sp.points, np.float64) if sp is not None else None
     else:
-        # Fallback: nimm alle vorhandenen points_ref_*.ply
-        refs = []
-        for p in glob.glob(os.path.join(mesh_dir, "points_ref_*.ply")):
-            try:
-                ridx = int(os.path.splitext(os.path.basename(p))[0].split("_")[-1])
-                refs.append(ridx)
-            except Exception:
-                pass
-        refs = sorted(set(refs))
+        sparse_pts,_ = _read_ascii_ply_points_colors(sparse_ply)
 
+    # --- Kandidaten = Frames, für die points_ref_XXXX.ply existiert (+Maske)
+    candidates = []
+    for i in range(N):
+        if masks_all[i] is None: continue
+        if os.path.isfile(os.path.join(mesh_dir, f"points_ref_{i:04d}.ply")):
+            candidates.append(i)
+    if not candidates:
+        raise RuntimeError("[fusion] Keine points_ref_*.ply gefunden.")
+
+    # --- Scores und bucketed Auswahl
+    scores = _score_frames_by_sparse(K, R_all[:N], t_all[:N], sparse_pts, masks_all[:N])
+    refs = _choose_bucketed_best_from_candidates(scores, candidates, total_N=N, num_refs=num_refs)
     if not refs:
-        _log("[fusion] Keine Referenz-PLYs gefunden.", on_log)
-        return None
+        # Fallback: gleichmäßig aus candidates
+        step = max(1, len(candidates)//max(1,num_refs))
+        refs = candidates[::step][:num_refs]
+    log and log(f"[fusion] chosen refs (bucketed): {refs}")
 
-    _log(f"[fusion] use refs: {refs}", on_log)
-
-    # --- Refs: Masken + optional Depth vorbereiten ---
-    ref_masks: dict[int, np.ndarray] = {}
-    ref_depths: dict[int, np.ndarray] = {}
-
-    H = W = None
+    # --- Punkte + Farben laden
+    P_list=[]; C_list=[]; SRC=[]
     for ridx in refs:
-        m = _load_masks_for_index(masks_dir, ridx)
-        if m is None:
-            _log(f"[fusion] WARN: keine Maske für ref={ridx} gefunden → skip diesen Ref", on_log)
-            continue
-        ref_masks[ridx] = m
-        if H is None: H, W = m.shape[:2]
-        if use_depth:
-            d = _load_depth_for_index(depth_dir, ridx)
-            ref_depths[ridx] = d  # darf auch None sein
+        ply = os.path.join(mesh_dir, f"points_ref_{ridx:04d}.ply")
+        P,C = _read_points_ref_ply(ply)
+        if P is None or P.size==0: continue
+        P_list.append(P)
+        SRC.append(np.full(P.shape[0], ridx, np.int32))
+        C_list.append(C if C is not None and C.shape[0]==P.shape[0] else None)
+        log and log(f"[fusion] load {os.path.basename(ply)} : {P.shape[0]} pts")
+    if not P_list: raise RuntimeError("[fusion] Keine Punkte zu fusionieren.")
 
-    refs = [r for r in refs if r in ref_masks]
-    if not refs:
-        _log("[fusion] Keine gültigen Masken gefunden.", on_log); return None
+    P = np.concatenate(P_list, axis=0)
+    src_ids = np.concatenate(SRC, axis=0)
+    C = np.concatenate(C_list, axis=0) if all(c is not None for c in C_list) else None
 
-    # --- Punkte laden (alle points_ref_*.ply aus 'refs') ---
-    all_pts = []
-    all_cols = []
-    for ridx in refs:
-        ply_path = os.path.join(mesh_dir, f"points_ref_{ridx:04d}.ply")
-        if not os.path.isfile(ply_path):
-            _log(f"[fusion] WARN: {ply_path} fehlt, skip", on_log)
-            continue
-        P, C = _read_pcd(ply_path)
-        if P.size == 0:
-            _log(f"[fusion] WARN: {ply_path} leer, skip", on_log)
-            continue
-        all_pts.append(P.astype(np.float32))
-        all_cols.append(C.astype(np.uint8) if C is not None else None)
+    # --- View-Assets für die ausgewählten Refs
+    masks_ref = {i: masks_all[i] for i in refs}
+    depth_ref = {i: (_load_depth(depth_dir, i) if use_depth else None) for i in refs}
 
-    if not all_pts:
-        _log("[fusion] Keine Punkte geladen.", on_log); return None
+    # 1) Source-Depth-Gate (straffes Trimmen pro Herkunftssicht)
+    keep_src = _source_depth_gate(P, src_ids, K, R_all, t_all, masks_ref, depth_ref, tol_rel=tol_rel, chunk=chunk)
+    P = P[keep_src]; src_ids = src_ids[keep_src];
+    if C is not None: C = C[keep_src]
+    log and log(f"[fusion] after source-depth-gate: {P.shape[0]} pts")
 
-    P = np.concatenate(all_pts, axis=0)
-    C = None
-    if any(c is None for c in all_cols):
-        C = None
-    else:
-        C = np.concatenate(all_cols, axis=0)
+    # 2) Multi-View-Silhouette (alle gewählten Refs, ‘all’ als Default)
+    R_sel = [R_all[i] for i in refs]; t_sel = [t_all[i] for i in refs]
+    M_sel = [masks_ref[i] for i in refs]; D_sel = [depth_ref[i] for i in refs]
+    keep_mv = _multi_view_silhouette(P, K, R_sel, t_sel, M_sel, D_sel, mode=mode, tol_rel=tol_rel, chunk=chunk)
+    P = P[keep_mv]; src_ids = src_ids[keep_mv];
+    if C is not None: C = C[keep_mv]
+    log and log(f"[fusion] after multi-view silhouette: {P.shape[0]} pts")
 
-    _log(f"[fusion] total input points: {P.shape[0]}", on_log)
+    # 3) Merge mit Frontalsicht-Priorität
+    Pm, Cm = _voxel_merge_weighted(P, C, src_ids, R_all, t_all, voxel=None)
+    log and log(f"[fusion] after voxel-merge: {Pm.shape[0]} pts")
 
-    # --- Sichtbarkeitszählung über Refs ---
-    counts = np.zeros(P.shape[0], np.int32)
+    # 4) Save
+    out_points = os.path.join(mesh_dir, "fused_points.ply")
+    _save_colored_ply(Pm, Cm, out_points)
+    log and log(f"[fusion] saved -> {out_points}")
 
-    # Vorab Kamerazentren
-    cam_C = {r: (-R_all[r].T @ t_all[r]).reshape(3) for r in refs}
-
-    # Chunked (Speicher freundlich)
-    for start in range(0, P.shape[0], max(1, chunk_size)):
-        end = min(P.shape[0], start + chunk_size)
-        Pw = P[start:end]  # (M,3)
-        keep_any = np.zeros(Pw.shape[0], dtype=bool)
-
-        for ridx in refs:
-            R = R_all[ridx]; t = t_all[ridx]; Cw = cam_C[ridx]
-            M = ref_masks[ridx]
-            H, W = M.shape[:2]
-            # world -> cam
-            X_cam = (R @ (Pw.T - Cw.reshape(3,1))).T  # (M,3)
-            u, v, z = _project(K, X_cam)
-            ui = np.floor(u).astype(np.int32)
-            vi = np.floor(v).astype(np.int32)
-
-            in_img = (z > 1e-6) & (ui >= 0) & (ui < W) & (vi >= 0) & (vi < H)
-            if not np.any(in_img):
-                continue
-
-            ok = in_img.copy()
-            ok[in_img] &= (M[vi[in_img], ui[in_img]] > 0)
-
-            if use_depth:
-                D = ref_depths.get(ridx)
-                if D is not None:
-                    # nearest lookup
-                    di = D[vi[in_img], ui[in_img]]
-                    # valide depth?
-                    valid_d = np.isfinite(di) & (di > 1e-6)
-                    mask_depth = np.zeros_like(ok)
-                    sub_ok = ok[in_img]
-                    sub_ok &= valid_d
-                    # z <= di + tol
-                    sub_ok &= (z[in_img] <= di + float(depth_tol))
-                    ok[in_img] = sub_ok
-
-            counts[start:end] += ok.astype(np.int32)
-
-        on_progress and on_progress(int(100.0 * end / max(1, P.shape[0])), "Fusion (silhouette)")
-
-    L = len(refs)
-    if mode == "all":
-        thr = L
-    elif mode == "any":
-        thr = 1
-    else:
-        # majority
-        thr = (L + 1) // 2
-        if min_in_mask > 0:
-            thr = max(1, min(L, min_in_mask))
-
-    keep = counts >= thr
-    P_out = P[keep]
-    C_out = C[keep] if C is not None else None
-    _log(f"[fusion] kept {P_out.shape[0]} / {P.shape[0]} (mode={mode}, thr={thr})", on_log)
-
-    fused_points = os.path.join(mesh_dir, "fused_points.ply")
-    _write_points_with_colors(fused_points, P_out, C_out)
-    _log(f"[fusion] saved -> {fused_points}", on_log)
-
-    if export_mesh and HAS_O3D and P_out.shape[0] >= 1500:
+    # (optional) Mesh – per Default AUS, erst aktivieren, wenn Oberfläche stabil ist
+    if export_mesh and HAS_O3D and Pm.shape[0] >= 2000:
         try:
-            pcd = o3d.io.read_point_cloud(fused_points)
+            pcd = o3d.io.read_point_cloud(out_points)
             pcd.estimate_normals()
-            mesh, dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=poisson_depth)
+            mesh, dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+                pcd, depth=int(float(os.getenv("FUSION_POISSON_DEPTH","10")))
+            )
             dens = np.asarray(dens)
-            keep_idx = np.where(dens > np.quantile(dens, 0.02))[0]
-            mesh = mesh.select_by_index(keep_idx)
-            fused_mesh = os.path.join(mesh_dir, "fused_mesh.ply")
-            o3d.io.write_triangle_mesh(fused_mesh, mesh)
-            _log(f"[fusion] mesh saved -> {fused_mesh}", on_log)
+            keep = dens > np.quantile(dens, 0.02)
+            mesh = mesh.select_by_index(np.where(keep)[0])
+            out_mesh = os.path.join(mesh_dir, "fused_mesh.ply")
+            o3d.io.write_triangle_mesh(out_mesh, mesh)
+            log and log(f"[fusion] saved -> {out_mesh}")
         except Exception as e:
-            _log(f"[fusion] meshing failed: {e}", on_log)
+            log and log(f"[fusion] WARN: poisson failed: {e}")
 
-    return fused_points
+    return out_points
