@@ -1,16 +1,4 @@
 
-# Wichtige ENV:
-#   MVS_DEVICE=cuda (erforderlich, GPU-only)
-#   MVS_REF_STRATEGY=auto|bestk|step  (auto)
-#   MVS_REF_TOPK=40                   (0 = deaktiviert)
-#   MVS_REF_MIN_GAP=2                 (Mindestabstand bei bestk)
-#   MVS_REF_STEP=3                    (bei step)
-#   MVS_SEED_SAMPLE=200000            (max #Sparse-Punkte für Selektion, zufällig)
-#   MVS_SEED_RADIUS=2, MVS_SEED_MIN=200
-#   MVS_FILL_ITERS=150, MVS_BETA=4.0, MVS_MASK_PAD=6
-#   MVS_EXPORT_MESH=true, MVS_POISSON_DEPTH=10
-#   MVS_SCALE=1.0
-#
 from __future__ import annotations
 import os, glob
 from typing import List, Tuple
@@ -25,7 +13,6 @@ except Exception:
 
 GLOBAL_INTRINSICS_K = None  # vom Runner gesetzt
 
-# --------------------- Utils / I/O ---------------------
 
 def _mkdir(p: str): os.makedirs(p, exist_ok=True)
 
@@ -123,7 +110,7 @@ def _load_poses_npz(poses_npz_path):
     idx = npz.get("frame_idx", np.arange(len(R_all)))
     return R_all, t_all, idx
 
-# --------------------- Kamera/Projektion/ROI ---------------------
+# camera / projection / ROI
 
 def _project(K, X_cam):
     x = X_cam[...,0]; y = X_cam[...,1]; z = np.maximum(X_cam[...,2], 1e-9)
@@ -137,11 +124,10 @@ def _estimate_roi_from_mask(mask, pad=6):
     x0 = max(0, xs.min()-pad); x1 = min(mask.shape[1], xs.max()+1+pad)
     return y0, y1, x0, x1
 
-# --------------------- Seeds aus sparse in Frame ---------------------
 
 def _sparse_to_depth_seeds(K, R_ref, t_ref, sparse_pts, mask_ref, seed_radius=2,
                            sample_max: int | None = None):
-    """Projiziere sparse in den Ref-Frame → Depth-Seed-Map + Seed-Maske."""
+    """Project sparse into the reference frame - Depth seed map + Seed mask."""
     H, W = mask_ref.shape[:2]
     seed_depth = np.full((H, W), np.nan, np.float32)
     seed_mask  = np.zeros((H, W), np.uint8)
@@ -185,7 +171,7 @@ def _sparse_to_depth_seeds(K, R_ref, t_ref, sparse_pts, mask_ref, seed_radius=2,
         seed_mask[y0:y1, x0:x1]  = sub_mask
     return seed_depth, seed_mask
 
-# --------------------- Edge-aware GPU-Füllung ---------------------
+# Edge-aware GPU-filling
 
 def _edge_aware_fill_gpu(seed_depth, seed_mask, ref_img, roi, mask_ref,
                          iters=150, beta=4.0, device_str="cuda"):
@@ -243,7 +229,7 @@ def _edge_aware_fill_gpu(seed_depth, seed_mask, ref_img, roi, mask_ref,
 
     return D.squeeze().detach().cpu().numpy()
 
-# --------------------- Frame-Scoring & Auswahl ---------------------
+# Frame scoring and selection
 
 def _score_frames_by_seeds(K, R_all, t_all, sparse_pts, masks, seed_radius: int,
                            sample_max: int, on_log=None):
@@ -281,7 +267,7 @@ def _choose_ref_indices(N, scores, strategy: str, step: int, topk: int, min_gap:
         step = max(1, int(step))
         return list(range(0, N, step))
 
-    # bestk (greedy mit Mindestabstand)
+    # bestk
     idx_sorted = np.argsort(-scores)  # desc
     chosen = []
     for i in idx_sorted:
@@ -291,7 +277,7 @@ def _choose_ref_indices(N, scores, strategy: str, step: int, topk: int, min_gap:
     chosen.sort()
     return chosen
 
-# --------------------- Hauptlauf: Sparse-Paint ---------------------
+# Sparse paint
 
 def run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_dir,
                          on_log=None, on_progress=None):
@@ -319,7 +305,7 @@ def run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_di
 
     R_all, t_all, frame_idx = _load_poses_npz(poses_npz)
     frame_files = _sorted_frames(frames_dir)
-    if len(frame_files) == 0: raise RuntimeError(f"Keine Frames in {frames_dir} gefunden.")
+    if len(frame_files) == 0: raise RuntimeError(f"No frames found in {frames_dir}.")
     images = [_load_color(f) for f in frame_files]
 
     if masks_dir and os.path.isdir(masks_dir):
@@ -341,7 +327,7 @@ def run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_di
     sparse_path = os.path.join(mesh_dir, "sparse.ply")
     sparse_pts  = _read_sparse_points(sparse_path)
 
-    # Frame-Scoring & Auswahl
+    # Frame scoring and selection
     scores = _score_frames_by_seeds(K, R_all, t_all, sparse_pts, masks, SEED_R, SAMPLE_MAX, on_log)
     refs = _choose_ref_indices(len(images), scores, REF_STRAT, REF_STEP, REF_TOPK, REF_MIN_G)
     _log(f"[sparse-paint] selection strategy={REF_STRAT}  step={REF_STEP}  topk={REF_TOPK}  min_gap={REF_MIN_G}", on_log)
@@ -372,7 +358,7 @@ def run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_di
         depth_roi = _edge_aware_fill_gpu(seed_depth, seed_mask, ref_img, ROI, ref_msk,
                                          iters=FILL_ITERS, beta=BETA, device_str="cuda")
 
-        # Depth zurück ins volle Bild
+        # Depth back to full image
         depth_full = np.zeros(ref_msk.shape, np.float32)
         depth_full[y0:y1, x0:x1] = depth_roi
 
@@ -387,7 +373,7 @@ def run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_di
         cv.imwrite(os.path.join(depth_dir, f"depth_{ridx:04d}.png"), vis)
         np.save(os.path.join(depth_dir, f"depth_{ridx:04d}.npy"), depth_full)
 
-        # Back-Projection (nur Maske)
+        # Back-Projection (just masked part if masking true)
         ys, xs = np.where(ref_msk>0)
         if ys.size == 0: continue
         z = depth_full[ys, xs].astype(np.float32)
@@ -401,7 +387,7 @@ def run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_di
         Xw = (R_all[ridx].T @ x_cam.T + (-R_all[ridx].T @ t_all[ridx]).reshape(3,1)).T
         cols = ref_img[ys, xs]
 
-        # pro-Ref PLY (optional)
+        # ref_points.ply for every pose choosen (optional)
         if HAS_O3D:
             pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(Xw))
             pcd.colors = o3d.utility.Vector3dVector(cols[:, ::-1] / 255.0)  # BGR->RGB
@@ -410,9 +396,9 @@ def run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_di
         all_pts.append(Xw.astype(np.float32)); all_cols.append(cols.astype(np.uint8))
 
 
-    _log("[ui] Done Sparse-Paint.", on_log)    # ... am Ende von run_sparse_paint_gpu(), NACH der Schleife über refs:
+    _log("[ui] Done Sparse-Paint.", on_log)
 
-    # >>> NEU: Merge & Carve, falls aktiviert
+    # Carving with masks
     if str(os.getenv("CARVE_ENABLE", "false")).lower() in ("1","true","yes","on"):
         try:
             out = merge_all_points_ref_and_carve(mesh_dir, frames_dir, masks_dir, poses_npz, on_log=on_log)
@@ -423,7 +409,7 @@ def run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_di
 
 
 
-# --------------------- Wrapper (API-kompatibel) ---------------------
+# ENV wrapper
 
 def _set_env_from_args(scale, max_views, n_planes, depth_expand, patch, cost_thr,
                        min_valid_frac, poisson_depth, mode: str):
@@ -480,7 +466,7 @@ def reconstruct_mvs_depth_and_mesh_all(paths, K,
     run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_dir,
                          on_log=on_log, on_progress=on_progress)
 
-# --- Merge & Carve: alle points_ref_* zusammenführen und mit Masken „schneiden“ ---
+# Merge & Carve: all points_ref_* fused and cut with all ref /all masks
 
 def _read_points_ref_with_colors(ply_path):
     if not os.path.isfile(ply_path):
@@ -544,8 +530,8 @@ def _save_colored_ply_any(P, C, out_path):
 def _carve_points_with_masks(P, K, R_all, t_all, masks, depth_dir=None,
                              mode="all", use_depth=False, depth_tol=0.03, chunk=400000, on_log=None):
     """
-    P: Nx3 in Weltkoordinaten.
-    masks: Liste [len(views)] aus 2D-Masken (oder None).
+    P: Nx3 in world coordinates.
+    masks: List [len(views)] of 2D masks (or None).
     mode: "all" (AND), "majority", "any".
     use_depth: z <= depth(u,v) + tol*(1+depth)
     """
@@ -557,7 +543,7 @@ def _carve_points_with_masks(P, K, R_all, t_all, masks, depth_dir=None,
 
     for vi in range(V):
         m = masks[vi]
-        if m is None:  # ohne Maske ignorieren wir diese Sicht
+        if m is None:  # if no masks: this part is ignored
             continue
         H,W = m.shape[:2]
         R = R_all[vi]; t = t_all[vi]
@@ -568,7 +554,7 @@ def _carve_points_with_masks(P, K, R_all, t_all, masks, depth_dir=None,
             if os.path.isfile(p):
                 try: D = np.load(p)
                 except: D = None
-        # Projizieren in Chunks
+        # Project in chunks
         Cc = (-R.T @ t).reshape(3)
         for s in range(0, N, chunk):
             e = min(N, s+chunk)
@@ -597,10 +583,10 @@ def _carve_points_with_masks(P, K, R_all, t_all, masks, depth_dir=None,
 
 def merge_all_points_ref_and_carve(mesh_dir, frames_dir, masks_dir, poses_npz, on_log=None):
     """
-    1) Lädt ALLE points_ref_*.ply im mesh_dir und merged sie.
-    2) Carvt die gemergte Cloud mit allen Masken (oder nur mit den ausgewählten Refs),
-       je nach ENV (CARVE_USE_ALL_MASKS, CARVE_MODE, CARVE_USE_DEPTH, CARVE_DEPTH_TOL).
-    3) Speichert fused_points.ply
+    1) Load all points_ref_*.ply in mesh_dir and merge.
+    2) Carve fused point cloud with all / all selected masks, as configured with ENV
+        (CARVE_USE_ALL_MASKS, CARVE_MODE, CARVE_USE_DEPTH, CARVE_DEPTH_TOL).
+    3) Saves fused_points.ply
     """
     _log("[carve] merge & carve start", on_log)
     K = globals().get("GLOBAL_INTRINSICS_K", None)
@@ -614,7 +600,7 @@ def merge_all_points_ref_and_carve(mesh_dir, frames_dir, masks_dir, poses_npz, o
     depth_tol = float(os.getenv("CARVE_DEPTH_TOL", "0.03"))
     chunk   = int(float(os.getenv("CARVE_CHUNK","400000")))
 
-    # 1) alle points_ref_* laden
+    # 1) Load points_ref_*
     plys = sorted(glob.glob(os.path.join(mesh_dir, "points_ref_*.ply")))
     if not plys:
         raise RuntimeError("[carve] keine points_ref_*.ply gefunden")
@@ -631,7 +617,7 @@ def merge_all_points_ref_and_carve(mesh_dir, frames_dir, masks_dir, poses_npz, o
     C = np.concatenate(C_list, axis=0) if all(c is not None for c in C_list) else None
     _log(f"[carve] stacked: {P.shape[0]} pts", on_log)
 
-    # 2) Masken & Posen laden
+    # 2) Load masks and poses
     R_all, t_all, _ = _load_poses_npz(poses_npz)
     frame_files = _sorted_frames(frames_dir)
     masks_all = [_mask_for_frame(masks_dir, f) for f in frame_files]
@@ -639,7 +625,7 @@ def merge_all_points_ref_and_carve(mesh_dir, frames_dir, masks_dir, poses_npz, o
     if use_all:
         view_ids = list(range(min(len(frame_files), len(R_all))))
     else:
-        # nur Sichten verwenden, für die es ein points_ref_* gab
+        # only use views which have existing points_ref_*-files
         view_ids = sorted(set(int(os.path.basename(p).split("_")[2].split(".")[0]) for p in plys))
 
     masks = [masks_all[i] if 0 <= i < len(masks_all) else None for i in view_ids]
@@ -656,7 +642,7 @@ def merge_all_points_ref_and_carve(mesh_dir, frames_dir, masks_dir, poses_npz, o
     Ck = (C[keep] if C is not None else None)
     _log(f"[carve] after carving: {Pk.shape[0]} pts", on_log)
 
-    # optional leichtes Downsample zur Stabilisierung
+    # optional little downsampling
     try:
         import open3d as o3d
         pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(Pk))
