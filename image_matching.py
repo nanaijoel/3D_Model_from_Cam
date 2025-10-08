@@ -1,6 +1,4 @@
-# image_matching.py
-# LightGlue/Classic Matching für bereits extrahierte Features (*.npz in features_dir).
-# Rückgabe: (pairs, matches) und optionales Speichern nach projects/.../matches/matches.npz
+
 
 import os
 from typing import List, Tuple, Optional, Dict
@@ -18,14 +16,13 @@ def _log(msg: str, fn=None):
 
 
 def _safe_load_npz(path: str) -> Dict[str, np.ndarray]:
-    """Lädt unsere Feature-Datei robust (kps, des, shape, optional scores)."""
-    d = np.load(path, allow_pickle=True)  # allow_pickle für evtl. spätere Erweiterungen
+    d = np.load(path, allow_pickle=True)
     out = {
         "kps": d["kps"],                            # (N,7)
         "des": d["des"].astype(np.float32),         # (N,D) oder (0,D)
         "shape": tuple(d["shape"].tolist())         # (H,W)
     }
-    # optional: scores (N,) falls vorhanden
+
     if "scores" in d.files:
         out["scores"] = d["scores"].astype(np.float32)
     return out
@@ -39,7 +36,7 @@ def _kps_to_xy(kps_np: np.ndarray) -> np.ndarray:
 
 def _infer_features_name_from_dim(dim: int) -> Optional[str]:
     if dim == 256: return "superpoint"
-    if dim == 128: return "disk"      # ggf. andere 128-D Varianten
+    if dim == 128: return "disk"
     if dim == 64:  return "aliked"
     return None
 
@@ -54,11 +51,7 @@ def _call_lightglue_try_both_apis(
     k1: np.ndarray, d1: np.ndarray, s1: np.ndarray, hw1: Tuple[int, int],
     device: str,
 ) -> np.ndarray:
-    """
-    Ruft LightGlue auf und extrahiert Matches.
-    Probiert zuerst die "suffixed keys"-API, dann die "image0/image1"-API.
-    Gibt (M,2) int32 zurück.
-    """
+
     H0, W0 = hw0
     H1, W1 = hw1
     t_k0 = torch.from_numpy(k0)[None].to(device)       # [1,N0,2]
@@ -79,7 +72,7 @@ def _call_lightglue_try_both_apis(
                 "scores0": t_s0, "scores1": t_s1,
                 "image_size0": t_sz0, "image_size1": t_sz1,
             })
-            # Neue/alte Rückgabeformate abfangen
+
             if "matches" in out:  # [B,M,2]
                 m = out["matches"][0].detach().cpu().numpy().astype(np.int32)
                 return m
@@ -91,7 +84,6 @@ def _call_lightglue_try_both_apis(
                 valid1 = mvec[valid0].astype(np.int32)
                 return np.stack([valid0, valid1], axis=1).astype(np.int32)
         except Exception:
-            # Fallback auf zweite API
             pass
 
         # 2) image0/image1-API
@@ -123,7 +115,6 @@ def _call_lightglue_try_both_apis(
         except Exception:
             pass
 
-    # Wenn alles fehlschlägt:
     return np.empty((0, 2), np.int32)
 
 
@@ -139,7 +130,7 @@ def build_pairs(
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # --- Feature-Dateien finden
+    # find feature data files
     fnames = sorted([f for f in os.listdir(features_dir) if f.startswith("features_") and f.endswith(".npz")])
     paths = [os.path.join(features_dir, f) for f in fnames]
     N = len(paths)
@@ -147,7 +138,7 @@ def build_pairs(
         _log("[match] not enough frames", on_log)
         return np.empty((0, 2), np.int32), []
 
-    # --- Descriptor-Dim bestimmen
+    # Define descriptor-dim
     first_dim = None
     for p in paths:
         f = _safe_load_npz(p)
@@ -165,7 +156,7 @@ def build_pairs(
         features_name = _infer_features_name_from_dim(first_dim) or "superpoint"
     exp_dim = _expected_dim_from_name(features_name)
 
-    # --- Matcher vorbereiten
+    # Preprocess matcher
     lg = None
     classic = None
     if backend.lower() == "lightglue":
@@ -187,7 +178,7 @@ def build_pairs(
     elif lg is None:
         raise RuntimeError("LightGlue not available and descriptors are not 128-D; cannot match.")
 
-    # --- Nachbarschafts-Paare
+    # Neighbor pairs
     span = 5
     pair_list: List[PAIR] = []
     for i in range(N):
@@ -197,7 +188,7 @@ def build_pairs(
     pairs_out: List[List[int]] = []
     matches_out: List[np.ndarray] = []
 
-    # --- Matching
+    # Matching
     for (i, j) in pair_list:
         Fi = _safe_load_npz(paths[i])
         Fj = _safe_load_npz(paths[j])
@@ -207,7 +198,6 @@ def build_pairs(
         d0 = Fi["des"]
         d1 = Fj["des"]
 
-        # Leere Frames/Dimension prüfen
         if d0.ndim != 2 or d1.ndim != 2 or d0.shape[0] == 0 or d1.shape[0] == 0:
             _log(f"[match] skip pair ({i},{j}): empty descriptors", on_log)
             pairs_out.append([i, j])
@@ -220,12 +210,13 @@ def build_pairs(
             matches_out.append(np.empty((0, 2), np.int32))
             continue
 
-        # Scores (falls nicht vorhanden -> 1en)
+        # Scores
         s0 = Fi.get("scores", np.ones((len(k0),), np.float32))
         s1 = Fj.get("scores", np.ones((len(k1),), np.float32))
         H0, W0 = Fi["shape"]
         H1, W1 = Fj["shape"]
 
+        # If lightglue, use corresponding variables, else classic BF
         if lg is not None:
             m = _call_lightglue_try_both_apis(
                 lg, k0, d0, s0, (H0, W0),
@@ -233,7 +224,7 @@ def build_pairs(
                 device
             )
         else:
-            # Classic BF + Ratio-Test
+
             knn = classic.knnMatch(d0, d1, k=2)
             good = []
             for a, b in knn:

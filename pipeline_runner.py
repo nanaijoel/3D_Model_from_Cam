@@ -1,4 +1,4 @@
-# pipeline_runner.py — abgestimmt auf Sparse-Paint (GPU-only), ohne ref_index-Gefummel
+
 import os, json
 import numpy as np
 import cv2 as cv
@@ -14,7 +14,7 @@ from meshing import (
     save_point_cloud,
     reconstruct_mvs_depth_and_mesh,
     reconstruct_mvs_depth_and_mesh_all)
-# ---------------- config utils ----------------
+
 
 def _load_yaml_or_json(path: str) -> Dict[str, Any]:
     ext = os.path.splitext(path)[1].lower()
@@ -64,7 +64,7 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
             except Exception: return default
         return default
 
-    # ---------- FEATURES ----------
+    # FEATURES
     fe = cfg.get("features", {})
     setenv("FEATURE_BACKEND", fe.get("backend"))
     setenv("FEATURE_DEVICE", fe.get("device"))
@@ -95,13 +95,13 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("FEATURE_SIFT_EDGE", int(pick_num(sf.get("edge", 12))))
     setenv("FEATURE_SIFT_SIGMA", pick_num(sf.get("sigma", 1.2)))
 
-    # ---------- MASKING ----------
+    # MASKING
     mask_cfg = cfg.get("masking", {})
     setenv("MASK_ENABLE", pick_bool(mask_cfg.get("enable", False)))
     setenv("MASK_METHOD", mask_cfg.get("method"))
     setenv("MASK_OVERWRITE_IMAGES", pick_bool(mask_cfg.get("overwrite_images", False)))
 
-    # ---------- MATCHING ----------
+    # MATCHING
     ma = cfg.get("matching", {})
     setenv("MATCH_BACKEND", ma.get("backend"))
     setenv("MATCH_RATIO", pick_num(ma.get("ratio", 0.82)))
@@ -111,7 +111,7 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     if "features" in ma:
         setenv("MATCH_FEATURES", str(ma["features"]).lower())
 
-    # ---------- SFM ----------
+    # SFM
     sfm = cfg.get("sfm", {})
     setenv("SFM_INIT_RATIO", pick_num(sfm.get("init_ratio", 0.5)))
     setenv("SFM_INIT_MAX_SPAN", pick_num(sfm.get("init_max_span", 6)))
@@ -121,7 +121,7 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("SFM_POSE_SMOOTHING", pick_bool(sfm.get("pose_smoothing", True)))
     setenv("SFM_SMOOTH_LAMBDA", pick_num(sfm.get("smooth_lambda", 0.25)))
 
-    # ---------- MVS / Sparse-Paint ----------
+    # MVS / Sparse-Paint
     mvs = cfg.get("mvs", {})
     setenv("MVS_ENABLE", pick_bool(mvs.get("enable", True)))
     setenv("MVS_MODE", (mvs.get("mode", "all") or "all"))
@@ -147,7 +147,7 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("MVS_EXPORT_MESH", mp.get("export_mesh"))
     setenv("MVS_POISSON_DEPTH", mp.get("poisson_depth"))
 
-    # ---------- CARVE ----------
+    # CARVE
     cv = cfg.get("carve", {}) or {}
     setenv("CARVE_ENABLE", cv.get("enable"))
     setenv("CARVE_USE_ALL_MASKS", cv.get("use_all_masks"))
@@ -173,7 +173,7 @@ def _dump_resolved_config(project_root: str) -> str:
             json.dump(kv, f, indent=2, ensure_ascii=False)
     return out_path
 
-# ---------------- pipeline runner ----------------
+
 class PipelineRunner:
     def __init__(self, base_dir: str, on_log: Callable[[str], None], on_progress: Callable[[int, str], None]):
         self.base_dir = base_dir
@@ -194,13 +194,13 @@ class PipelineRunner:
         else:
             cfg = {}
 
-        # --- 1) frames
+        # 1) frames
         imgs = extract_and_save_frames(video_path, target_frames, paths.raw_frames, log, prog)
         if not imgs:
             raise RuntimeError("No frames were extracted.")
         log(f"[frames] saved: {len(imgs)}")
 
-        # --- 2) optional masking / preprocessing
+        # 2) optional masking / preprocessing
         prog(20, "Image preprocessing / masking")
         if _parse_bool(os.getenv("MASK_ENABLE", "false"), False):
             log("[mask] preprocessing enabled")
@@ -217,12 +217,12 @@ class PipelineRunner:
                 save_debug=True
             )
 
-        # --- 3) features
+        # 3) features
         kps, descs, shapes, meta = extract_features(imgs, paths.features, log, prog)
         if not kps or not shapes:
             raise RuntimeError("Feature extraction returned no keypoints.")
 
-        # --- 4) matching
+        # 4) matching
         ratio = float(os.getenv("MATCH_RATIO", "0.82"))
         device = os.getenv("FEATURE_DEVICE", "cuda")
         pairs_np, matches_list = build_pairs(
@@ -234,7 +234,7 @@ class PipelineRunner:
             save_dir=paths.matches
         )
 
-        # ---- convert to SfM format
+        # convert to SfM format
         def _as_sfm_matches(pairs_arr: np.ndarray, matches_any) -> Dict[tuple[int, int], list]:
             mdict: Dict[tuple[int, int], list] = {}
             for (i, j), m in zip(pairs_arr.tolist(), matches_any):
@@ -251,7 +251,7 @@ class PipelineRunner:
 
         matches_for_sfm = _as_sfm_matches(pairs_np, matches_list)
 
-        # --- 5) intrinsics (pinhole guess)
+        # 5) intrinsics (pinhole guess)
         h, w = shapes[0]
         focal = 0.92 * float(max(w, h))
         pp = (w / 2.0, h / 2.0)
@@ -263,7 +263,7 @@ class PipelineRunner:
         snap = _dump_resolved_config(paths.root)
         log(f"[pipeline] saved resolved config -> {snap}")
 
-        # --- 6) SfM
+        # 6) SfM
         cfg_sfm = SfMConfig(
             INIT_WINDOW_RATIO=float(os.getenv("SFM_INIT_RATIO", "0.5")),
             INIT_MAX_SPAN=int(float(os.getenv("SFM_INIT_MAX_SPAN", "6"))),
@@ -281,7 +281,7 @@ class PipelineRunner:
             poses_out_dir=poses_dir, config=cfg_sfm
         )
 
-        # --- 7) save sparse cloud
+        # 7) save sparse cloud
         if not (isinstance(res, tuple) and len(res) >= 1):
             raise RuntimeError("SfM did not return a points array.")
         points3d = np.asarray(res[0], dtype=np.float64).reshape(-1, 3)
@@ -293,7 +293,7 @@ class PipelineRunner:
         log(f"[sfm] raw_points(after validation)={points3d.shape[0]:d}")
         log(f"[ui] Done: {sparse_ply}")
 
-        # --- 8) Sparse-Paint (GPU)
+        # 8) Sparse-Paint (GPU)
         if _parse_bool(os.getenv("MVS_ENABLE", "true"), True):
             log("Sparse-Paint (sparse-guided depth completion)")
             try:
@@ -306,7 +306,7 @@ class PipelineRunner:
                     poisson_depth=int(os.getenv("MVS_POISSON_DEPTH","10")),
                     on_log=log, on_progress=prog
                 )
-                # Der Wrapper-Namen bleibt aus Kompatibilität; Auswahl passiert in meshing.py
+
                 if mode == "all":
                     reconstruct_mvs_depth_and_mesh_all(**common_kwargs)
                 else:

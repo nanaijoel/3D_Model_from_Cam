@@ -6,12 +6,8 @@ import numpy as np
 import torch
 
 
-# helper
 def _make_lg_extractor(kind: str, device: str, max_kp: int, log=print):
-    """
-    Erzeugt SuperPoint/DISK/ALIKED mit per ENV steuerbaren Parametern.
-    Nur Argumente, die der jeweilige Konstruktor unterstützt, werden übergeben.
-    """
+    """ Create Lightglue keypoints via SuperPoint/DISK/ALIKED, controlled by ENV variable in config.yaml."""
     det_thr = float(os.getenv("FEATURE_LG_DET_THR", "0.001"))  # kleiner => mehr Punkte
     nms_r   = int(os.getenv("FEATURE_LG_NMS", "3"))
     resize  = int(os.getenv("FEATURE_LG_RESIZE", "1024"))
@@ -38,7 +34,7 @@ def _make_lg_extractor(kind: str, device: str, max_kp: int, log=print):
 
 
 def _rootsift(des: Optional[np.ndarray]) -> Optional[np.ndarray]:
-    """Wandelt SIFT-Deskriptoren in RootSIFT."""
+    """Exchange SIFT-Descriptors to RootSIFT."""
     if des is None or len(des) == 0:
         return des
     des = des.astype(np.float32)
@@ -47,7 +43,7 @@ def _rootsift(des: Optional[np.ndarray]) -> Optional[np.ndarray]:
 
 
 def _kp_to_np(kps: List[cv.KeyPoint]) -> np.ndarray:
-    """KeyPoints → flaches Array (zum Speichern)"""
+    """KeyPoints - save flat array"""
     out = np.zeros((len(kps), 7), np.float32)
     for i, k in enumerate(kps):
         out[i] = (k.pt[0], k.pt[1], k.size, k.angle, k.response, k.octave, k.class_id)
@@ -55,13 +51,13 @@ def _kp_to_np(kps: List[cv.KeyPoint]) -> np.ndarray:
 
 
 def _to_tensor(img_gray: np.ndarray) -> torch.Tensor:
-    """Graubild - LightGlue-Input-Format"""
+    """gray image - LightGlue input format"""
     t = torch.from_numpy(img_gray).float() / 255.0
     return t[None, None, :, :]
 
 
 def _sp_to_cv_kp(sp_kp: torch.Tensor, scores: torch.Tensor) -> List[cv.KeyPoint]:
-    """LightGlue-Keypoints + Scores → OpenCV-KeyPoints"""
+    """LightGlue-Keypoints + Scores - OpenCV-KeyPoints"""
     kps: List[cv.KeyPoint] = []
     xy = sp_kp.detach().cpu().numpy()
     sc = scores.detach().cpu().numpy()
@@ -72,8 +68,8 @@ def _sp_to_cv_kp(sp_kp: torch.Tensor, scores: torch.Tensor) -> List[cv.KeyPoint]
 
 def _ensure_desc_is_NC(des_np: np.ndarray, n_kp: int) -> np.ndarray:
     """
-    Bringt Deskriptor-Array robust auf [N, C].
-    Viele LG-Backends liefern [C, N]; hier transponieren wir falls nötig.
+    convert descriptor array to consistent [N, C].
+    Mostly LG-Backends deliver [C, N]; transpose if necessary.
     """
     if des_np.ndim != 2:
         return des_np
@@ -90,7 +86,7 @@ def _filter_kp_des_scores(
     dilate: int = 3
 ) -> Tuple[List[cv.KeyPoint], Optional[np.ndarray], Optional[np.ndarray]]:
     """
-    Filtert Keypoints, Deskriptoren UND Scores anhand einer 0/255-Maske.
+    Filter keypoints, descriptor and cores by the 0/255-mask.
     Für learned Backends (SuperPoint/DISK/ALIKED).
     """
     if mask is None or len(kps) == 0:
@@ -122,8 +118,7 @@ def _filter_kp_des_scores(
 
 def _boost_gray(gray0: np.ndarray) -> np.ndarray:
     """
-    Optionales Vorprocessing: CLAHE + Unsharp + leichtes Dithering.
-    Alles per ENV steuerbar.
+    Optional preprocessing: CLAHE + Unsharp + small Dithering.
     """
     use_clahe   = os.getenv("FEATURE_PREPROC_CLAHE", "1").lower() in ("1","true","yes")
     use_unsharp = os.getenv("FEATURE_PREPROC_UNSHARP", "1").lower() in ("1","true","yes")
@@ -242,7 +237,7 @@ def extract_features(
         gray0 = cv.cvtColor(img_bgr, cv.COLOR_BGR2GRAY)
         gray = _boost_gray(gray0)
 
-        # Maske laden (falls aktiviert und vorhanden)
+        # Load masks if activated
         mask = None
         if use_mask:
             mpath = os.path.join(mask_dir, os.path.splitext(os.path.basename(path))[0] + "_mask.png")
@@ -250,7 +245,7 @@ def extract_features(
                 mask = cv.imread(mpath, cv.IMREAD_GRAYSCALE)
 
         if backend == "superpoint" and sp is not None:
-            # ---- Learned Features (SP/DISK/ALIKED via LightGlue) ----
+            # Learned Features (SP/DISK/ALIKED via LightGlue)
             with torch.no_grad():
                 tin = _to_tensor(gray).to(device)
                 out = sp({"image": tin})
@@ -263,7 +258,7 @@ def extract_features(
                     raise KeyError("LightGlue features: 'scores' or 'keypoint_scores' missing.")
                 sc_t = sc_t[0]                          # [N]
 
-                desc_t = out["descriptors"][0]         # [C, N] ODER [N, C]
+                desc_t = out["descriptors"][0]         # [C, N] or [N, C] ?
                 img_size_t = out.get("image_size", None)
                 if img_size_t is not None:
                     H, W = int(img_size_t[0, 0].item()), int(img_size_t[0, 1].item())
@@ -275,15 +270,15 @@ def extract_features(
                     des_np = np.empty((0, 256), np.float32)
                     sc_np = np.empty((0,), np.float32)
                 else:
-                    # Tensor → numpy
+                    # Tensor to numpy conversion
                     kps = _sp_to_cv_kp(kp_t, sc_t)
                     des_np = desc_t.detach().cpu().numpy().astype(np.float32)
                     sc_np = sc_t.detach().cpu().numpy().astype(np.float32)
 
-                    # Deskriptoren auf [N, C]
+                    # Descriptors for [N, C]
                     des_np = _ensure_desc_is_NC(des_np, n_kp=len(kps))
 
-                    # Maskenfilter anwenden
+                    # Use filter mask
                     kps, des_np, sc_np = _filter_kp_des_scores(
                         kps, des_np, sc_np, mask, dilate=mask_dilate if mask is not None else 0
                     )
@@ -312,7 +307,7 @@ def extract_features(
         if N:
             prog(30 + (i + 1) / max(1, N) * 10, f"Feature Extraction ({lg_name or backend})")
 
-        # Persistenter Dump (für spätere Schritte)
+        # Persistent dump (for later steps
         des_last = descriptors[-1]
         des_last = des_last.astype(np.float32).reshape(-1, des_last.shape[-1]) if des_last is not None else np.empty((0,128),np.float32)
         np.savez(

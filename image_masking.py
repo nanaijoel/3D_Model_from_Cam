@@ -1,4 +1,3 @@
-# image_masking.py
 import os
 from typing import List, Tuple, Optional, Dict
 import cv2 as cv
@@ -6,13 +5,11 @@ import numpy as np
 
 Mask = np.ndarray  # uint8, 0/255
 
-# --- Optionale Backends:
+# --- Optional backends:
 # A) rembg (U^2-Net) -> pip install rembg
 # B) SAM 2           -> pip install git+https://github.com/facebookresearch/sam2.git
-#                      und ein Checkpoint, Pfad via env SAM2_CKPT (z.B. checkpoints/sam2_hiera_tiny.pt)
-# Hinweis: Wenn Backend fehlt, liefern wir eine "volle" Maske (255), damit die Pipeline nicht bricht.
+#                      and create a checkpoint path via env SAM2_CKPT (e.g. checkpoints/sam2_hiera_tiny.pt)
 
-# -------- Utils --------
 def _ensure_dir(d: str):
     os.makedirs(d, exist_ok=True)
 
@@ -24,7 +21,7 @@ def _postprocess_mask(m: Mask, open_k: int = 3, close_k: int = 5) -> Mask:
         m = cv.morphologyEx(m, cv.MORPH_CLOSE, cv.getStructuringElement(cv.MORPH_ELLIPSE, (close_k, close_k)))
     return m
 
-# -------- rembg (U^2-Net) --------
+# rembg (U^2-Net)
 def _rembg_mask(img_bgr: np.ndarray, alpha_thr: float = 0.5) -> Mask:
     try:
         from rembg import remove
@@ -36,7 +33,7 @@ def _rembg_mask(img_bgr: np.ndarray, alpha_thr: float = 0.5) -> Mask:
     img_rgb = cv.cvtColor(img_bgr, cv.COLOR_BGR2RGB)
     pil_in = Image.fromarray(img_rgb)
     try:
-        pil_out = remove(pil_in)  # RGBA Image mit Alpha-Matte
+        pil_out = remove(pil_in)  # RGBA Image with alpha mat
     except Exception as e:
         print(f"[mask][rembg] remove failed: {e}")
         return np.full(img_bgr.shape[:2], 255, np.uint8)
@@ -45,13 +42,13 @@ def _rembg_mask(img_bgr: np.ndarray, alpha_thr: float = 0.5) -> Mask:
     if out_np.ndim == 3 and out_np.shape[2] == 4:
         alpha = out_np[:, :, 3].astype(np.float32) / 255.0
     else:
-        # Falls kein Alpha geliefert wird, alles FG
+        # if no alpha delivered, all FG
         alpha = np.ones(img_bgr.shape[:2], np.float32)
 
     m = (alpha >= float(alpha_thr)).astype(np.uint8) * 255
     return _postprocess_mask(m, open_k=3, close_k=5)
 
-# -------- SAM 2 --------
+# SAM 2
 _SAM2_CACHE = {"predictor": None, "device": "cpu"}
 
 def _get_sam2_predictor() -> Optional[object]:
@@ -82,7 +79,7 @@ def _sam2_mask(img_bgr: np.ndarray, keep: str = "largest") -> Mask:
     img_rgb = cv.cvtColor(img_bgr, cv.COLOR_BGR2RGB)
     try:
         predictor.set_image(img_rgb)
-        # Ohne Prompt: mehrere Kandidatenmasken; wir wählen genau EINE
+        # choose a specific mask
         masks, scores, _ = predictor.predict(
             point_coords=None, point_labels=None, box=None, multimask_output=True
         )
@@ -106,14 +103,14 @@ def _sam2_mask(img_bgr: np.ndarray, keep: str = "largest") -> Mask:
 def build_mask(img_bgr: np.ndarray, method: str = "rembg", params: Optional[Dict] = None) -> Mask:
     """
     method: 'rembg' | 'sam2'
-    Genau EINE finale Binärmaske (0/255) pro Bild.
+    1 binary mask (0/255) per image.
     """
     params = params or {}
     if method == "rembg":
         return _rembg_mask(img_bgr, alpha_thr=float(params.get("alpha_thr", 0.5)))
     if method == "sam2":
         return _sam2_mask(img_bgr, keep=str(params.get("keep", "largest")))
-    # Fallback: keine Maske
+    # Fallback if no masks
     h, w = img_bgr.shape[:2]
     return np.full((h, w), 255, np.uint8)
 
@@ -127,9 +124,8 @@ def preprocess_images(
 ) -> Tuple[List[str], List[str]]:
 
     """
-    Erzeugt pro Bild genau EINE Maske:
+    Create one mask per frame.
       projects/<name>/features/masks/<basename>_mask.png
-    Optional: schreibt FG-boosted Bild zurück (overwrite_images=True).
     """
     _ensure_dir(out_mask_dir)
     mask_paths: List[str] = []
@@ -142,7 +138,7 @@ def preprocess_images(
 
         m = build_mask(img, method=method, params=params)
 
-        # optional: FG leicht boosten – NICHT notwendig für FE-Filtering
+        # optional: FG slightly boosted – not necessary if FE-filtering is used
         if overwrite_images:
             fg = cv.bitwise_and(img, img, mask=m)
             bg = cv.bitwise_and(img, img, mask=cv.bitwise_not(m))
@@ -152,7 +148,7 @@ def preprocess_images(
             merged = cv.add(fg, bg)
             cv.imwrite(p, merged)  # gleicher Ort & Name
 
-        # Maske speichern (genau eine)
+        # Save masks
         base = os.path.splitext(os.path.basename(p))[0]
         mpath = os.path.join(out_mask_dir, f"{base}_mask.png")
         cv.imwrite(mpath, m)

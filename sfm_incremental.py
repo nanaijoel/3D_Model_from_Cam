@@ -1,4 +1,3 @@
-# sfm_incremental.py (refactored, symmetric matches + full-frame evaluation)
 import os
 import numpy as np
 import cv2 as cv
@@ -7,9 +6,6 @@ from dataclasses import dataclass
 from collections import defaultdict
 
 
-# =========================
-# Config
-# =========================
 
 @dataclass
 class SfMConfig:
@@ -78,9 +74,7 @@ class SfMConfig:
     BACKFILL_PASSES: int = 2
 
 
-# =========================
 # Helpers
-# =========================
 
 def _override_cfg_from_env(cfg: SfMConfig):
     """Override selected config fields from environment variables (set via pipeline)."""
@@ -241,9 +235,6 @@ def _pairwise_max_parallax_deg(Kinv, poses_R, poses_t, obs_list):
     return best
 
 
-# =========================
-# Track database
-# =========================
 
 class TrackDB:
     """Manages 3D points, observations and promotion (multi-view validation)."""
@@ -338,9 +329,7 @@ class TrackDB:
                         dtype=float)
 
 
-# =========================
 # Keyframes and smoothing utilities
-# =========================
 
 def _should_be_keyframe(K, poses_R, poses_t, last_kf_idx: int, fi: int,
                         anchors: List[int], kps, matches, track3d, tdb: TrackDB, cfg: SfMConfig) -> bool:
@@ -418,9 +407,7 @@ def _smooth_poses(poses_R: Dict[int, np.ndarray], poses_t: Dict[int, np.ndarray]
         poses_t[i] = -poses_R[i] @ C
 
 
-# =========================
 # Initialization helpers
-# =========================
 
 def _init_window_bounds(N: int, cfg: SfMConfig):
     mid = (cfg.INIT_WINDOW_CENTER if cfg.INIT_WINDOW_CENTER is not None else (N // 2))
@@ -561,9 +548,7 @@ def _initialize_with_pair(best, keypoints, matches, K, on_log=None):
     return (i0, j0), poses_R, poses_t, track3d, TDB
 
 
-# =========================
 # Per-frame utilities
-# =========================
 
 def _count_corr_for_frame(fi: int, visited: set, matches, track3d) -> int:
     c = 0
@@ -860,9 +845,7 @@ def _finalize_output(TDB: TrackDB, poses_R, poses_t, poses_out_dir, on_log=None)
     return pts
 
 
-# =========================
 # Backfill & Refinement
-# =========================
 
 def _backfill_frames(all_frames, poses_R, poses_t, keypoints, matches, K, cfg, track3d, TDB, log, prog):
     """Try to recover poses for frames that were not estimated in the main sweep."""
@@ -921,9 +904,7 @@ def _pose_only_refine_all(poses_R, poses_t, keypoints, matches, K, cfg, track3d,
             pass
 
 
-# =========================
 # Main SfM
-# =========================
 
 def run_sfm(keypoints: List[List[cv.KeyPoint]],
             descriptors: List[np.ndarray],
@@ -1064,56 +1045,3 @@ def run_sfm(keypoints: List[List[cv.KeyPoint]],
     if return_metrics:
         return pts, poses_R, poses_t, metrics
     return pts, poses_R, poses_t
-
-
-# =========================
-# Ensemble wrapper
-# =========================
-
-def run_sfm_multi(keypoints, descriptors, shapes, pairs, matches, K,
-                  n_runs: int = 5,
-                  on_log=None, on_progress=None,
-                  poses_out_dir: Optional[str] = None):
-    """Run SfM multiple times with different init windows and pick the best."""
-    def log(m): on_log and on_log(m)
-    def prog(p, s): on_progress and on_progress(p, s)
-
-    N = len(shapes)
-    centers = np.linspace(N * 0.15, N * 0.85, num=max(2, min(n_runs, 5)), dtype=int)
-    extra = n_runs - len(centers)
-    rng = np.random.default_rng(42)
-    if extra > 0:
-        jitter = np.clip(rng.normal(0, N * 0.05, size=extra).astype(int), -N // 6, N // 6)
-        extra_centers = np.clip(rng.integers(0, N, size=extra) + jitter, 0, N - 1)
-        centers = list(centers) + list(extra_centers)
-
-    trials = []
-    best_score = -1.0
-    best = None
-    for r, c in enumerate(centers):
-        cfg = SfMConfig(INIT_WINDOW_CENTER=int(c))
-        _override_cfg_from_env(cfg)
-        try:
-            pts, Rdict, tdict, metrics = run_sfm(
-                keypoints, descriptors, shapes, pairs, matches, K,
-                on_log=lambda m, r=r: log(f"[run {r + 1}/{len(centers)}] {m}"),
-                on_progress=lambda p, s, r=r: prog(int((r / (len(centers))) * 90 + p / len(centers) * 0.9), s),
-                poses_out_dir=poses_out_dir,
-                config=cfg,
-                return_metrics=True
-            )
-            score = float(metrics.get('num_points', 0)) - 0.5 * float(metrics.get('rejected_frames', 0))
-            trials.append((score, c, (pts, Rdict, tdict, metrics)))
-            if score > best_score:
-                best_score = score
-                best = (pts, Rdict, tdict, dict(best_center=int(c),
-                                                best_init_pair=metrics.get('init_pair'),
-                                                best_score=score))
-        except Exception as e:
-            log(f"[run {r + 1}] failed: {e}")
-
-    if best is None:
-        raise RuntimeError("All ensemble runs failed.")
-    pts, Rdict, tdict, report = best
-    prog(92, "SfM Ensemble – done")
-    return pts, Rdict, tdict, report

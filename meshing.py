@@ -1,17 +1,4 @@
-# meshing.py — GPU-only Sparse-Paint (sparse-guided depth completion + back-projection)
-#
-# Pipeline pro Referenzframe:
-#   1) sparse.ply -> in Frame projizieren -> Depth-Seeds (nur Maske, nur Vorderseite).
-#   2) Edge-aware Depth-Completion (Torch, GPU), Seeds bleiben hart fixiert.
-#   3) Back-Projection aller maskierten Pixel mit finaler Depth -> farbige 3D Punkte.
-#   4) Fusion: optionales Voxel-Downsampling + Poisson (Open3D).
-#
-# Frame-Selektion:
-#   - MVS_REF_STRATEGY=bestk|step|auto
-#     * bestk: nimm die MVS_REF_TOPK Frames mit meisten Seeds, mit Mindestabstand MVS_REF_MIN_GAP
-#     * step : nimm jeden MVS_REF_STEP-ten Frame
-#     * auto : bestk falls TOPK>0, sonst step
-#
+
 # Wichtige ENV:
 #   MVS_DEVICE=cuda (erforderlich, GPU-only)
 #   MVS_REF_STRATEGY=auto|bestk|step  (auto)
