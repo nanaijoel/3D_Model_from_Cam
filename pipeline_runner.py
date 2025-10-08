@@ -14,7 +14,7 @@ from meshing import (
     save_point_cloud,
     reconstruct_mvs_depth_and_mesh,
     reconstruct_mvs_depth_and_mesh_all)
-
+from texturing import texture_points_from_views
 
 def _load_yaml_or_json(path: str) -> Dict[str, Any]:
     ext = os.path.splitext(path)[1].lower()
@@ -64,13 +64,14 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
             except Exception: return default
         return default
 
-    # FEATURES
+
     fe = cfg.get("features", {})
     setenv("FEATURE_BACKEND", fe.get("backend"))
     setenv("FEATURE_DEVICE", fe.get("device"))
     setenv("FEATURE_USE_MASK", fe.get("use_mask"))
     setenv("FEATURE_MAX_KP", pick_num(fe.get("max_kp", 4096)))
     setenv("FEATURE_DEBUG_EVERY", pick_num(fe.get("debug_every", 0)))
+
 
     pp = fe.get("preproc", {})
     setenv("FEATURE_PREPROC_CLAHE", pick_bool(pp.get("clahe", True)))
@@ -83,6 +84,7 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("FEATURE_PREPROC_NOISE_STD", pick_num(pp.get("noise_std", 1.5)))
     setenv("FEATURE_MASK_DILATE", int(pick_num(pp.get("mask_dilate", 5))))
 
+
     lg = fe.get("lg", {})
     setenv("FEATURE_LG_DET_THR", pick_num(lg.get("detection_threshold", 0.001)))
     setenv("FEATURE_LG_NMS", int(pick_num(lg.get("nms", 3))))
@@ -90,18 +92,19 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("FEATURE_LG_REMOVE_BORDERS", int(pick_num(lg.get("remove_borders", 2))))
     setenv("FEATURE_LG_FORCE_NUM", pick_bool(lg.get("force_num", False)))
 
+
     sf = fe.get("sift", {})
     setenv("FEATURE_SIFT_CONTRAST", pick_num(sf.get("contrast", 0.004)))
     setenv("FEATURE_SIFT_EDGE", int(pick_num(sf.get("edge", 12))))
     setenv("FEATURE_SIFT_SIGMA", pick_num(sf.get("sigma", 1.2)))
 
-    # MASKING
+
     mask_cfg = cfg.get("masking", {})
     setenv("MASK_ENABLE", pick_bool(mask_cfg.get("enable", False)))
     setenv("MASK_METHOD", mask_cfg.get("method"))
     setenv("MASK_OVERWRITE_IMAGES", pick_bool(mask_cfg.get("overwrite_images", False)))
 
-    # MATCHING
+
     ma = cfg.get("matching", {})
     setenv("MATCH_BACKEND", ma.get("backend"))
     setenv("MATCH_RATIO", pick_num(ma.get("ratio", 0.82)))
@@ -111,7 +114,7 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     if "features" in ma:
         setenv("MATCH_FEATURES", str(ma["features"]).lower())
 
-    # SFM
+
     sfm = cfg.get("sfm", {})
     setenv("SFM_INIT_RATIO", pick_num(sfm.get("init_ratio", 0.5)))
     setenv("SFM_INIT_MAX_SPAN", pick_num(sfm.get("init_max_span", 6)))
@@ -121,7 +124,7 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("SFM_POSE_SMOOTHING", pick_bool(sfm.get("pose_smoothing", True)))
     setenv("SFM_SMOOTH_LAMBDA", pick_num(sfm.get("smooth_lambda", 0.25)))
 
-    # MVS / Sparse-Paint
+
     mvs = cfg.get("mvs", {})
     setenv("MVS_ENABLE", pick_bool(mvs.get("enable", True)))
     setenv("MVS_MODE", (mvs.get("mode", "all") or "all"))
@@ -130,14 +133,12 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("MVS_DEVICE", mp.get("device", fe.get("device", "cuda")))
     setenv("MVS_SCALE", mp.get("scale"))
 
-    # Auswahlstrategie
     setenv("MVS_REF_STRATEGY", mp.get("ref_strategy"))       # auto|bestk|step
     setenv("MVS_REF_TOPK", mp.get("ref_topk"))               # z.B. 40
     setenv("MVS_REF_MIN_GAP", mp.get("ref_min_gap"))         # z.B. 2
     setenv("MVS_REF_STEP", mp.get("ref_step"))               # z.B. 3
     setenv("MVS_REF_BUCKETS", mp.get("ref_buckets", mp.get("ref_topk", 6)))
 
-    # Seeds/Fill
     setenv("MVS_SEED_RADIUS", mp.get("seed_radius"))
     setenv("MVS_SEED_MIN", mp.get("seed_min"))
     setenv("MVS_SEED_SAMPLE", mp.get("seed_sample"))
@@ -147,7 +148,6 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("MVS_EXPORT_MESH", mp.get("export_mesh"))
     setenv("MVS_POISSON_DEPTH", mp.get("poisson_depth"))
 
-    # CARVE
     cv = cfg.get("carve", {}) or {}
     setenv("CARVE_ENABLE", cv.get("enable"))
     setenv("CARVE_USE_ALL_MASKS", cv.get("use_all_masks"))
@@ -156,8 +156,22 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("CARVE_DEPTH_TOL", cv.get("depth_tol"))       # 0.03
     setenv("CARVE_CHUNK", cv.get("chunk"))
 
+    tx = cfg.get("texturing", {}) or {}
+    setenv("TEXTURE_ENABLE", pick_bool(tx.get("enable", True)))
+    setenv("TEXTURE_DIVISOR", int(pick_num(tx.get("divisor", 6))))
+    setenv("TEXTURE_WEIGHT_POWER", pick_num(tx.get("weight_power", 2.0)))
+    setenv("TEXTURE_IN_PLY", tx.get("in_ply", "fused_points.ply"))
+    setenv("TEXTURE_OUT_PLY", tx.get("out_ply", "fused_textured_points.ply"))
 
 
+def _auto_views(n_frames: int, divisor: int) -> list[int]:
+    import numpy as _np
+    divisor = max(1, int(divisor))
+    if n_frames <= 1:
+        return [0]
+    idx = _np.linspace(0, n_frames - 1, num=divisor + 1, dtype=int)
+    idx = _np.unique(_np.clip(idx, 0, n_frames - 1))
+    return idx.tolist()
 
 
 def _dump_resolved_config(project_root: str) -> str:
@@ -314,16 +328,31 @@ class PipelineRunner:
             except Exception as e:
                 log("[error]\nSparse-Paint failed: " + str(e))
 
-        """
+        # 9) Texturing
         try:
-            from meshing import mesh_from_fused_points
-            mesh_dir = os.path.join(paths.root, "mesh")
-            if os.path.isfile(os.path.join(mesh_dir, "fused_points.ply")):
-                mesh_ply = mesh_from_fused_points(mesh_dir)
-                log(f"[mesh] final surface -> {mesh_ply}")
+            if _parse_bool(os.getenv("TEXTURE_ENABLE", "true"), True):
+                mesh_dir = os.path.join(paths.root, "mesh")
+                in_ply = os.getenv("TEXTURE_IN_PLY", "fused_points.ply")
+                fused_ply = os.path.join(mesh_dir, in_ply)
+                if os.path.isfile(fused_ply):
+                    divisor = int(float(os.getenv("TEXTURE_DIVISOR", "6")))
+                    views = _auto_views(len(imgs), divisor)
+                    out_ply = os.getenv("TEXTURE_OUT_PLY", "fused_textured_points.ply")
+                    wpow = float(os.getenv("TEXTURE_WEIGHT_POWER", "2.0"))
+
+                    log(f"[texture] auto-views (div={divisor}) -> {views}")
+                    out_path = texture_points_from_views(
+                        project_root=paths.root,
+                        view_ids=views,
+                        in_ply=in_ply,
+                        out_ply=out_ply,
+                        weight_power=wpow
+                    )
+                    log(f"[texture] saved: {out_path}")
+                else:
+                    log(f"[texture] skipped (no {fused_ply})")
         except Exception as e:
-            log(f"[mesh] surface build failed: {e}")
-        """
+            log(f"[texture] failed: {e}")
 
         prog(100, "finished")
         return sparse_ply, paths

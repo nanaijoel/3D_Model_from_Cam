@@ -82,3 +82,11 @@ carve:
   use_depth: false      # optional z-Konsistenz gegen depth_{i}.npy (falls vorhanden)
   depth_tol: 0.02
   chunk: 400000
+
+
+texturing:
+  enable: true
+  divisor: 12               # 6 => 7 Ansichten, 12 => 13 Ansichten, usw.
+  weight_power: 2.0
+  in_ply: fused_points.ply
+  out_ply: fused_textured_points.ply
