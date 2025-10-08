@@ -1,0 +1,42 @@
+--prefer-binary
+
+# Install all dependencies into your venv:
+#    pip install -r requirements.txt
+
+# Core
+numpy
+opencv-python
+matplotlib
+PySide6
+scipy
+PyYAML
+tqdm
+Pillow
+rich
+
+# Masking
+rembg
+onnxruntime-gpu
+# Segment anything (SAM2)
+# for SAM2 you need to create a checkpoint to PATHS, see documentation
+git+https://github.com/facebookresearch/segment-anything.git
+
+
+# 3D / Geometry
+open3d
+
+# ML / GPU
+torch
+torchvision
+# Repository uses mainly GPU, in my case I installed following:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+
+# Local feature extraction (LightGlue + backends)
+# LightGlue official repo (supports SuperPoint, DISK, ALIKED)
+git+https://github.com/cvg/LightGlue.git
+
+# Optional / utils
+kornia
+pyopengl
+pyqtgraph

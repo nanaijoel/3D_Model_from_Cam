@@ -99,7 +99,6 @@ def _sam2_mask(img_bgr: np.ndarray, keep: str = "largest") -> Mask:
     m = (masks_np[idx] > 0).astype(np.uint8) * 255
     return _postprocess_mask(m, open_k=2, close_k=4)
 
-# -------- Public API --------
 def build_mask(img_bgr: np.ndarray, method: str = "rembg", params: Optional[Dict] = None) -> Mask:
     """
     method: 'rembg' | 'sam2'
