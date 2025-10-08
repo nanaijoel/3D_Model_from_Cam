@@ -314,5 +314,16 @@ class PipelineRunner:
             except Exception as e:
                 log("[error]\nSparse-Paint failed: " + str(e))
 
+        """
+        try:
+            from meshing import mesh_from_fused_points
+            mesh_dir = os.path.join(paths.root, "mesh")
+            if os.path.isfile(os.path.join(mesh_dir, "fused_points.ply")):
+                mesh_ply = mesh_from_fused_points(mesh_dir)
+                log(f"[mesh] final surface -> {mesh_ply}")
+        except Exception as e:
+            log(f"[mesh] surface build failed: {e}")
+        """
+
         prog(100, "finished")
         return sparse_ply, paths

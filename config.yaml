@@ -80,6 +80,5 @@ carve:
   use_all_masks: true   # wenn false: nur die Sichten nutzen, für die points_ref_* existieren
   mode: "all"           # "all" (streng), "majority" (robuster), "any" (locker)
   use_depth: false      # optional z-Konsistenz gegen depth_{i}.npy (falls vorhanden)
-  depth_tol: 0.03
+  depth_tol: 0.02
   chunk: 400000
-
