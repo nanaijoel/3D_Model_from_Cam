@@ -10,10 +10,8 @@ try:
 except Exception:
     HAS_O3D = False
 
-GLOBAL_INTRINSICS_K = None  # vom Runner gesetzt
+GLOBAL_INTRINSICS_K = None  # set by pipeline_runner
 
-
-# ---------- utils ----------
 
 def _mkdir(p: str): os.makedirs(p, exist_ok=True)
 
@@ -112,7 +110,7 @@ def _load_poses_npz(poses_npz_path):
     return R_all, t_all, idx
 
 
-# ---------- camera / projection / ROI ----------
+# Camera / projection / ROI
 
 def _project(K, X_cam):
     x = X_cam[...,0]; y = X_cam[...,1]; z = np.maximum(X_cam[...,2], 1e-9)
@@ -127,31 +125,30 @@ def _estimate_roi_from_mask(mask, pad=6):
     return y0, y1, x0, x1
 
 
-# ---------- Boundary-Volume-Fill (Seed-basiert) ----------
+# Boundary-Volume-Fill
 
 def _boundary_volume_fill_from_seeds(
     K, R_ref, t_ref,
     mask_ref: np.ndarray,
-    seed_depth: np.ndarray,   # aus _sparse_to_depth_seeds
-    seed_mask:  np.ndarray,   # aus _sparse_to_depth_seeds (1=Seed)
-    sample_step_px: int = 3,  # Loch-Pixel rasterisieren
-    samples_per_pix: int = 8, # pro Pixel so viele Punkte erzeugen
+    seed_depth: np.ndarray,   # from _sparse_to_depth_seeds
+    seed_mask:  np.ndarray,   # from _sparse_to_depth_seeds (if mask pixel = 1 --> Seed)
+    sample_step_px: int = 3,  # "hole" pixel grid
+    samples_per_pix: int = 8, # create points per "hole" pixel
     px_sigma: float = 1.0,    # Bildraum-Jitter (Pixel) für (dx,dy)
-    z_sigma_rel: float = 0.01,# z-Jitter relativ zu z* (1% = leicht volumetrisch)
+    z_sigma_rel: float = 0.01,# z-Jitter relative to z* (1% volume)
     focus_bottom: bool = True,
-    focus_frac: float = 0.40, # nur untere 40% des Bildes
-    # stärkere Füllung unten
-    z_bias_rel: float = 0.02, # Mittelwert-Bias: etwas tiefer als z*
-    dy_bias_px: float = 0.8   # Pixel-Bias nach unten
+    focus_frac: float = 0.40, # focus on the lower part of the images
+    z_bias_rel: float = 0.02,
+    dy_bias_px: float = 0.8
 ):
     """
-    Füllt Masken-Löcher (mask==1 & seed_mask==0) mit Punkten auf der
-    *nächstliegenden* Seed-Tiefe z*. Pro Loch-Pixel erzeugen wir 'samples_per_pix'
-    Punkte mit kleinem (dx,dy,dz)-Jitter ⇒ kleines Volumen statt Scheibe.
+    Fills parts, where areas of the 2D masks aren't covered by the sparse.ply cloud
+    Reference to the nearest / closest point found to the "hole" pixel to estimate the depth.
+    Create a volumetric point cloud in this region.
 
-    Rückgabe:
-      Xw_fill : (M,3) Weltpunkte
-      pix_idx : (M,2) (y,x) der Bildpixel (für Farb-Sampling)
+    Return:
+      Xw_fill : (M,3) world points
+      pix_idx : (M,2) (y,x) the specific image pixel (color sampling)
     """
     H, W = mask_ref.shape[:2]
     seed_valid = (seed_mask > 0)
@@ -171,7 +168,7 @@ def _boundary_volume_fill_from_seeds(
     if ys.size == 0:
         return None, None
 
-    # 1) z* pro Loch-Pixel: nächster Seed im 2D-Bild
+    # 1) z* per "hole" pixel: next seed in the 2D image
     try:
         from scipy import ndimage as ndi
         inv = ~seed_valid
@@ -190,12 +187,11 @@ def _boundary_volume_fill_from_seeds(
         z_med = float(np.median(dv)) if dv.size > 0 else 0.5
         z_near[bad] = z_med
 
-    # 2) pro Loch-Pixel kleines Volumen um (x,y,z*)
+    # 2) where is a part in mask which isn't covered by sparse: create points in volume (x,y,z*)
     S = max(1, int(samples_per_pix))
     fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
     Ccam = (-R_ref.T @ t_ref).reshape(3)
 
-    # reproduzierbarer, aber view-spezifischer RNG
     seed_hash = int((float(abs(t_ref[0]))*1e6) % (2**32 - 1))
     rng = np.random.default_rng(seed_hash if seed_hash > 0 else 42)
 
@@ -231,7 +227,7 @@ def _boundary_volume_fill_from_seeds(
     return Xw_fill, pix_idx
 
 
-# ---------- Seeds aus sparse ----------
+# Seeds from sparse
 
 def _sparse_to_depth_seeds(K, R_ref, t_ref, sparse_pts, mask_ref, seed_radius=2,
                            sample_max: int | None = None):
@@ -280,7 +276,7 @@ def _sparse_to_depth_seeds(K, R_ref, t_ref, sparse_pts, mask_ref, seed_radius=2,
     return seed_depth, seed_mask
 
 
-# ---------- Edge-aware GPU depth fill ----------
+# Edge-aware GPU depth fill
 
 def _edge_aware_fill_gpu(seed_depth, seed_mask, ref_img, roi, mask_ref,
                          iters=150, beta=4.0, device_str="cuda"):
@@ -339,7 +335,7 @@ def _edge_aware_fill_gpu(seed_depth, seed_mask, ref_img, roi, mask_ref,
     return D.squeeze().detach().cpu().numpy()
 
 
-# ---------- Frame scoring & Auswahl ----------
+# Frame scoring and selection
 
 def _score_frames_by_seeds(K, R_all, t_all, sparse_pts, masks, seed_radius: int,
                            sample_max: int, on_log=None):
@@ -388,7 +384,6 @@ def _choose_ref_indices(N, scores, strategy: str, step: int, topk: int, min_gap:
     return chosen
 
 
-# ---------- Sparse-Paint (GPU) ----------
 
 def run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_dir,
                          on_log=None, on_progress=None):
@@ -484,13 +479,13 @@ def run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_di
         cv.imwrite(os.path.join(depth_dir, f"depth_{ridx:04d}.png"), vis)
         np.save(os.path.join(depth_dir, f"depth_{ridx:04d}.npy"), depth_full)
 
-        # --- Boundary-Volume-Fill (aus Seeds) ---
+        # Boundary volume fill
         BV_ENABLE = str(os.getenv("MVS_BOUNDARY_FILL_ENABLE", "true")).lower() in ("1","true","yes","on")
         if BV_ENABLE:
             bv_step   = int(float(os.getenv("MVS_BVF_STEP_PX", "3")))   # Raster
-            bv_spp    = int(float(os.getenv("MVS_BVF_SAMPLES", "10")))  # Samples pro Pixel (kräftiger)
-            bv_px_sig = float(os.getenv("MVS_BVF_PX_SIGMA", "1.2"))     # (dx,dy) in Pixel
-            bv_z_rel  = float(os.getenv("MVS_BVF_Z_SIGMA_REL", "0.015"))# dz relativ zu z*
+            bv_spp    = int(float(os.getenv("MVS_BVF_SAMPLES", "10")))  # Samples per pixel (stronger)
+            bv_px_sig = float(os.getenv("MVS_BVF_PX_SIGMA", "1.2"))     # (dx,dy) in pixel
+            bv_z_rel  = float(os.getenv("MVS_BVF_Z_SIGMA_REL", "0.015"))# dz relative to z*
             bv_focus  = str(os.getenv("MVS_BVF_FOCUS_BOTTOM", "true")).lower() in ("1","true","yes","on")
             bv_frac   = float(os.getenv("MVS_BVF_FOCUS_FRAC", "0.40"))
             bv_zbias  = float(os.getenv("MVS_BVF_Z_BIAS_REL", "0.02"))
@@ -550,7 +545,7 @@ def run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_di
             _log(f"[carve] failed: {e}", on_log)
 
 
-# ---------- ENV wrapper ----------
+# ENV wrapper
 
 def _set_env_from_args(scale, max_views, n_planes, depth_expand, patch, cost_thr,
                        min_valid_frac, poisson_depth, mode: str):
@@ -558,7 +553,7 @@ def _set_env_from_args(scale, max_views, n_planes, depth_expand, patch, cost_thr
     os.environ.setdefault("MVS_SCALE",         os.getenv("MVS_SCALE", str(scale)))
     os.environ.setdefault("MVS_EXPORT_MESH",   os.getenv("MVS_EXPORT_MESH","true"))
     os.environ.setdefault("MVS_POISSON_DEPTH", os.getenv("MVS_POISSON_DEPTH", str(poisson_depth)))
-    # sinnvolle Defaults für Sparse-Paint:
+
     os.environ.setdefault("MVS_REF_STRATEGY",  os.getenv("MVS_REF_STRATEGY","auto"))
     os.environ.setdefault("MVS_REF_STEP",      os.getenv("MVS_REF_STEP","3"))
     os.environ.setdefault("MVS_REF_TOPK",      os.getenv("MVS_REF_TOPK","0"))
@@ -608,7 +603,7 @@ def reconstruct_mvs_depth_and_mesh_all(paths, K,
                          on_log=on_log, on_progress=on_progress)
 
 
-# ---------- Merge & Carve ----------
+# Merge and carve
 
 def _read_points_ref_with_colors(ply_path):
     if not os.path.isfile(ply_path):
@@ -671,8 +666,8 @@ def _save_colored_ply_any(P, C, out_path):
 
 def _max_consecutive_true_per_row(B: np.ndarray) -> np.ndarray:
     """
-    B: bool array [N,V] (N Punkte, V Masken in zeitlicher Reihenfolge).
-    Rückgabe: int array [N] = Länge der längsten True-Sequenz pro Zeile.
+    B: bool array [N,V] (N points, V masks in chronological order).
+    Return: int array [N] = Length of longest True sequence per row.
     """
     if B.size == 0:
         return np.zeros((B.shape[0],), dtype=np.int32)
@@ -699,7 +694,7 @@ def _carve_points_with_masks(P, K, R_all, t_all, masks, depth_dir=None,
     min_views_keep = int(float(os.getenv("CARVE_MIN_VIEWS", "0")))  # 0 = aus
 
     remove_mat = np.zeros((N, V), dtype=bool)
-    keep_mat   = np.zeros((N, V), dtype=bool)  # Sicht innerhalb Maske (+ optional depth)
+    keep_mat   = np.zeros((N, V), dtype=bool)  # Sight inside mask
 
     for vi in range(V):
         m = masks[vi]
@@ -742,17 +737,17 @@ def _carve_points_with_masks(P, K, R_all, t_all, masks, depth_dir=None,
                 remove_mat[s:e, vi] = tmp
                 keep_mat[s:e, vi]   = tmp2
             else:
-                remove_mat[s:e, vi] |= True  # komplett draußen
+                remove_mat[s:e, vi] |= True
 
     if mode == "consecutive":
-        # Entfernen nur, wenn mind. consec_N aufeinanderfolgende "remove" stimmen
+        # Only remove, if min. consec_N reached
         max_run = _max_consecutive_true_per_row(remove_mat)
         keep = (max_run < max(1, consec_N))
         if min_views_keep > 0:
             keep &= (keep_mat.sum(axis=1) >= min_views_keep)
         return keep
 
-    # alte Modi: basieren auf Anzahl "inside & mask>0"
+    # other tested modes - not used
     counts = keep_mat.sum(axis=1).astype(np.int32)
     if mode == "all":
         return counts == V
