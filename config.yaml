@@ -1,92 +1,88 @@
-# config.yaml — wird 1:1 in ENV gemappt
+# CONFIG.YAML — Full pipeline config
+# All parameters are mapped 1:1 into environment variables
 
 features:
-  backend: disk
-  device: cuda
-  use_mask: true
-  max_kp: 25000
-  debug_every: 20
+  backend: disk                 # feature extractor type: 'disk', 'superpoint', or 'aliked'
+  device: cuda                  # compute device used for feature extraction ('cuda' or 'cpu')
+  use_mask: true                # apply segmentation mask to filter keypoints
+  max_kp: 25000                 # maximum number of keypoints per frame
+  debug_every: 20               # frequency of debug output (every N frames)
 
   lg:
-    detection_threshold: 0.0001
-    nms: 2
-    resize: 1536
-    remove_borders: 2
-    force_num: true
+    detection_threshold: 0.0001 # threshold for LightGlue detector (lower → more keypoints)
+    nms: 2                      # non-maximum suppression radius (pixels)
+    resize: 1536                # image resize before keypoint detection
+    remove_borders: 2           # ignore border region (pixels)
+    force_num: true             # force fixed number of keypoints per image
 
   preproc:
-    clahe: true
-    clahe_clip: 4.0
-    clahe_tiles: 16
-    unsharp: true
-    unsharp_sigma: 1.0
-    unsharp_amount: 1.3
-    noise: false
-    noise_std: 1.5
-    mask_dilate: 6
+    clahe: true                 # enable CLAHE (contrast-limited adaptive histogram equalization)
+    clahe_clip: 4.0             # CLAHE clip limit (contrast strength)
+    clahe_tiles: 16             # CLAHE tile grid size
+    unsharp: true               # enable unsharp mask sharpening
+    unsharp_sigma: 1.0          # Gaussian blur sigma for unsharp mask
+    unsharp_amount: 1.3         # blending amount for unsharp enhancement
+    noise: false                # optionally add small random noise (for stability)
+    noise_std: 1.5              # noise standard deviation (if enabled)
+    mask_dilate: 6              # dilation radius for feature mask (pixels)
 
 matching:
-  backend: lightglue
-  features: disk
-  ratio: 0.82
-  depth_confidence: -1
-  width_confidence: -1
-  filter_threshold: 0.09
+  backend: lightglue            # matching backend ('lightglue' or 'classic')
+  features: disk                # must match feature extractor type above
+  ratio: 0.82                   # ratio test threshold (Lowe’s ratio)
+  depth_confidence: -1          # LightGlue depth confidence (use default if <0)
+  width_confidence: -1          # LightGlue width confidence (use default if <0)
+  filter_threshold: 0.09        # LightGlue internal filtering threshold
 
 masking:
-  enable: true
-  method: rembg
-  overwrite_images: false
+  enable: true                  # enable automatic background removal
+  method: rembg                 # masking backend ('rembg', etc.)
+  overwrite_images: false       # whether to overwrite original input images
   params:
-    alpha_thr: 0.4
-    save_debug: true
+    alpha_thr: 0.2              # alpha transparency cutoff (lower keeps more pixels)
+    save_debug: true            # save debug images showing mask results
 
 sfm:
-  init_ratio: 0.5
-  init_max_span: 8
-  densify: true
-  use_keyframes: true
-  use_loops: true
-  pose_smoothing: true
-  smooth_lambda: 0.01
+  init_ratio: 0.5               # fraction of total frames used for initial reconstruction
+  init_max_span: 8              # maximum frame distance when searching for initialization pair
+  densify: true                 # enable densification (more points after initial SfM)
+  use_keyframes: true           # use keyframe selection instead of all frames
+  use_loops: true               # detect and use loop-closure constraints
+  pose_smoothing: true          # apply light smoothing to camera poses
+  smooth_lambda: 0.01           # smoothing weight (higher = stronger smoothing)
 
 mvs:
-  enable: true
-  mode: "single"
+  enable: true                  # enable multi-view stereo (dense reconstruction)
+  mode: "single"                # reconstruction mode ('single' or 'multi')
   params:
-    device: cuda
-    scale: 1.0
+    device: cuda                # device for depth estimation (cuda/cpu)
+    scale: 1.0                  # input image scaling factor (1.0 = full res)
 
-    # ---- Frame-Auswahl (bucketed) ----
-    ref_strategy: "bucket"   # "bucket" | "bestk" | "step"
-    ref_topk: 60             # Anzahl der gewünschten points_ref_XXXX
-    ref_min_gap: 2           # Sicherheitsabstand (nur für "bestk")
-    ref_step: 2              # nur für "step"
+    # Frame selection
+    ref_strategy: "bucket"      # reference frame selection strategy: 'bucket', 'bestk', or 'step'
+    ref_topk: 60                # number of reference views to sample
+    ref_min_gap: 4              # minimum temporal gap between frames ('bestk' mode)
+    ref_step: 4                 # step size between reference frames ('step' mode)
 
-    # ---- Seeds & Fill ----
-    seed_radius: 2
-    seed_min: 200
-    seed_sample: 200000
-    beta: 4.0
-    fill_iters: 150
-    mask_pad: 6
-
-    # ---- Output ----
-    export_mesh: false       # <- wir bauen KEIN dense_mesh hier
-    poisson_depth: 10
+    # Seeds and fill
+    seed_radius: 2              # pixel radius for seeding depth hypotheses
+    seed_min: 200               # minimum number of valid seeds to start reconstruction
+    seed_sample: 200000         # number of random seed samples for depth initialization
+    beta: 4.0                   # depth regularization parameter
+    fill_iters: 150             # number of filling/refinement iterations
+    mask_pad: 6                 # padding (in pixels) around masks during processing
 
 carve:
-  enable: true
-  use_all_masks: true   # wenn false: nur die Sichten nutzen, für die points_ref_* existieren
-  mode: "all"           # "all" (streng), "majority" (robuster), "any" (locker)
-  use_depth: false      # optional z-Konsistenz gegen depth_{i}.npy (falls vorhanden)
-  depth_tol: 0.02
-  chunk: 400000
-
+  enable: true                  # enable space carving for visibility refinement
+  use_all_masks: false          # if false: only use masks from reference views, also in "all" mode
+  mode: "all"                   # carving policy: 'all' (strict),, 'majority' (robust), 'any' (loose)
+  use_depth: false              # optionally check consistency against depth maps
+  depth_tol: 0.02               # allowed depth deviation (meters or relative units)
+  chunk: 400000                 # maximum number of points processed per batch
 
 texturing:
-  enable: true
-  divisor: 12               # 6 => 7 Ansichten, 12 => 13 Ansichten, usw.
-  weight_power: 2.0
-  in_ply: fused_points.ply
-  out_ply: fused_textured_points.ply
+  enable: true                  # enable texturing / color projection
+  divisor: 18                   # determines number of selected views (divisor + 1 views)
+  weight_power: 1.0             # weight exponent for blending view contributions
+  in_ply: fused_points.ply      # input point cloud file
+  out_ply: fused_textured_points.ply  # output textured point cloud file

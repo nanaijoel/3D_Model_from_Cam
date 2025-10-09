@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 import os, glob
 from typing import List, Tuple
@@ -13,6 +12,8 @@ except Exception:
 
 GLOBAL_INTRINSICS_K = None  # vom Runner gesetzt
 
+
+# ---------- utils ----------
 
 def _mkdir(p: str): os.makedirs(p, exist_ok=True)
 
@@ -110,7 +111,8 @@ def _load_poses_npz(poses_npz_path):
     idx = npz.get("frame_idx", np.arange(len(R_all)))
     return R_all, t_all, idx
 
-# camera / projection / ROI
+
+# ---------- camera / projection / ROI ----------
 
 def _project(K, X_cam):
     x = X_cam[...,0]; y = X_cam[...,1]; z = np.maximum(X_cam[...,2], 1e-9)
@@ -124,6 +126,112 @@ def _estimate_roi_from_mask(mask, pad=6):
     x0 = max(0, xs.min()-pad); x1 = min(mask.shape[1], xs.max()+1+pad)
     return y0, y1, x0, x1
 
+
+# ---------- Boundary-Volume-Fill (Seed-basiert) ----------
+
+def _boundary_volume_fill_from_seeds(
+    K, R_ref, t_ref,
+    mask_ref: np.ndarray,
+    seed_depth: np.ndarray,   # aus _sparse_to_depth_seeds
+    seed_mask:  np.ndarray,   # aus _sparse_to_depth_seeds (1=Seed)
+    sample_step_px: int = 3,  # Loch-Pixel rasterisieren
+    samples_per_pix: int = 8, # pro Pixel so viele Punkte erzeugen
+    px_sigma: float = 1.0,    # Bildraum-Jitter (Pixel) für (dx,dy)
+    z_sigma_rel: float = 0.01,# z-Jitter relativ zu z* (1% = leicht volumetrisch)
+    focus_bottom: bool = True,
+    focus_frac: float = 0.40, # nur untere 40% des Bildes
+    # stärkere Füllung unten
+    z_bias_rel: float = 0.02, # Mittelwert-Bias: etwas tiefer als z*
+    dy_bias_px: float = 0.8   # Pixel-Bias nach unten
+):
+    """
+    Füllt Masken-Löcher (mask==1 & seed_mask==0) mit Punkten auf der
+    *nächstliegenden* Seed-Tiefe z*. Pro Loch-Pixel erzeugen wir 'samples_per_pix'
+    Punkte mit kleinem (dx,dy,dz)-Jitter ⇒ kleines Volumen statt Scheibe.
+
+    Rückgabe:
+      Xw_fill : (M,3) Weltpunkte
+      pix_idx : (M,2) (y,x) der Bildpixel (für Farb-Sampling)
+    """
+    H, W = mask_ref.shape[:2]
+    seed_valid = (seed_mask > 0)
+    holes = (mask_ref > 0) & (~seed_valid)
+
+    if focus_bottom:
+        y_cut = int((1.0 - float(np.clip(focus_frac, 0.0, 1.0))) * H)
+        m = np.zeros_like(holes, dtype=bool); m[y_cut:] = True
+        holes &= m
+
+    ys, xs = np.where(holes)
+    if ys.size == 0:
+        return None, None
+
+    step = max(1, int(sample_step_px))
+    ys = ys[::step]; xs = xs[::step]
+    if ys.size == 0:
+        return None, None
+
+    # 1) z* pro Loch-Pixel: nächster Seed im 2D-Bild
+    try:
+        from scipy import ndimage as ndi
+        inv = ~seed_valid
+        _, (iy, ix) = ndi.distance_transform_edt(inv, return_distances=True, return_indices=True)
+        z_map = seed_depth.copy()
+        z_map[~seed_valid] = np.nan
+        z_near = z_map[iy[ys, xs], ix[ys, xs]]
+    except Exception:
+        dv = seed_depth[seed_valid]
+        z_med = float(np.median(dv)) if dv.size > 0 else 0.5
+        z_near = np.full(ys.shape, z_med, dtype=np.float32)
+
+    bad = ~np.isfinite(z_near)
+    if np.any(bad):
+        dv = seed_depth[seed_valid]
+        z_med = float(np.median(dv)) if dv.size > 0 else 0.5
+        z_near[bad] = z_med
+
+    # 2) pro Loch-Pixel kleines Volumen um (x,y,z*)
+    S = max(1, int(samples_per_pix))
+    fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
+    Ccam = (-R_ref.T @ t_ref).reshape(3)
+
+    # reproduzierbarer, aber view-spezifischer RNG
+    seed_hash = int((float(abs(t_ref[0]))*1e6) % (2**32 - 1))
+    rng = np.random.default_rng(seed_hash if seed_hash > 0 else 42)
+
+    all_world = []
+    pix_idx = []
+
+    for y, x, z0 in zip(ys, xs, z_near.astype(np.float32)):
+        if not np.isfinite(z0) or z0 <= 1e-6:
+            continue
+        dx = rng.normal(0.0, px_sigma, size=S).astype(np.float32)
+        dy = rng.normal(dy_bias_px, px_sigma, size=S).astype(np.float32)  # nach unten bias
+        dz = rng.normal(z_bias_rel * max(z0, 1e-3), z_sigma_rel * max(z0, 1e-3), size=S).astype(np.float32)
+
+        z = np.maximum(z0 + dz, 1e-6)
+        u = (x + dx).astype(np.float32)
+        v = (y + dy).astype(np.float32)
+
+        Xc = np.stack([
+            (u - cx) / fx * z,
+            (v - cy) / fy * z,
+            z
+        ], axis=1)  # (S,3) Kamera
+        Xw = (R_ref.T @ Xc.T + Ccam.reshape(3,1)).T  # (S,3) Welt
+
+        all_world.append(Xw)
+        pix_idx.extend([(int(y), int(x))] * S)
+
+    if not all_world:
+        return None, None
+
+    Xw_fill = np.concatenate(all_world, axis=0).astype(np.float32)
+    pix_idx = np.array(pix_idx, dtype=np.int32)
+    return Xw_fill, pix_idx
+
+
+# ---------- Seeds aus sparse ----------
 
 def _sparse_to_depth_seeds(K, R_ref, t_ref, sparse_pts, mask_ref, seed_radius=2,
                            sample_max: int | None = None):
@@ -171,7 +279,8 @@ def _sparse_to_depth_seeds(K, R_ref, t_ref, sparse_pts, mask_ref, seed_radius=2,
         seed_mask[y0:y1, x0:x1]  = sub_mask
     return seed_depth, seed_mask
 
-# Edge-aware GPU-filling
+
+# ---------- Edge-aware GPU depth fill ----------
 
 def _edge_aware_fill_gpu(seed_depth, seed_mask, ref_img, roi, mask_ref,
                          iters=150, beta=4.0, device_str="cuda"):
@@ -229,7 +338,8 @@ def _edge_aware_fill_gpu(seed_depth, seed_mask, ref_img, roi, mask_ref,
 
     return D.squeeze().detach().cpu().numpy()
 
-# Frame scoring and selection
+
+# ---------- Frame scoring & Auswahl ----------
 
 def _score_frames_by_seeds(K, R_all, t_all, sparse_pts, masks, seed_radius: int,
                            sample_max: int, on_log=None):
@@ -277,7 +387,8 @@ def _choose_ref_indices(N, scores, strategy: str, step: int, topk: int, min_gap:
     chosen.sort()
     return chosen
 
-# Sparse paint
+
+# ---------- Sparse-Paint (GPU) ----------
 
 def run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_dir,
                          on_log=None, on_progress=None):
@@ -373,6 +484,39 @@ def run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_di
         cv.imwrite(os.path.join(depth_dir, f"depth_{ridx:04d}.png"), vis)
         np.save(os.path.join(depth_dir, f"depth_{ridx:04d}.npy"), depth_full)
 
+        # --- Boundary-Volume-Fill (aus Seeds) ---
+        BV_ENABLE = str(os.getenv("MVS_BOUNDARY_FILL_ENABLE", "true")).lower() in ("1","true","yes","on")
+        if BV_ENABLE:
+            bv_step   = int(float(os.getenv("MVS_BVF_STEP_PX", "3")))   # Raster
+            bv_spp    = int(float(os.getenv("MVS_BVF_SAMPLES", "10")))  # Samples pro Pixel (kräftiger)
+            bv_px_sig = float(os.getenv("MVS_BVF_PX_SIGMA", "1.2"))     # (dx,dy) in Pixel
+            bv_z_rel  = float(os.getenv("MVS_BVF_Z_SIGMA_REL", "0.015"))# dz relativ zu z*
+            bv_focus  = str(os.getenv("MVS_BVF_FOCUS_BOTTOM", "true")).lower() in ("1","true","yes","on")
+            bv_frac   = float(os.getenv("MVS_BVF_FOCUS_FRAC", "0.40"))
+            bv_zbias  = float(os.getenv("MVS_BVF_Z_BIAS_REL", "0.02"))
+            bv_dybias = float(os.getenv("MVS_BVF_DY_BIAS_PX", "0.8"))
+
+            Xw_fill, pix_idx = _boundary_volume_fill_from_seeds(
+                K, R_all[ridx], t_all[ridx],
+                ref_msk, seed_depth, seed_mask,
+                sample_step_px=bv_step, samples_per_pix=bv_spp,
+                px_sigma=bv_px_sig, z_sigma_rel=bv_z_rel,
+                focus_bottom=bv_focus, focus_frac=bv_frac,
+                z_bias_rel=bv_zbias, dy_bias_px=bv_dybias
+            )
+            if Xw_fill is not None and Xw_fill.size > 0:
+                cols_fill = ref_img[pix_idx[:, 0], pix_idx[:, 1]]
+                if HAS_O3D:
+                    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(Xw_fill))
+                    pcd.colors = o3d.utility.Vector3dVector(cols_fill[:, ::-1] / 255.0)
+                    o3d.io.write_point_cloud(os.path.join(mesh_dir, f"points_ref_{ridx:04d}_fill.ply"), pcd)
+
+                all_pts.append(Xw_fill.astype(np.float32))
+                all_cols.append(cols_fill.astype(np.uint8))
+                _log(f"[bvf] ref={ridx} fill_points={Xw_fill.shape[0]} step={bv_step} spp={bv_spp} "
+                     f"px_sigma={bv_px_sig} z_rel={bv_z_rel} z_bias={bv_zbias} dy_bias={bv_dybias} "
+                     f"focus_bottom={bv_focus} frac={bv_frac}", on_log)
+
         # Back-Projection (just masked part if masking true)
         ys, xs = np.where(ref_msk>0)
         if ys.size == 0: continue
@@ -395,7 +539,6 @@ def run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_di
 
         all_pts.append(Xw.astype(np.float32)); all_cols.append(cols.astype(np.uint8))
 
-
     _log("[ui] Done Sparse-Paint.", on_log)
 
     # Carving with masks
@@ -407,9 +550,7 @@ def run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_di
             _log(f"[carve] failed: {e}", on_log)
 
 
-
-
-# ENV wrapper
+# ---------- ENV wrapper ----------
 
 def _set_env_from_args(scale, max_views, n_planes, depth_expand, patch, cost_thr,
                        min_valid_frac, poisson_depth, mode: str):
@@ -444,7 +585,7 @@ def reconstruct_mvs_depth_and_mesh(paths, K,
     frames_dir   = os.path.join(root, "raw_frames")
     features_dir = os.path.join(root, "features")
     poses_npz    = os.path.join(root, "poses", "camera_poses.npz")
-    masks_dir    = os.path.join(features_dir, "masks")
+    masks_dir    = os.path.join(root, "features", "masks")
     run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_dir,
                          on_log=on_log, on_progress=on_progress)
 
@@ -462,11 +603,12 @@ def reconstruct_mvs_depth_and_mesh_all(paths, K,
     frames_dir   = os.path.join(root, "raw_frames")
     features_dir = os.path.join(root, "features")
     poses_npz    = os.path.join(root, "poses", "camera_poses.npz")
-    masks_dir    = os.path.join(features_dir, "masks")
+    masks_dir    = os.path.join(root, "features", "masks")
     run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_dir,
                          on_log=on_log, on_progress=on_progress)
 
-# Merge & Carve: all points_ref_* fused and cut with all ref /all masks
+
+# ---------- Merge & Carve ----------
 
 def _read_points_ref_with_colors(ply_path):
     if not os.path.isfile(ply_path):
@@ -527,34 +669,51 @@ def _save_colored_ply_any(P, C, out_path):
                     f.write(f"{p[0]} {p[1]} {p[2]} {int(c[2])} {int(c[1])} {int(c[0])}\n")
         return out_path
 
+def _max_consecutive_true_per_row(B: np.ndarray) -> np.ndarray:
+    """
+    B: bool array [N,V] (N Punkte, V Masken in zeitlicher Reihenfolge).
+    Rückgabe: int array [N] = Länge der längsten True-Sequenz pro Zeile.
+    """
+    if B.size == 0:
+        return np.zeros((B.shape[0],), dtype=np.int32)
+    N, V = B.shape
+    run = np.zeros((N, V), dtype=np.int32)
+    run[:, 0] = B[:, 0].astype(np.int32)
+    for j in range(1, V):
+        run[:, j] = (run[:, j-1] + 1) * B[:, j].astype(np.int32)
+    return run.max(axis=1)
+
 def _carve_points_with_masks(P, K, R_all, t_all, masks, depth_dir=None,
                              mode="all", use_depth=False, depth_tol=0.03, chunk=400000, on_log=None):
     """
     P: Nx3 in world coordinates.
     masks: List [len(views)] of 2D masks (or None).
-    mode: "all" (AND), "majority", "any".
+    mode: "all" (AND), "majority", "any", "consecutive"
     use_depth: z <= depth(u,v) + tol*(1+depth)
     """
     V = len(masks); N = P.shape[0]
     if V == 0 or N == 0:
         return np.ones(N, np.bool_)
 
-    counts = np.zeros(N, np.int32)
+    consec_N = int(float(os.getenv("CARVE_CONSEC_N", "3")))
+    min_views_keep = int(float(os.getenv("CARVE_MIN_VIEWS", "0")))  # 0 = aus
+
+    remove_mat = np.zeros((N, V), dtype=bool)
+    keep_mat   = np.zeros((N, V), dtype=bool)  # Sicht innerhalb Maske (+ optional depth)
 
     for vi in range(V):
         m = masks[vi]
-        if m is None:  # if no masks: this part is ignored
+        if m is None:
             continue
         H,W = m.shape[:2]
         R = R_all[vi]; t = t_all[vi]
-        # optional Depth
         D = None
         if use_depth and depth_dir:
             p = os.path.join(depth_dir, f"depth_{vi:04d}.npy")
             if os.path.isfile(p):
                 try: D = np.load(p)
                 except: D = None
-        # Project in chunks
+
         Cc = (-R.T @ t).reshape(3)
         for s in range(0, N, chunk):
             e = min(N, s+chunk)
@@ -566,26 +725,49 @@ def _carve_points_with_masks(P, K, R_all, t_all, masks, depth_dir=None,
             ui = np.floor(u).astype(np.int32)
             vi2= np.floor(v).astype(np.int32)
             inside = (z>1e-6)&(ui>=0)&(ui<W)&(vi2>=0)&(vi2<H)
-            if not np.any(inside):
-                continue
-            ui = np.clip(ui,0,W-1); vi2 = np.clip(vi2,0,H-1)
-            inside &= (m[vi2, ui] > 0)
-            if D is not None:
-                d = D[vi2, ui]
-                inside &= (z <= (d + depth_tol*(1.0 + d)))
-            counts[s:e] += inside.astype(np.int32)
 
+            rem = ~inside
+            if np.any(inside):
+                ui = np.clip(ui,0,W-1); vi2 = np.clip(vi2,0,H-1)
+                m_inside = (m[vi2, ui] > 0)
+                if D is not None:
+                    d = D[vi2, ui]
+                    m_inside &= (z <= (d + depth_tol*(1.0 + d)))
+                rem_inside = ~m_inside
+
+                tmp = remove_mat[s:e, vi]
+                tmp2= keep_mat[s:e, vi]
+                tmp |= rem_inside
+                tmp2 |= m_inside
+                remove_mat[s:e, vi] = tmp
+                keep_mat[s:e, vi]   = tmp2
+            else:
+                remove_mat[s:e, vi] |= True  # komplett draußen
+
+    if mode == "consecutive":
+        # Entfernen nur, wenn mind. consec_N aufeinanderfolgende "remove" stimmen
+        max_run = _max_consecutive_true_per_row(remove_mat)
+        keep = (max_run < max(1, consec_N))
+        if min_views_keep > 0:
+            keep &= (keep_mat.sum(axis=1) >= min_views_keep)
+        return keep
+
+    # alte Modi: basieren auf Anzahl "inside & mask>0"
+    counts = keep_mat.sum(axis=1).astype(np.int32)
     if mode == "all":
         return counts == V
     if mode == "majority":
         return counts >= int(np.ceil(V/2.0))
-    return counts >= 1  # "any"
+    if mode == "any":
+        return counts >= 1
+    # fallback
+    return counts >= int(np.ceil(V/2.0))
 
 def merge_all_points_ref_and_carve(mesh_dir, frames_dir, masks_dir, poses_npz, on_log=None):
     """
     1) Load all points_ref_*.ply in mesh_dir and merge.
     2) Carve fused point cloud with all / all selected masks, as configured with ENV
-        (CARVE_USE_ALL_MASKS, CARVE_MODE, CARVE_USE_DEPTH, CARVE_DEPTH_TOL).
+       (CARVE_USE_ALL_MASKS, CARVE_MODE, CARVE_CONSEC_N, CARVE_MIN_VIEWS, CARVE_USE_DEPTH, CARVE_DEPTH_TOL).
     3) Saves fused_points.ply
     """
     _log("[carve] merge & carve start", on_log)
@@ -593,68 +775,89 @@ def merge_all_points_ref_and_carve(mesh_dir, frames_dir, masks_dir, poses_npz, o
     if K is None:
         raise RuntimeError("GLOBAL_INTRINSICS_K ist nicht gesetzt.")
 
-    # ENV
-    use_all = str(os.getenv("CARVE_USE_ALL_MASKS", "true")).lower() in ("1","true","yes","on")
-    mode    = (os.getenv("CARVE_MODE", "all") or "all").strip().lower()
-    use_depth = str(os.getenv("CARVE_USE_DEPTH", "false")).lower() in ("1","true","yes","on")
+    use_all   = str(os.getenv("CARVE_USE_ALL_MASKS", "true")).lower() in ("1", "true", "yes", "on")
+    mode      = (os.getenv("CARVE_MODE", "consecutive") or "consecutive").strip().lower()
+    use_depth = str(os.getenv("CARVE_USE_DEPTH", "false")).lower() in ("1", "true", "yes", "on")
     depth_tol = float(os.getenv("CARVE_DEPTH_TOL", "0.03"))
-    chunk   = int(float(os.getenv("CARVE_CHUNK","400000")))
+    chunk     = int(float(os.getenv("CARVE_CHUNK", "400000")))
+    # neu: Regeln für „consecutive“
+    os.environ.setdefault("CARVE_CONSEC_N",   os.getenv("CARVE_CONSEC_N", "10"))
+    os.environ.setdefault("CARVE_MIN_VIEWS",  os.getenv("CARVE_MIN_VIEWS", "0"))
 
-    # 1) Load points_ref_*
+    # Load all  points_ref_*.ply, including *_fill.ply
     plys = sorted(glob.glob(os.path.join(mesh_dir, "points_ref_*.ply")))
     if not plys:
-        raise RuntimeError("[carve] keine points_ref_*.ply gefunden")
-    P_list=[]; C_list=[]
+        raise RuntimeError("[carve] points_ref_*.ply not found.")
+
+    P_list, C_list = [], []
     for p in plys:
-        P,C = _read_points_ref_with_colors(p)
-        if P is None or P.size==0: continue
+        P, C = _read_points_ref_with_colors(p)
+        if P is None or P.size == 0:
+            continue
         P_list.append(P.astype(np.float64))
-        C_list.append(C if C is not None and C.shape[0]==P.shape[0] else None)
+        C_list.append(C if (C is not None and C.shape[0] == P.shape[0]) else None)
         _log(f"[carve] load {os.path.basename(p)} : {P.shape[0]} pts", on_log)
+
     if not P_list:
-        raise RuntimeError("[carve] keine Punkte geladen")
+        raise RuntimeError("[carve] no points loaded.")
+
     P = np.concatenate(P_list, axis=0)
     C = np.concatenate(C_list, axis=0) if all(c is not None for c in C_list) else None
     _log(f"[carve] stacked: {P.shape[0]} pts", on_log)
 
-    # 2) Load masks and poses
+    # Load masks and poses
     R_all, t_all, _ = _load_poses_npz(poses_npz)
     frame_files = _sorted_frames(frames_dir)
-    masks_all = [_mask_for_frame(masks_dir, f) for f in frame_files]
+    masks_all   = [_mask_for_frame(masks_dir, f) for f in frame_files]
 
     if use_all:
         view_ids = list(range(min(len(frame_files), len(R_all))))
     else:
-        # only use views which have existing points_ref_*-files
-        view_ids = sorted(set(int(os.path.basename(p).split("_")[2].split(".")[0]) for p in plys))
+        # only use frames with existing points_ref_* files
+        def _extract_view_id(p):
+            stem = os.path.splitext(os.path.basename(p))[0]  # e.g. "points_ref_0001" or "points_ref_0001_fill"
+            parts = stem.split("_")
+            if len(parts) >= 3 and parts[0] == "points" and parts[1] == "ref":
+                try:
+                    return int(parts[2])  # "0001" -> 1
+                except ValueError:
+                    return None
+            return None
+
+        view_ids = sorted({vid for vid in (_extract_view_id(p) for p in plys) if vid is not None})
+        _log(f"[carve] using view_ids={view_ids}", on_log)
 
     masks = [masks_all[i] if 0 <= i < len(masks_all) else None for i in view_ids]
-    R_sel = [R_all[i] for i in view_ids]
-    t_sel = [t_all[i] for i in view_ids]
+    R_sel = np.array([R_all[i] for i in view_ids])
+    t_sel = np.array([t_all[i] for i in view_ids])
     depth_dir = os.path.join(mesh_dir, "depth")
 
-    # 3) Carving
-    keep = _carve_points_with_masks(P, K, np.array(R_sel), np.array(t_sel), masks,
-                                    depth_dir=depth_dir, mode=mode,
-                                    use_depth=use_depth, depth_tol=depth_tol,
-                                    chunk=chunk, on_log=on_log)
+    # Carving mode
+    keep = _carve_points_with_masks(
+        P, K, R_sel, t_sel, masks,
+        depth_dir=depth_dir, mode=mode,
+        use_depth=use_depth, depth_tol=depth_tol,
+        chunk=chunk, on_log=on_log
+    )
+
     Pk = P[keep]
     Ck = (C[keep] if C is not None else None)
     _log(f"[carve] after carving: {Pk.shape[0]} pts", on_log)
 
-    # optional little downsampling
+    # optional downsampling
+    out_path = os.path.join(mesh_dir, "fused_points.ply")
     try:
-        import open3d as o3d
-        pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(Pk))
-        if Ck is not None: pcd.colors = o3d.utility.Vector3dVector((Ck[:, ::-1] / 255.0))
-        if Pk.shape[0] > 8000:
-            vox = max(1e-4, 0.6 * _median_nn_distance(Pk))
-            pcd = pcd.voxel_down_sample(voxel_size=float(vox))
-        out = os.path.join(mesh_dir, "fused_points.ply")
-        o3d.io.write_point_cloud(out, pcd)
-    except Exception:
-        out = os.path.join(mesh_dir, "fused_points.ply")
-        _save_colored_ply_any(Pk, Ck, out)
+        if HAS_O3D:
+            pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(Pk))
+            if Ck is not None:
+                pcd.colors = o3d.utility.Vector3dVector((Ck[:, ::-1] / 255.0))
+            if Pk.shape[0] > 8000:
+                vox = max(1e-4, 0.6 * _median_nn_distance(Pk))
+                pcd = pcd.voxel_down_sample(voxel_size=float(vox))
+            o3d.io.write_point_cloud(out_path, pcd)
+        else:
+            _save_colored_ply_any(Pk, Ck, out_path)
+    finally:
+        _log(f"[carve] saved -> {out_path}", on_log)
 
-    _log(f"[carve] saved -> {out}", on_log)
-    return out
+    return out_path
