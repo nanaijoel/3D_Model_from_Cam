@@ -60,8 +60,8 @@ mvs:
     # ---- Frame-Auswahl (bucketed) ----
     ref_strategy: "bucket"   # "bucket" | "bestk" | "step"
     ref_topk: 60             # Anzahl der gewünschten points_ref_XXXX
-    ref_min_gap: 3           # Sicherheitsabstand (nur für "bestk")
-    ref_step: 3              # nur für "step"
+    ref_min_gap: 2           # Sicherheitsabstand (nur für "bestk")
+    ref_step: 2              # nur für "step"
 
     # ---- Seeds & Fill ----
     seed_radius: 2

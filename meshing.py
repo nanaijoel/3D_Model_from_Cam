@@ -658,4 +658,3 @@ def merge_all_points_ref_and_carve(mesh_dir, frames_dir, masks_dir, poses_npz, o
 
     _log(f"[carve] saved -> {out}", on_log)
     return out
-
