@@ -11,7 +11,7 @@ The configuration is fully controlled via `config.yaml`, which maps directly to 
 
 - **Automatic frame extraction** from video input  
 - **Image preprocessing** (CLAHE, unsharp masking, etc.)  
-- **Masking with rembg for background and foreground mask 
+- **Masking with rembg** for background and foreground mask 
 - **Feature extraction & matching** using [DISK](https://github.com/cvlab-epfl/disk) + [LightGlue](https://github.com/cvg/LightGlue)  
 - **Incremental SfM** (camera poses, sparse reconstruction)  
 - **Optional dense MVS refinement**  
