@@ -2,7 +2,7 @@
 _Reconstruct high-quality 3D point clouds from a short handheld video._
 
 This repository implements a modular **Structure-from-Motion (SfM)** and **Multi-View Stereo (MVS)** pipeline with automatic background masking, LightGlue feature matching.  
-A simple GUI application is added, so the whole program can be run by just execute the app_gui.py.
+A simple GUI application is added, so the whole program can be run by just executing the app_gui.py.
 The configuration is fully controlled via `config.yaml`, which maps directly to environment variables.
 
 ---
@@ -43,8 +43,9 @@ The configuration is fully controlled via `config.yaml`, which maps directly to 
 
 ```bash
 # Clone repository
-git clone https://github.com/nanaijoel/3D_Model_from_Cam.git
-cd 3d-reconstruction-pipeline
+git clone git@github.com:nanaijoel/3D_Model_from_Cam.git
+# or git clone https://github.com/nanaijoel/3D_Model_from_Cam.git
+cd 3D_Model_from_Cam
 
 # Create environment (optional)
 python -m venv venv
