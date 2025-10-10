@@ -339,7 +339,8 @@ def _edge_aware_fill_gpu(seed_depth, seed_mask, ref_img, roi, mask_ref,
 
 def _score_frames_by_seeds(K, R_all, t_all, sparse_pts, masks, seed_radius: int,
                            sample_max: int, on_log=None):
-    N = len(masks)
+    # Verwende die gemeinsame Länge von Posen und Masken
+    N = min(len(masks), len(R_all))
     if sparse_pts is None or sparse_pts.size == 0:
         _log("[sparse-paint] WARNING: sparse.ply leer → Scoring=0", on_log)
         return np.zeros(N, dtype=np.int32)
@@ -352,18 +353,23 @@ def _score_frames_by_seeds(K, R_all, t_all, sparse_pts, masks, seed_radius: int,
     scores = np.zeros(N, dtype=np.int32)
     for i in range(N):
         m = masks[i]
-        if m is None: scores[i] = 0; continue
+        if m is None:
+            scores[i] = 0
+            continue
         C = (-R_all[i].T @ t_all[i]).reshape(3)
         X_cam = (R_all[i] @ (pts.T - C.reshape(3,1))).T
         Z = X_cam[:,2]
         u, v = _project(K, X_cam)
         H, W = m.shape[:2]
         in_img = (u>=0)&(u<W)&(v>=0)&(v<H)&(Z>1e-6)
-        if not np.any(in_img): scores[i] = 0; continue
+        if not np.any(in_img):
+            scores[i] = 0
+            continue
         ui = np.clip(np.floor(u[in_img]).astype(np.int32), 0, W-1)
         vi = np.clip(np.floor(v[in_img]).astype(np.int32), 0, H-1)
         scores[i] = int(np.count_nonzero(m[vi, ui] > 0))
     return scores
+
 
 def _choose_ref_indices(N, scores, strategy: str, step: int, topk: int, min_gap: int):
     if strategy == "auto":
@@ -430,12 +436,25 @@ def run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_di
         K[0,0]*=SCALE; K[1,1]*=SCALE; K[0,2]*=SCALE; K[1,2]*=SCALE
         globals()["GLOBAL_INTRINSICS_K"] = K
 
+    # clamp to unified length
+    Vposes = len(R_all)
+    Nimgs = len(images)
+    V = min(Vposes, Nimgs)
+
+    if V < Nimgs:
+        _log(f"[sparse-paint] clamping to {V} views (poses={Vposes}, images={Nimgs})", on_log)
+        images = images[:V]
+        masks = masks[:V]
+
     sparse_path = os.path.join(mesh_dir, "sparse.ply")
     sparse_pts  = _read_sparse_points(sparse_path)
 
+
     # Frame scoring and selection
-    scores = _score_frames_by_seeds(K, R_all, t_all, sparse_pts, masks, SEED_R, SAMPLE_MAX, on_log)
-    refs = _choose_ref_indices(len(images), scores, REF_STRAT, REF_STEP, REF_TOPK, REF_MIN_G)
+    scores = _score_frames_by_seeds(K, R_all[:V], t_all[:V], sparse_pts, masks[:V],
+                                    SEED_R, SAMPLE_MAX, on_log)
+    refs = _choose_ref_indices(V, scores, REF_STRAT, REF_STEP, REF_TOPK, REF_MIN_G)
+
     _log(f"[sparse-paint] selection strategy={REF_STRAT}  step={REF_STEP}  topk={REF_TOPK}  min_gap={REF_MIN_G}", on_log)
     _log(f"[sparse-paint] selected refs: {refs[:10]}{'...' if len(refs)>10 else ''} (total {len(refs)})", on_log)
 
