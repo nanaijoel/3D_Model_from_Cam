@@ -241,9 +241,7 @@ class PipelineRunner:
         device = os.getenv("FEATURE_DEVICE", "cuda")
         pairs_np, matches_list = build_pairs(
             paths.features,
-            ratio=ratio,
             device=device,
-            backend=os.getenv("MATCH_BACKEND", "lightglue"),
             on_log=log,
             save_dir=paths.matches
         )
