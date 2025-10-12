@@ -307,6 +307,11 @@ class PipelineRunner:
         log(f"[sfm] raw_points(after validation)={points3d.shape[0]:d}")
         log(f"[ui] Done: {sparse_ply}")
 
+        prog(100, "finished")
+        return sparse_ply, paths
+
+
+"""
         # 8) Sparse-Paint (GPU)
         if _parse_bool(os.getenv("MVS_ENABLE", "true"), True):
             log("Sparse-Paint (sparse-guided depth completion)")
@@ -353,6 +358,4 @@ class PipelineRunner:
                     log(f"[texture] skipped (no {fused_ply})")
         except Exception as e:
             log(f"[texture] failed: {e}")
-
-        prog(100, "finished")
-        return sparse_ply, paths
+"""
