@@ -1,20 +1,25 @@
-
 import os, json
 import numpy as np
 import cv2 as cv
-from typing import Callable, Tuple, Any, Dict
+from typing import Callable, Tuple, Any, Dict, List
 
 from image_masking import preprocess_images
 from io_paths import make_project_paths
 from frame_extractor import extract_and_save_frames
-from feature_extraction import extract_features
-from image_matching import build_pairs
+from feature_extraction import extract_features          # bleibt für Nicht-LoFTR-Modi
+from image_matching import build_pairs                   # bleibt für Nicht-LoFTR-Modi
 from sfm_incremental import run_sfm, SfMConfig
 from meshing import (
     save_point_cloud,
     reconstruct_mvs_depth_and_mesh,
     reconstruct_mvs_depth_and_mesh_all)
 from texturing import texture_points_from_views
+
+# LoFTR-only Matching (neu)
+try:
+    from loftr_only_matching import build_pairs_loftr     # :contentReference[oaicite:4]{index=4}
+except ImportError:
+    build_pairs_loftr = None
 
 def _load_yaml_or_json(path: str) -> Dict[str, Any]:
     ext = os.path.splitext(path)[1].lower()
@@ -64,14 +69,12 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
             except Exception: return default
         return default
 
-
     fe = cfg.get("features", {})
     setenv("FEATURE_BACKEND", fe.get("backend"))
     setenv("FEATURE_DEVICE", fe.get("device"))
     setenv("FEATURE_USE_MASK", fe.get("use_mask"))
     setenv("FEATURE_MAX_KP", pick_num(fe.get("max_kp", 4096)))
     setenv("FEATURE_DEBUG_EVERY", pick_num(fe.get("debug_every", 0)))
-
 
     pp = fe.get("preproc", {})
     setenv("FEATURE_PREPROC_CLAHE", pick_bool(pp.get("clahe", True)))
@@ -84,7 +87,6 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("FEATURE_PREPROC_NOISE_STD", pick_num(pp.get("noise_std", 1.5)))
     setenv("FEATURE_MASK_DILATE", int(pick_num(pp.get("mask_dilate", 5))))
 
-
     lg = fe.get("lg", {})
     setenv("FEATURE_LG_DET_THR", pick_num(lg.get("detection_threshold", 0.001)))
     setenv("FEATURE_LG_NMS", int(pick_num(lg.get("nms", 3))))
@@ -92,18 +94,15 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("FEATURE_LG_REMOVE_BORDERS", int(pick_num(lg.get("remove_borders", 2))))
     setenv("FEATURE_LG_FORCE_NUM", pick_bool(lg.get("force_num", False)))
 
-
     sf = fe.get("sift", {})
     setenv("FEATURE_SIFT_CONTRAST", pick_num(sf.get("contrast", 0.004)))
     setenv("FEATURE_SIFT_EDGE", int(pick_num(sf.get("edge", 12))))
     setenv("FEATURE_SIFT_SIGMA", pick_num(sf.get("sigma", 1.2)))
 
-
     mask_cfg = cfg.get("masking", {})
     setenv("MASK_ENABLE", pick_bool(mask_cfg.get("enable", False)))
     setenv("MASK_METHOD", mask_cfg.get("method"))
     setenv("MASK_OVERWRITE_IMAGES", pick_bool(mask_cfg.get("overwrite_images", False)))
-
 
     ma = cfg.get("matching", {})
     setenv("MATCH_BACKEND", ma.get("backend"))
@@ -114,7 +113,6 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     if "features" in ma:
         setenv("MATCH_FEATURES", str(ma["features"]).lower())
 
-
     sfm = cfg.get("sfm", {})
     setenv("SFM_INIT_RATIO", pick_num(sfm.get("init_ratio", 0.5)))
     setenv("SFM_INIT_MAX_SPAN", pick_num(sfm.get("init_max_span", 6)))
@@ -124,7 +122,6 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("SFM_POSE_SMOOTHING", pick_bool(sfm.get("pose_smoothing", True)))
     setenv("SFM_SMOOTH_LAMBDA", pick_num(sfm.get("smooth_lambda", 0.25)))
 
-
     mvs = cfg.get("mvs", {})
     setenv("MVS_ENABLE", pick_bool(mvs.get("enable", True)))
     setenv("MVS_MODE", (mvs.get("mode", "all") or "all"))
@@ -133,10 +130,10 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("MVS_DEVICE", mp.get("device", fe.get("device", "cuda")))
     setenv("MVS_SCALE", mp.get("scale"))
 
-    setenv("MVS_REF_STRATEGY", mp.get("ref_strategy"))       # auto|bestk|step
-    setenv("MVS_REF_TOPK", mp.get("ref_topk"))               # z.B. 40
-    setenv("MVS_REF_MIN_GAP", mp.get("ref_min_gap"))         # z.B. 2
-    setenv("MVS_REF_STEP", mp.get("ref_step"))               # z.B. 3
+    setenv("MVS_REF_STRATEGY", mp.get("ref_strategy"))
+    setenv("MVS_REF_TOPK", mp.get("ref_topk"))
+    setenv("MVS_REF_MIN_GAP", mp.get("ref_min_gap"))
+    setenv("MVS_REF_STEP", mp.get("ref_step"))
     setenv("MVS_REF_BUCKETS", mp.get("ref_buckets", mp.get("ref_topk", 6)))
 
     setenv("MVS_SEED_RADIUS", mp.get("seed_radius"))
@@ -148,13 +145,13 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("MVS_EXPORT_MESH", mp.get("export_mesh"))
     setenv("MVS_POISSON_DEPTH", mp.get("poisson_depth"))
 
-    cv = cfg.get("carve", {}) or {}
-    setenv("CARVE_ENABLE", cv.get("enable"))
-    setenv("CARVE_USE_ALL_MASKS", cv.get("use_all_masks"))
-    setenv("CARVE_MODE", cv.get("mode"))                 # all | majority | any
-    setenv("CARVE_USE_DEPTH", cv.get("use_depth"))       # true/false
-    setenv("CARVE_DEPTH_TOL", cv.get("depth_tol"))       # 0.03
-    setenv("CARVE_CHUNK", cv.get("chunk"))
+    cvv = cfg.get("carve", {}) or {}
+    setenv("CARVE_ENABLE", cvv.get("enable"))
+    setenv("CARVE_USE_ALL_MASKS", cvv.get("use_all_masks"))
+    setenv("CARVE_MODE", cvv.get("mode"))
+    setenv("CARVE_USE_DEPTH", cvv.get("use_depth"))
+    setenv("CARVE_DEPTH_TOL", cvv.get("depth_tol"))
+    setenv("CARVE_CHUNK", cvv.get("chunk"))
 
     tx = cfg.get("texturing", {}) or {}
     setenv("TEXTURE_ENABLE", pick_bool(tx.get("enable", True)))
@@ -162,7 +159,6 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("TEXTURE_WEIGHT_POWER", pick_num(tx.get("weight_power", 2.0)))
     setenv("TEXTURE_IN_PLY", tx.get("in_ply", "fused_points.ply"))
     setenv("TEXTURE_OUT_PLY", tx.get("out_ply", "fused_textured_points.ply"))
-
 
 def _auto_views(n_frames: int, divisor: int) -> list[int]:
     import numpy as _np
@@ -172,7 +168,6 @@ def _auto_views(n_frames: int, divisor: int) -> list[int]:
     idx = _np.linspace(0, n_frames - 1, num=divisor + 1, dtype=int)
     idx = _np.unique(_np.clip(idx, 0, n_frames - 1))
     return idx.tolist()
-
 
 def _dump_resolved_config(project_root: str) -> str:
     keys = [k for k in os.environ.keys() if k.startswith(("FEATURE_", "MATCH_", "SFM_", "MVS_", "MASK_"))]
@@ -187,6 +182,14 @@ def _dump_resolved_config(project_root: str) -> str:
             json.dump(kv, f, indent=2, ensure_ascii=False)
     return out_path
 
+def _read_shapes(image_paths: List[str]) -> List[tuple]:
+    shapes: List[tuple] = []
+    for p in image_paths:
+        im = cv.imread(p, cv.IMREAD_GRAYSCALE)
+        if im is None:
+            raise FileNotFoundError(f"Could not read image: {p}")
+        shapes.append(im.shape[:2])  # (h, w)
+    return shapes
 
 class PipelineRunner:
     def __init__(self, base_dir: str, on_log: Callable[[str], None], on_progress: Callable[[int, str], None]):
@@ -231,20 +234,44 @@ class PipelineRunner:
                 save_debug=True
             )
 
-        # 3) features
-        kps, descs, shapes, meta = extract_features(imgs, paths.features, log, prog)
-        if not kps or not shapes:
-            raise RuntimeError("Feature extraction returned no keypoints.")
-
-        # 4) matching
-        ratio = float(os.getenv("MATCH_RATIO", "0.82"))
+        # 3) matching mode switch
+        match_backend = (os.getenv("MATCH_BACKEND", "") or "").lower()
         device = os.getenv("FEATURE_DEVICE", "cuda")
-        pairs_np, matches_list = build_pairs(
-            paths.features,
-            device=device,
-            on_log=log,
-            save_dir=paths.matches
-        )
+
+        if match_backend in ("loftr-only", "loftr", "only-loftr"):
+            if build_pairs_loftr is None:
+                raise RuntimeError("LoFTR-only backend selected, but 'loftr_only_matching.py' is not available.")
+            log("[matching] LoFTR-only mode")
+
+            # LoFTR liefert direkt (pairs, matches, keypoints)
+            pairs_np, matches_list, kps_loftr = build_pairs_loftr(
+                imgs,
+                features_dir=paths.features,
+                device=device,
+                max_size=int(float(os.getenv("LOFTR_MAX_SIZE", "640"))),
+                on_log=log,
+                save_dir=paths.matches,
+                use_masks=_parse_bool(os.getenv("FEATURE_USE_MASK", "true"), True)
+            )  # :contentReference[oaicite:5]{index=5}
+
+            # Shapes direkt von den Bildern (wir haben keine Feature-Extraktion gemacht)
+            shapes = _read_shapes(imgs)
+
+            # Dummy-Deskriptoren (SfM erwartet einen Platzhalter)
+            descs = [None for _ in kps_loftr]
+            kps = kps_loftr
+
+        else:
+            # Klassischer Pfad (Features + bildpaarweises Matching)
+            kps, descs, shapes, meta = extract_features(imgs, paths.features, log, prog)  # :contentReference[oaicite:6]{index=6}
+            if not kps or not shapes:
+                raise RuntimeError("Feature extraction returned no keypoints.")
+            pairs_np, matches_list = build_pairs(
+                paths.features,
+                device=device,
+                on_log=log,
+                save_dir=paths.matches
+            )
 
         # convert to SfM format
         def _as_sfm_matches(pairs_arr: np.ndarray, matches_any) -> Dict[tuple[int, int], list]:
@@ -287,11 +314,11 @@ class PipelineRunner:
         )
 
         res = run_sfm(
-            kps, descs, shapes,
+            kps, descs, shapes,                # kps/desc/shapes kommen entweder von LoFTR-Only oder vom klassischen Pfad
             pairs_np, matches_for_sfm,
             K, log, prog,
             poses_out_dir=poses_dir, config=cfg_sfm
-        )
+        )  # :contentReference[oaicite:7]{index=7}
 
         # 7) save sparse cloud
         if not (isinstance(res, tuple) and len(res) >= 1):

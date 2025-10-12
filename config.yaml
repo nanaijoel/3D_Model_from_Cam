@@ -16,10 +16,10 @@ features:
     force_num: true             # force fixed number of keypoints per image
 
   preproc:
-    clahe: true                 # enable CLAHE (contrast-limited adaptive histogram equalization)
+    clahe: false                 # enable CLAHE (contrast-limited adaptive histogram equalization)
     clahe_clip: 4.0             # CLAHE clip limit (contrast strength)
     clahe_tiles: 16             # CLAHE tile grid size
-    unsharp: true               # enable unsharp mask sharpening
+    unsharp: false               # enable unsharp mask sharpening
     unsharp_sigma: 1.0          # Gaussian blur sigma for unsharp mask
     unsharp_amount: 1.3         # blending amount for unsharp enhancement
     noise: false                # optionally add small random noise (for stability)
@@ -27,7 +27,7 @@ features:
     mask_dilate: 6              # dilation radius for feature mask (pixels)
 
 matching:
-  backend: lightglue            # matching backend ('lightglue' or 'classic')
+  backend: loftr-only            # matching backend ('lightglue' or 'classic')
   features: disk                # must match feature extractor type above
   ratio: 0.82                   # ratio test threshold (Lowe’s ratio)
   depth_confidence: -1          # LightGlue depth confidence (use default if <0)
