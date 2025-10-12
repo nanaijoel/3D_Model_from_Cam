@@ -73,7 +73,7 @@ mvs:
     mask_pad: 6                 # padding (in pixels) around masks during processing
 
 carve:
-  enable: true                  # enable space carving for visibility refinement
+  enable: false                 # enable space carving for visibility refinement
   use_all_masks: false          # if false: only use masks from reference views, also in "all" mode
   mode: "all"                   # carving policy: 'all' (strict),, 'majority' (robust), 'any' (loose)
   use_depth: false              # optionally check consistency against depth maps
