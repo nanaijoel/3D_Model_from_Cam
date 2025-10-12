@@ -12,7 +12,7 @@ class SfMConfig:
     # Init pair search
     MIN_MATCHES_INIT: int = 160
     MIN_FLOW_PX: float = 3.0
-    MIN_INLIERS_INIT: int = 35
+    MIN_INLIERS_INIT: int = 60
     INIT_WINDOW_FRAMES: int = 120
     INIT_MAX_SPAN: int = 10
     INIT_WINDOW_CENTER: Optional[int] = None
@@ -20,16 +20,16 @@ class SfMConfig:
     FORCE_INIT_PAIR: Optional[Tuple[int, int]] = None
 
     # PnP
-    MIN_INLIERS_PNP: int = 160         # hard acceptance
-    MIN_TRY_PNP: int = 60              # soft gate: try PnP from this many 2D-3D
+    MIN_INLIERS_PNP: int = 200         # hard acceptance
+    MIN_TRY_PNP: int = 80              # soft gate: try PnP from this many 2D-3D
     PNP_ITERS: int = 8000
     PNP_ERR_PX: float = 3.0
     PNP_REPROJ_ACCEPT: float = 2.5
 
     # Triangulation (pairwise during expansion)
-    TRI_MIN_CORR: int = 14
+    TRI_MIN_CORR: int = 10
     TRI_REPROJ_MAX: float = 2.0
-    TRI_MIN_PARALLAX_DEG: float = 4.0
+    TRI_MIN_PARALLAX_DEG: float = 3.0
 
     # Local stereo seeding
     SEED_SPAN: int = 3
@@ -39,7 +39,7 @@ class SfMConfig:
     # Multiview point validation (promotion)
     POINT_PROMOTION_MIN_OBS: int = 3
     POINT_MAX_MULTIVIEW_REPROJ: float = 2.0
-    POINT_MIN_MULTIVIEW_PARALLAX_DEG: float = 4.0
+    POINT_MIN_MULTIVIEW_PARALLAX_DEG: float = 3.0
     POINT_REQUIRE_POSITIVE_DEPTH_RATIO: float = 0.6
 
     # Low-parallax fallback
@@ -54,7 +54,7 @@ class SfMConfig:
     DENSIFY_ENABLE: bool = True
     DENSIFY_MAX_SPAN: int = 20
     DENSIFY_MIN_MATCHES: int = 50
-    DENSIFY_MIN_PARALLAX_DEG: float = 4.0
+    DENSIFY_MIN_PARALLAX_DEG: float = 3.0
     DENSIFY_MAX_REPROJ: float = 2.0
 
     # Keyframes, loop constraints, smoothing

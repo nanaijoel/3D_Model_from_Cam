@@ -6,10 +6,10 @@ features:
   device: cuda                  # compute device used for feature extraction ('cuda' or 'cpu')
   use_mask: true                # apply segmentation mask to filter keypoints
   max_kp: 25000                 # maximum number of keypoints per frame
-  debug_every: 20               # frequency of debug output (every N frames)
+  debug_every: 5               # frequency of debug output (every N frames)
 
   lg:
-    detection_threshold: 0.0001 # threshold for LightGlue detector (lower → more keypoints)
+    detection_threshold: 0.00005 # threshold for LightGlue detector (lower → more keypoints)
     nms: 2                      # non-maximum suppression radius (pixels)
     resize: 1536                # image resize before keypoint detection
     remove_borders: 2           # ignore border region (pixels)
@@ -61,8 +61,8 @@ mvs:
     # Frame selection
     ref_strategy: "bucket"      # reference frame selection strategy: 'bucket', 'bestk', or 'step'
     ref_topk: 60                # number of reference views to sample
-    ref_min_gap: 4              # minimum temporal gap between frames ('bestk' mode)
-    ref_step: 4                 # step size between reference frames ('step' mode)
+    ref_min_gap: 3              # minimum temporal gap between frames ('bestk' mode)
+    ref_step: 3                 # step size between reference frames ('step' mode)
 
     # Seeds and fill
     seed_radius: 2              # pixel radius for seeding depth hypotheses
@@ -82,7 +82,7 @@ carve:
 
 texturing:
   enable: true                  # enable texturing / color projection
-  divisor: 18                   # determines number of selected views (divisor + 1 views)
-  weight_power: 4.0             # weight exponent for blending view contributions
+  divisor: 6                   # determines number of selected views (divisor + 1 views)
+  weight_power: 6.0             # weight exponent for blending view contributions
   in_ply: fused_points.ply      # input point cloud file
   out_ply: fused_textured_points.ply  # output textured point cloud file
