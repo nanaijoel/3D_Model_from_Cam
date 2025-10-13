@@ -94,12 +94,9 @@ mvs:
     mask_pad: 6                 # padding (in pixels) around masks during processing
 
 carve:
-  enable: true                 # enable space carving for visibility refinement
-  use_all_masks: false          # if false: only use masks from reference views
-  mode: "any"                   # carving policy: 'all' (strict), 'majority' (robust), 'any' (loose)
-  use_depth: false              # optionally check consistency against depth maps
-  depth_tol: 0.02               # allowed depth deviation (meters or relative units)
-  chunk: 400000                 # maximum number of points processed per batch
+  enable: true            # schaltet Carving ein
+  use_all_masks: false    # true = alle Masken nutzen; false = nur n gleichverteilte
+  views: 4                # optional: erzwingt n Views (falls gesetzt, überschreibt divisor)
 
 texturing:
   enable: true                  # enable texturing / color projection

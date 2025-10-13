@@ -170,6 +170,8 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("CARVE_USE_DEPTH", cv.get("use_depth"))       # true/false
     setenv("CARVE_DEPTH_TOL", cv.get("depth_tol"))       # 0.03
     setenv("CARVE_CHUNK", cv.get("chunk"))
+    setenv("CARVE_VIEWS", cv.get("views"))
+
 
     tx = cfg.get("texturing", {}) or {}
     setenv("TEXTURE_ENABLE", pick_bool(tx.get("enable", True)))
@@ -343,7 +345,40 @@ class PipelineRunner:
             except Exception as e:
                 log("[error]\nSparse-Paint failed: " + str(e))
 
-        # 9) Texturing
+        # 8.5) Carving
+        try:
+            if _parse_bool(os.getenv("CARVE_ENABLE", "false"), False):
+                from meshing import carve_points_like_texturing
+                import meshing as _meshing
+                _meshing.GLOBAL_INTRINSICS_K = K
+
+                mesh_dir = os.path.join(paths.root, "mesh")
+                frames_dir = os.path.join(paths.root, "raw_frames")
+                masks_dir = os.path.join(paths.root, "features", "masks")
+                poses_npz = os.path.join(paths.root, "poses", "camera_poses.npz")
+
+                use_all = _parse_bool(os.getenv("CARVE_USE_ALL_MASKS", "false"), False)
+                # fixe Anzahl aus CARVE_VIEWS; fallback: TEXTURE_DIVISOR+1 (nur falls CARVE_VIEWS fehlt)
+                n_req = os.getenv("CARVE_VIEWS", "").strip()
+                if n_req.isdigit():
+                    n_req = int(n_req)
+                else:
+                    n_req = int(float(os.getenv("TEXTURE_DIVISOR", "6"))) + 1
+
+                log(f"[carve] start (use_all={use_all}, views={n_req})")
+                carve_points_like_texturing(
+                    mesh_dir=mesh_dir,
+                    frames_dir=frames_dir,
+                    poses_npz=poses_npz,
+                    masks_dir=masks_dir,
+                    use_all_masks=use_all,
+                    n_views=n_req,
+                    on_log=log, on_progress=prog
+                )
+        except Exception as e:
+            log(f"[carve] failed: {e}")
+
+        # 10) Texturing
         try:
             if _parse_bool(os.getenv("TEXTURE_ENABLE", "true"), True):
                 mesh_dir = os.path.join(paths.root, "mesh")
