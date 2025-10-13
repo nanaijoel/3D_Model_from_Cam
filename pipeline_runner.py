@@ -72,6 +72,21 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("FEATURE_MAX_KP", pick_num(fe.get("max_kp", 4096)))
     setenv("FEATURE_DEBUG_EVERY", pick_num(fe.get("debug_every", 0)))
 
+    fill = fe.get("fill", {}) or {}
+    setenv("FEATURE_FILL_ENABLE", fill.get("enable", True))
+    setenv("FEATURE_FILL_THR", fill.get("thr", 0.05))
+    setenv("FEATURE_FILL_KP_RADIUS", fill.get("kp_radius", 4))
+    setenv("FEATURE_FILL_ERODE", fill.get("erode", 2))
+    setenv("FEATURE_FILL_DILATE", fill.get("dilate", 4))
+    setenv("FEATURE_FILL_MERGE_R", fill.get("merge_r", 2))
+
+    setenv("FEATURE_FILL_GAMMA", fill.get("gamma", 0.75))
+    setenv("FEATURE_FILL_CLAHE_CLIP", fill.get("clahe_clip", 6.0))
+    setenv("FEATURE_FILL_CLAHE_TILES", fill.get("clahe_tiles", 8))
+    setenv("FEATURE_FILL_UNSHARP_SIGMA", fill.get("unsharp_sigma", 1.2))
+    setenv("FEATURE_FILL_UNSHARP_AMOUNT", fill.get("unsharp_amount", 1.8))
+    setenv("FEATURE_FILL_NOISE", fill.get("noise", False))
+    setenv("FEATURE_FILL_NOISE_STD", fill.get("noise_std", 2.0))
 
     pp = fe.get("preproc", {})
     setenv("FEATURE_PREPROC_CLAHE", pick_bool(pp.get("clahe", True)))

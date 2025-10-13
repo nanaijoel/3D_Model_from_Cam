@@ -6,14 +6,14 @@ features:
   device: cuda                  # compute device used for feature extraction ('cuda' or 'cpu')
   use_mask: true                # apply segmentation mask to filter keypoints
   max_kp: 25000                 # maximum number of keypoints per frame
-  debug_every: 5               # frequency of debug output (every N frames)
+  debug_every: 5                # frequency of debug output (every N frames)
 
   lg:
-    detection_threshold: 0.00005 # threshold for LightGlue detector (lower → more keypoints)
-    nms: 2                      # non-maximum suppression radius (pixels)
-    resize: 1536                # image resize before keypoint detection
-    remove_borders: 2           # ignore border region (pixels)
-    force_num: true             # force fixed number of keypoints per image
+    detection_threshold: 0.000005  # threshold for LightGlue detector (lower → more keypoints)
+    nms: 2                        # non-maximum suppression radius (pixels)
+    resize: 1024                  # image resize before keypoint detection
+    remove_borders: 2             # ignore border region (pixels)
+    force_num: true               # force fixed number of keypoints per image
 
   preproc:
     clahe: true                 # enable CLAHE (contrast-limited adaptive histogram equalization)
@@ -25,6 +25,27 @@ features:
     noise: false                # optionally add small random noise (for stability)
     noise_std: 1.5              # noise standard deviation (if enabled)
     mask_dilate: 6              # dilation radius for feature mask (pixels)
+
+  # ---------------------------------------------------------------------
+  # NEW: Iterative Feature-Fill (2nd pass for dark / featureless areas)
+  # ---------------------------------------------------------------------
+  fill:
+    enable: true             # enable second pass on "featureless" areas
+    thr: 0.08                # density threshold [0..1]; higher = more areas filled
+    kp_radius: 4             # radius (pixels) per keypoint in density map
+    erode: 2                 # Restmask morphology: erosion iterations
+    dilate: 6                # Restmask morphology: dilation iterations
+    merge_r: 2               # merge radius for combining pass1+pass2 keypoints
+
+    # enhanced preprocessing for dark regions (only in pass 2)
+    gamma: 0.45              # <1 brightens image (use 0.45 for darker scenes)
+    clahe_clip: 8.0          # stronger local contrast
+    clahe_tiles: 24
+    unsharp_sigma: 1.0
+    unsharp_amount: 1.5
+    noise: true             # optional texture noise addition
+    noise_std: 1.4
+
 
 matching:
   backend: lightglue            # matching backend ('lightglue' or 'classic')
@@ -73,16 +94,16 @@ mvs:
     mask_pad: 6                 # padding (in pixels) around masks during processing
 
 carve:
-  enable: false                 # enable space carving for visibility refinement
-  use_all_masks: false          # if false: only use masks from reference views, also in "all" mode
-  mode: "all"                   # carving policy: 'all' (strict),, 'majority' (robust), 'any' (loose)
+  enable: true                 # enable space carving for visibility refinement
+  use_all_masks: false          # if false: only use masks from reference views
+  mode: "any"                   # carving policy: 'all' (strict), 'majority' (robust), 'any' (loose)
   use_depth: false              # optionally check consistency against depth maps
   depth_tol: 0.02               # allowed depth deviation (meters or relative units)
   chunk: 400000                 # maximum number of points processed per batch
 
 texturing:
   enable: true                  # enable texturing / color projection
-  divisor: 6                   # determines number of selected views (divisor + 1 views)
+  divisor: 6                    # determines number of selected views (divisor + 1 views)
   weight_power: 6.0             # weight exponent for blending view contributions
   in_ply: fused_points.ply      # input point cloud file
   out_ply: fused_textured_points.ply  # output textured point cloud file
