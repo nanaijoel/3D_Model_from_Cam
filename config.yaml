@@ -38,7 +38,7 @@ features:
     merge_r: 2               # merge radius for combining pass1+pass2 keypoints
 
     # enhanced preprocessing for dark regions (only in pass 2)
-    gamma: 0.45              # <1 brightens image (use 0.45 for darker scenes)
+    gamma: 0.3             # <1 brightens image (use 0.45 for darker scenes)
     clahe_clip: 8.0          # stronger local contrast
     clahe_tiles: 24
     unsharp_sigma: 1.0
@@ -80,7 +80,7 @@ mvs:
     scale: 1.0                  # input image scaling factor (1.0 = full res)
 
     # Frame selection
-    ref_strategy: "bucket"      # reference frame selection strategy: 'bucket', 'bestk', or 'step'
+    ref_strategy: "step"      # reference frame selection strategy: 'bestk', or 'step'
     ref_topk: 60                # number of reference views to sample
     ref_min_gap: 3              # minimum temporal gap between frames ('bestk' mode)
     ref_step: 3                 # step size between reference frames ('step' mode)
@@ -94,13 +94,13 @@ mvs:
     mask_pad: 6                 # padding (in pixels) around masks during processing
 
 carve:
-  enable: true            # schaltet Carving ein
-  use_all_masks: false    # true = alle Masken nutzen; false = nur n gleichverteilte
-  views: 4                # optional: erzwingt n Views (falls gesetzt, überschreibt divisor)
+  enable: true
+  use_all_masks: false
+  views: 12
 
 texturing:
   enable: true                  # enable texturing / color projection
   divisor: 6                    # determines number of selected views (divisor + 1 views)
-  weight_power: 6.0             # weight exponent for blending view contributions
+  weight_power: 2.0             # weight exponent for blending view contributions
   in_ply: fused_points.ply      # input point cloud file
   out_ply: fused_textured_points.ply  # output textured point cloud file

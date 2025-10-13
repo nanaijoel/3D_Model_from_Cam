@@ -172,7 +172,6 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("CARVE_CHUNK", cv.get("chunk"))
     setenv("CARVE_VIEWS", cv.get("views"))
 
-
     tx = cfg.get("texturing", {}) or {}
     setenv("TEXTURE_ENABLE", pick_bool(tx.get("enable", True)))
     setenv("TEXTURE_DIVISOR", int(pick_num(tx.get("divisor", 6))))

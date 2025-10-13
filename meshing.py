@@ -220,19 +220,13 @@ def _choose_ref_indices(N: int, scores: np.ndarray,
     return chosen
 
 
-# --------- Lokale Tiefen-Füllung (kleine Lücken) ---------
 
 def _densify_small_gaps_depth(u: np.ndarray, v: np.ndarray, z: np.ndarray,
                               mask_img: np.ndarray, H: int, W: int,
-                              max_gap: int = 4, iters: int = 3,
-                              depth_std: float = 0.02, depth_rel: float = 0.05,
+                              max_gap: int = 8, iters: int = 3,
+                              depth_std: float = 0.04, depth_rel: float = 0.08,
                               stride: int = 2) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Baut aus den projizierten Sparse-Punkten (u,v,z) eine dünne Depth-Map,
-    füllt kleine Lücken (<= max_gap) nur dort, wo die Nachbar-Tiefen konsistent sind
-    (Gate über absolute UND/ODER relative Std), und gibt neue (u,v,z) Pixel zurück,
-    die vorher noch nicht belegt waren. Optional Subsampling über 'stride'.
-    """
+
     valid = (z > 1e-6)
     if not np.any(valid):
         return np.array([], np.float32), np.array([], np.float32), np.array([], np.float32)
@@ -332,22 +326,13 @@ def _save_colored_ply_any(P: np.ndarray, C: np.ndarray | None, out_path: str) ->
 
 def run_visible_sparse_with_fill(mesh_dir: str, frames_dir: str, poses_npz: str, masks_dir: str | None,
                                  on_log=None, on_progress=None) -> str:
-    """
-    1) Lädt sparse.ply (Weltkoordinaten).
-    2) Wählt Referenz-Views (step/bestk).
-    3) Für jede Ref-View:
-       - Projiziert Sparse → behält nur sichtbare & maskierte Punkte
-       - (optional) füllt kleine Lücken im Bildraum mit konsistenter Tiefe
-       - back-projiziert die gefüllten Pixel als zusätzliche Weltpunkte
-    4) Speichert Union als fused_points.ply
-    """
+
     _mkdir(mesh_dir)
 
     K = globals().get("GLOBAL_INTRINSICS_K", None)
     if K is None:
         raise RuntimeError("GLOBAL_INTRINSICS_K ist nicht gesetzt.")
 
-    # Ressourcen laden
     R_all, t_all, _ = _load_poses_npz(poses_npz)
     frame_files = _sorted_frames(frames_dir)
     if len(frame_files) == 0:
@@ -364,13 +349,11 @@ def run_visible_sparse_with_fill(mesh_dir: str, frames_dir: str, poses_npz: str,
     images = images[:V]
     masks = masks[:V]
 
-    # Sparse laden
     sparse_path = os.path.join(mesh_dir, "sparse.ply")
     P = _read_sparse_points(sparse_path)
     if P is None or P.size == 0:
         raise RuntimeError("sparse.ply ist leer oder fehlt.")
 
-    # Referenz-Views
     REF_STRAT = (os.getenv("MVS_REF_STRATEGY", "step") or "step").strip().lower()
     REF_TOPK  = int(float(os.getenv("MVS_REF_TOPK", "0")))
     REF_MIN_G = int(float(os.getenv("MVS_REF_MIN_GAP", "2")))
@@ -489,35 +472,47 @@ def reconstruct_mvs_depth_and_mesh_all(paths, K,
 
 
 
-# ===== Carving im Texturing-Stil =============================================
-
 def _evenly_pick_from_index_list(idxs: list[int], n_views: int) -> list[int]:
-    """Wählt n gleichmäßig verteilte Einträge aus einer Liste vorhandener Indizes."""
     if not idxs:
         return []
     n_views = max(1, min(int(n_views), len(idxs)))
     if n_views == len(idxs):
         return list(idxs)
-    pos = np.linspace(0, len(idxs)-1, num=n_views, dtype=int)
-    pos = np.unique(np.clip(pos, 0, len(idxs)-1))
+    pos = np.linspace(0, len(idxs) - 1, num=n_views, dtype=int)
+    pos = np.unique(np.clip(pos, 0, len(idxs) - 1))
     return [idxs[p] for p in pos.tolist()]
 
+def _dilate_mask(m: np.ndarray, px: int) -> np.ndarray:
+    if px <= 0: return m
+    k = (2*px+1, 2*px+1)
+    return cv.dilate(m, cv.getStructuringElement(cv.MORPH_ELLIPSE, k))
+
+def _save_carve_debug(frame_bgr: np.ndarray, m: np.ndarray, u: np.ndarray, v: np.ndarray,
+                      inside_img: np.ndarray, inside_mask: np.ndarray, out_path: str) -> None:
+    dbg = frame_bgr.copy()
+    # Maske-Kontur
+    cnts, _ = cv.findContours((m > 0).astype(np.uint8), cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+    cv.drawContours(dbg, cnts, -1, (0, 255, 0), 2)
+    # Punkte
+    pts = np.stack([u, v], axis=1).astype(np.int32)
+    ok  = inside_img & inside_mask
+    bad = inside_img & (~inside_mask)
+    for p in pts[ok]:
+        cv.circle(dbg, tuple(p), 1, (0, 255, 0), -1)
+    for p in pts[bad]:
+        cv.circle(dbg, tuple(p), 1, (0, 0, 255), -1)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    cv.imwrite(out_path, dbg)
+
 def carve_points_like_texturing(mesh_dir: str, frames_dir: str, poses_npz: str, masks_dir: str | None,
-                                use_all_masks: bool = False, n_views: int = 4,
+                                use_all_masks: bool = False, n_views: int = 3,
                                 on_log=None, on_progress=None) -> str:
-    """
-    - Wählt Views gleichmäßig verteilt wie beim Texturing (aber mit fixer Anzahl n_views).
-    - Nutzt NUR Frames, zu denen es eine Maske gibt (→ nie mehr Views als Masken).
-    - Maske i ↔ Pose i ↔ Frame i bleiben gekoppelt.
-    - Behalten wird ein Punkt, wenn er in JEDEM gewählten View entweder
-      (unsichtbar) ODER (sichtbar & in Maske) liegt.
-    - Überschreibt mesh/fused_points.ply.
-    """
+
     K = globals().get("GLOBAL_INTRINSICS_K", None)
     if K is None:
         raise RuntimeError("GLOBAL_INTRINSICS_K ist nicht gesetzt.")
 
-    # 3D Punkte laden (fused > sparse als Fallback)
+    # Punkte laden (fused > sparse)
     fused_path = os.path.join(mesh_dir, "fused_points.ply")
     P = _read_sparse_points(fused_path)
     if P is None or P.size == 0:
@@ -533,11 +528,8 @@ def carve_points_like_texturing(mesh_dir: str, frames_dir: str, poses_npz: str, 
     R_all, t_all, _ = _load_poses_npz(poses_npz)
 
     V = min(len(frame_files), len(R_all))
-    frame_files = frame_files[:V]
-    R_all = R_all[:V]
-    t_all = t_all[:V]
+    frame_files = frame_files[:V]; R_all = R_all[:V]; t_all = t_all[:V]
 
-    # Bildgröße
     H, W = _load_color(frame_files[0]).shape[:2]
 
     # Masken-Frames sammeln
@@ -559,40 +551,71 @@ def carve_points_like_texturing(mesh_dir: str, frames_dir: str, poses_npz: str, 
     if use_all_masks:
         refs = list(mask_indices)
     else:
-        n_req = max(1, int(n_views))
-        refs = _evenly_pick_from_index_list(mask_indices, n_req)
+        refs = _evenly_pick_from_index_list(mask_indices, max(1, int(n_views)))
 
-    _log(f"[carve] using {len(refs)} views (requested {n_views}, available_masks {len(mask_indices)}) -> {refs}", on_log)
+    # Robustheits-Parameter
+    TAU = float(os.getenv("CARVE_TAU", "0.8"))
+    TAU = min(1.0, max(0.01, TAU))
+    DIL = int(float(os.getenv("CARVE_MASK_DILATE_PX", "1")))
+    DO_DBG = str(os.getenv("CARVE_DEBUG", "false")).lower() in ("1","true","yes","y","on")
 
-    # Carving
-    keep = np.ones(P.shape[0], dtype=bool)
+    _log(f"[carve] using {len(refs)} views (requested {n_views}, available_masks {len(mask_indices)}) "
+         f"tau={TAU:.2f}, dil={DIL}px -> {refs}", on_log)
+
+
+    vis_count   = np.zeros(P.shape[0], dtype=np.int32)
+    inside_count= np.zeros(P.shape[0], dtype=np.int32)
+
     for k, ridx in enumerate(refs):
         if on_progress:
             on_progress(int(100.0 * k / max(1, len(refs))), f"carve v={ridx}")
+
         m = masks.get(ridx, None)
         if m is None:
-            # sollte nicht passieren, da refs aus mask_indices kommt
             continue
+        if DIL > 0:
+            m = _dilate_mask(m, DIL)
+
 
         C = (-R_all[ridx].T @ t_all[ridx]).reshape(3)
         Xc = (R_all[ridx] @ (P.T - C.reshape(3, 1))).T
         z = Xc[:, 2]
         u = K[0,0]*Xc[:,0]/np.maximum(z,1e-9) + K[0,2]
         v = K[1,1]*Xc[:,1]/np.maximum(z,1e-9) + K[1,2]
+
         inside_img = (z > 1e-6) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
-
         ui = np.clip(np.floor(u).astype(np.int32), 0, W - 1)
-        vi2 = np.clip(np.floor(v).astype(np.int32), 0, H - 1)
+        vi2= np.clip(np.floor(v).astype(np.int32), 0, H - 1)
 
-        ok_mask = np.zeros_like(keep, dtype=bool)
-        idx = np.where(inside_img)[0]
-        if idx.size:
-            ok_mask[idx] = (m[vi2[idx], ui[idx]] > 0)
+        vis_idx = np.where(inside_img)[0]
+        if vis_idx.size:
+            vis_count[vis_idx] += 1
+            in_mask = (m[vi2[vis_idx], ui[vis_idx]] > 0)
+            inside_count[vis_idx] += in_mask.astype(np.int32)
 
-        # Punkt bleibt, wenn er (unsichtbar) ODER (sichtbar & in Maske) ist.
-        keep &= (~inside_img) | (ok_mask)
+        if DO_DBG:
+            f_bgr = _load_color(frame_files[ridx])
+            dbg_path = os.path.join(mesh_dir, f"carve_v{ridx:04d}_dbg.png")
+
+            inside_mask = np.zeros_like(inside_img, dtype=bool)
+            if vis_idx.size:
+                inside_mask[vis_idx] = (m[vi2[vis_idx], ui[vis_idx]] > 0)
+            _save_carve_debug(f_bgr, m, u, v, inside_img, inside_mask, dbg_path)
+
+
+    keep = np.ones(P.shape[0], dtype=bool)
+
+    vis_pos = np.where(vis_count > 0)[0]
+    if vis_pos.size:
+        frac = np.zeros_like(vis_count, dtype=np.float32)
+        frac[vis_pos] = inside_count[vis_pos] / np.maximum(vis_count[vis_pos], 1)
+        keep[vis_pos] = (frac[vis_pos] >= TAU)
+
 
     out_path = os.path.join(mesh_dir, "fused_points.ply")
     save_point_cloud(P[keep], out_path, on_log=on_log, on_progress=on_progress)
-    _log(f"[carve] kept {int(np.count_nonzero(keep))}/{P.shape[0]} points", on_log)
+    _log(f"[carve] kept {int(np.count_nonzero(keep))}/{P.shape[0]} points "
+         f"(vis_any={int(np.count_nonzero(vis_count>0))}, "
+         f"median_vis={np.median(vis_count[vis_count>0]) if np.any(vis_count>0) else 0})",
+         on_log)
     return out_path
