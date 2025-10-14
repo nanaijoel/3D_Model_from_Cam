@@ -163,6 +163,7 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("MVS_EXPORT_MESH", mp.get("export_mesh"))
     setenv("MVS_POISSON_DEPTH", mp.get("poisson_depth"))
 
+
     cv = cfg.get("carve", {}) or {}
     setenv("CARVE_ENABLE", cv.get("enable"))
     setenv("CARVE_USE_ALL_MASKS", cv.get("use_all_masks"))
@@ -344,7 +345,9 @@ class PipelineRunner:
             except Exception as e:
                 log("[error]\nSparse-Paint failed: " + str(e))
 
-        # 8.5) Carving
+
+
+            # 9) Carving
         try:
             if _parse_bool(os.getenv("CARVE_ENABLE", "false"), False):
                 from meshing import carve_points_like_texturing
@@ -405,3 +408,5 @@ class PipelineRunner:
 
         prog(100, "finished")
         return sparse_ply, paths
+
+
