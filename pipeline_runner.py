@@ -180,6 +180,9 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("TEXTURE_WEIGHT_POWER", pick_num(tx.get("weight_power", 2.0)))
     setenv("TEXTURE_IN_PLY", tx.get("in_ply", "fused_points.ply"))
     setenv("TEXTURE_OUT_PLY", tx.get("out_ply", "fused_textured_points.ply"))
+    # NEU:
+    setenv("TEXTURE_USE_MASKS", tx.get("use_masks", True))
+    setenv("TEXTURE_MASK_DILATE", int(pick_num(tx.get("mask_dilate", 5))))
 
 def _auto_views(n_frames: int, divisor: int) -> list[int]:
     import numpy as _np
@@ -266,18 +269,19 @@ class PipelineRunner:
         # Welche Bilder für Masking/Features?
         imgs_for_features = processed_imgs if (processed_imgs and len(processed_imgs) == len(imgs)) else imgs
 
-        # 2) optional masking / preprocessing —> auf denselben Bildern wie Feature-Extraction!
+        # 2) Masking immer auf RAW-Frames, niemals auf processed_frames
         prog(20, "Image preprocessing / masking")
         if _parse_bool(os.getenv("MASK_ENABLE", "false"), False):
-            log("[mask] preprocessing enabled")
+            log("[mask] preprocessing enabled (SOURCE=raw_frames)")
             method = os.getenv("MASK_METHOD", "auto")
-            overwrite = _parse_bool(os.getenv("MASK_OVERWRITE_IMAGES", "false"), False)
+            # Originals NICHT überschreiben – sicherheitshalber auf False pinnen
+            overwrite = False
             mask_dir = os.path.join(paths.features, "masks")
             params = (cfg.get("masking", {}) or {}).get("params", {}) or {}
             log(f"[mask] method={method}, overwrite={overwrite}")
             log(f"[mask] params={params}")
             preprocess_images(
-                imgs_for_features,
+                imgs,  # <-- RAW frames!
                 out_mask_dir=mask_dir,
                 overwrite_images=overwrite,
                 method=method,
@@ -285,7 +289,6 @@ class PipelineRunner:
                 save_debug=True
             )
 
-        # 3) features —> ausschließlich von processed_frames (falls vorhanden)
         kps, descs, shapes, meta = extract_features(imgs_for_features, paths.features, log, prog)
         if not kps or not shapes:
             raise RuntimeError("Feature extraction returned no keypoints.")
@@ -357,7 +360,7 @@ class PipelineRunner:
         mesh_dir = os.path.join(paths.root, "mesh")
         os.makedirs(mesh_dir, exist_ok=True)
         sparse_ply = os.path.join(mesh_dir, "sparse.ply")
-        save_point_cloud(points3d, sparse_ply, on_log=log, on_progress=prog)
+        save_point_cloud(points3d, sparse_ply, filter_min_points=10**9, on_log=log, on_progress=prog)
         log(f"[sfm] raw_points(after validation)={points3d.shape[0]:d}")
         log(f"[ui] Done: {sparse_ply}")
 

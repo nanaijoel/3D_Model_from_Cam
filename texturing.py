@@ -1,25 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Project structure:
-- projects/NAME/raw_frames/frame_XXXX.png
-- projects/NAME/features/masks/frame_XXXX_mask.png
-- projects/NAME/poses/camera_poses.npz               (R,t, frame_idx)
-- projects/NAME/mesh/fused_points.ply                (input)
-- projects/NAME/mesh/fused_textured_points.ply       (output)
-"""
 
-import os
 import glob
 import numpy as np
 import cv2 as cv
+import os
 
 try:
     import open3d as o3d
     HAS_O3D = True
 except Exception:
     HAS_O3D = False
-
 
 
 def _load_color(path: str) -> np.ndarray:
@@ -119,7 +110,6 @@ def _save_points_ply(path: str, P: np.ndarray, C: np.ndarray | None = None) -> N
                 f.write(f"{p[0]} {p[1]} {p[2]} {int(c[2])} {int(c[1])} {int(c[0])}\n")
 
 
-
 def _load_poses_npz(path_npz: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     npz = np.load(path_npz)
     R_all = npz["R"]                  # (N,3,3) world->cam
@@ -146,11 +136,6 @@ def _project_points(K: np.ndarray, R: np.ndarray, t: np.ndarray, Pw: np.ndarray)
 
 
 def compute_auto_views(n_frames: int, divisor: int) -> list[int]:
-    """
-    Select evenly distributed views:
-    - Returns divisor + 1 indices between 0 and n_frames − 1 (inclusive).
-    - Robust even when n_frames < divisor + 1 (ensures uniqueness and clipping).
-    """
     divisor = max(1, int(divisor))
     if n_frames <= 1:
         return [0]
@@ -167,12 +152,17 @@ def texture_points_from_views(
     weight_power: float = 2.0
 ) -> str:
     """
-    Projects colors auf the selected view frames on the 3D point cloud.
+    Projects colors from selected view frames onto the 3D point cloud.
+    - Colors: always from raw_frames
+    - Masks: from features/masks (optional, with dilation)
     """
     frames_dir = os.path.join(project_root, "raw_frames")
     masks_dir = os.path.join(project_root, "features", "masks")
     mesh_dir = os.path.join(project_root, "mesh")
     poses_npz = os.path.join(project_root, "poses", "camera_poses.npz")
+
+    use_masks = str(os.getenv("TEXTURE_USE_MASKS", "true")).lower() in ("1","true","yes","y","on")
+    mask_dilate = int(float(os.getenv("TEXTURE_MASK_DILATE", "0")))
 
     # Load 3D points
     P, C_init = _read_points_ply(os.path.join(mesh_dir, in_ply))
@@ -186,7 +176,7 @@ def texture_points_from_views(
         raise RuntimeError(f"Keine Frames in {frames_dir} gefunden.")
     R_all, t_all, _ = _load_poses_npz(poses_npz)
 
-    # Intrinsics of first frame defined as in the pipline
+    # Intrinsics of first frame
     im0 = _load_color(frame_files[0])
     K = _intrinsics_from_image(im0)
     H, W = im0.shape[:2]
@@ -195,16 +185,31 @@ def texture_points_from_views(
     vmax = min(len(frame_files), len(R_all))
     view_ids = [int(v) for v in view_ids if 0 <= int(v) < vmax]
     if len(view_ids) == 0:
-        # Fallback: at least take first frame
         view_ids = [0]
+
+    # Prebuild dilate kernel if needed
+    kernel = None
+    if mask_dilate > 0:
+        k = max(1, int(mask_dilate))
+        kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (2*k+1, 2*k+1))
 
     for vi in view_ids:
         im = _load_color(frame_files[vi])
-        mask = _mask_for_frame(masks_dir, frame_files[vi])
+
+        # Mask handling
+        mask = None
+        if use_masks:
+            mask = _mask_for_frame(masks_dir, frame_files[vi])
+            if mask is None:
+                mask = np.ones(im.shape[:2], np.uint8) * 255
+            else:
+                if kernel is not None:
+                    mask = cv.dilate((mask > 0).astype(np.uint8)*255, kernel)
+
         if mask is None:
             mask = np.ones(im.shape[:2], np.uint8) * 255
 
-        # project points in teh specific view of frame / camera pose
+        # project points to this view
         u, v, z = _project_points(K, R_all[vi], t_all[vi], P)
 
         # Valid projections in image + camera + mask
@@ -228,15 +233,15 @@ def texture_points_from_views(
         order = np.argsort(z_valid)  # near first
         lin_sorted = lin[order]
         _, first_idx = np.unique(lin_sorted, return_index=True)
-        sel = order[first_idx]  # selected point indices (in pidx)
+        sel = order[first_idx]
 
-        # get image color points
+        # Sample colors
         cols = im[vi2[sel], ui[sel]].astype(np.float64)
 
         # Weights (Distance falloff 1/z^power)
         w = 1.0 / np.maximum(z_valid[sel], 1e-6) ** weight_power
 
-        # Farben akkumulieren
+        # Accumulate
         np.add.at(col_sum, pidx[sel], (cols.T * w).T)
         np.add.at(w_sum, pidx[sel], w)
 
@@ -245,12 +250,11 @@ def texture_points_from_views(
     have = w_sum > 1e-9
     C[have] = (col_sum[have] / w_sum[have][:, None])
 
-    # Fallback: if points weren't in sight, keep old color
+    # Fallback: keep old color or mid gray
     if C_init is not None and C_init.shape[0] == N:
         C[~have] = C_init[~have]
     else:
-        C[~have] = 127.0  # neutral gray values
-
+        C[~have] = 127.0
 
     out_path = os.path.join(mesh_dir, out_ply)
     _save_points_ply(out_path, P, C)
@@ -264,14 +268,11 @@ def texture_project_auto(
     out_ply: str = "fused_textured_points.ply",
     weight_power: float = 2.0
 ) -> tuple[str, list[int]]:
-    """
-    - find n over raw_frames
-    - select view-frames automatically via compute_auto_views(N, divisor)
-    - calls texture_points_from_views(...)
-    """
     frames_dir = os.path.join(project_root, "raw_frames")
     frame_files = _sorted_frames(frames_dir)
     n_frames = len(frame_files)
+    if n_frames <= 0:
+        raise RuntimeError(f"Keine Frames in {frames_dir} gefunden.")
     views = compute_auto_views(n_frames, divisor)
     out_path = texture_points_from_views(
         project_root=project_root,
