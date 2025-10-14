@@ -20,6 +20,10 @@ from meshing import (
 from texturing import texture_points_from_views
 
 
+# -----------------------------------------------------------------------------#
+# Konfig laden & in ENV spiegeln
+# -----------------------------------------------------------------------------#
+
 def _load_yaml_or_json(path: str) -> Dict[str, Any]:
     ext = os.path.splitext(path)[1].lower()
     if ext in (".yaml", ".yml"):
@@ -73,11 +77,10 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("LOWLIGHT_WEIGHTS", ll.get("weights"))
     setenv("LOWLIGHT_PATTERN", ll.get("pattern", "*.png"))
     setenv("LOWLIGHT_SCALE", ll.get("scale_factor", 1))
-    # NEU: Output-Steuerung
     setenv("LOWLIGHT_OUTPUT_MODE", (ll.get("output_mode", "separate") or "separate"))
     setenv("LOWLIGHT_OUT_DIR", ll.get("out_dir", "processed_frames"))
 
-    fe = cfg.get("features", {})
+    fe = cfg.get("features", {}) or {}
     setenv("FEATURE_BACKEND", fe.get("backend"))
     setenv("FEATURE_DEVICE", fe.get("device"))
     setenv("FEATURE_USE_MASK", fe.get("use_mask"))
@@ -99,7 +102,7 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("FEATURE_FILL_NOISE", fill.get("noise", False))
     setenv("FEATURE_FILL_NOISE_STD", fill.get("noise_std", 2.0))
 
-    pp = fe.get("preproc", {})
+    pp = fe.get("preproc", {}) or {}
     setenv("FEATURE_PREPROC_CLAHE", pick_bool(pp.get("clahe", True)))
     setenv("FEATURE_PREPROC_CLAHE_CLIP", pick_num(pp.get("clahe_clip", 3.0)))
     setenv("FEATURE_PREPROC_CLAHE_TILES", int(pick_num(pp.get("clahe_tiles", 8))))
@@ -110,24 +113,24 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("FEATURE_PREPROC_NOISE_STD", pick_num(pp.get("noise_std", 1.5)))
     setenv("FEATURE_MASK_DILATE", int(pick_num(pp.get("mask_dilate", 5))))
 
-    lg = fe.get("lg", {})
+    lg = fe.get("lg", {}) or {}
     setenv("FEATURE_LG_DET_THR", pick_num(lg.get("detection_threshold", 0.001)))
     setenv("FEATURE_LG_NMS", int(pick_num(lg.get("nms", 3))))
     setenv("FEATURE_LG_RESIZE", int(pick_num(lg.get("resize", 1024))))
     setenv("FEATURE_LG_REMOVE_BORDERS", int(pick_num(lg.get("remove_borders", 2))))
     setenv("FEATURE_LG_FORCE_NUM", pick_bool(lg.get("force_num", False)))
 
-    sf = fe.get("sift", {})
+    sf = fe.get("sift", {}) or {}
     setenv("FEATURE_SIFT_CONTRAST", pick_num(sf.get("contrast", 0.004)))
     setenv("FEATURE_SIFT_EDGE", int(pick_num(sf.get("edge", 12))))
     setenv("FEATURE_SIFT_SIGMA", pick_num(sf.get("sigma", 1.2)))
 
-    mask_cfg = cfg.get("masking", {})
+    mask_cfg = cfg.get("masking", {}) or {}
     setenv("MASK_ENABLE", pick_bool(mask_cfg.get("enable", False)))
     setenv("MASK_METHOD", mask_cfg.get("method"))
     setenv("MASK_OVERWRITE_IMAGES", pick_bool(mask_cfg.get("overwrite_images", False)))
 
-    ma = cfg.get("matching", {})
+    ma = cfg.get("matching", {}) or {}
     setenv("MATCH_BACKEND", ma.get("backend"))
     setenv("MATCH_RATIO", pick_num(ma.get("ratio", 0.82)))
     setenv("MATCH_DEPTH", ma.get("depth_confidence"))
@@ -136,7 +139,7 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     if "features" in ma:
         setenv("MATCH_FEATURES", str(ma["features"]).lower())
 
-    sfm = cfg.get("sfm", {})
+    sfm = cfg.get("sfm", {}) or {}
     setenv("SFM_INIT_RATIO", pick_num(sfm.get("init_ratio", 0.5)))
     setenv("SFM_INIT_MAX_SPAN", pick_num(sfm.get("init_max_span", 6)))
     setenv("SFM_DENSIFY", pick_bool(sfm.get("densify", True)))
@@ -145,7 +148,7 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("SFM_POSE_SMOOTHING", pick_bool(sfm.get("pose_smoothing", True)))
     setenv("SFM_SMOOTH_LAMBDA", pick_num(sfm.get("smooth_lambda", 0.25)))
 
-    mvs = cfg.get("mvs", {})
+    mvs = cfg.get("mvs", {}) or {}
     setenv("MVS_ENABLE", pick_bool(mvs.get("enable", True)))
     setenv("MVS_MODE", (mvs.get("mode", "all") or "all"))
     mp = mvs.get("params", {}) or {}
@@ -180,7 +183,6 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("TEXTURE_WEIGHT_POWER", pick_num(tx.get("weight_power", 2.0)))
     setenv("TEXTURE_IN_PLY", tx.get("in_ply", "fused_points.ply"))
     setenv("TEXTURE_OUT_PLY", tx.get("out_ply", "fused_textured_points.ply"))
-    # NEU:
     setenv("TEXTURE_USE_MASKS", tx.get("use_masks", True))
     setenv("TEXTURE_MASK_DILATE", int(pick_num(tx.get("mask_dilate", 5))))
 
@@ -206,6 +208,36 @@ def _dump_resolved_config(project_root: str) -> str:
             json.dump(kv, f, indent=2, ensure_ascii=False)
     return out_path
 
+
+# -----------------------------------------------------------------------------#
+# optionale Auto-Fokalschätzung aus Fundamental-Matrix (robuste Approximation)
+# -----------------------------------------------------------------------------#
+
+def _estimate_f_from_pair(p1: np.ndarray, p2: np.ndarray, W: int, H: int) -> Optional[float]:
+    F, _ = cv.findFundamentalMat(p1, p2, cv.FM_RANSAC, 1.0, 0.999)
+    if F is None or F.size == 0:
+        return None
+    cx, cy = W * 0.5, H * 0.5
+
+    def err_for_f(f):
+        if not np.isfinite(f) or f <= 10: return 1e6
+        K = np.array([[f,0,cx],[0,f,cy],[0,0,1]], float)
+        E = K.T @ F @ K
+        _, S, _ = np.linalg.svd(E)
+        # „Essentiell“: Rang≈2, S1≈S2, S3≈0
+        return abs(S[2]) + abs(S[0] - S[1])
+
+    grid = np.linspace(0.4, 2.0, 25) * max(W, H)
+    f_best = float(min(grid, key=err_for_f))
+    fine = np.linspace(max(50.0, f_best*0.7), f_best*1.3, 21)
+    f_best = float(min(fine, key=err_for_f))
+    return f_best if np.isfinite(f_best) else None
+
+
+# -----------------------------------------------------------------------------#
+# PipelineRunner (ohne Keyframe-Vorauswahl; SfM-internes KF bleibt unberührt)
+# -----------------------------------------------------------------------------#
+
 class PipelineRunner:
     def __init__(self, base_dir: str, on_log: Callable[[str], None], on_progress: Callable[[int, str], None]):
         self.base_dir = base_dir
@@ -213,11 +245,11 @@ class PipelineRunner:
         self.on_progress = on_progress
 
     def run(
-    self,
-    video_path: str,
-    project_name: str,
-    target_frames: int,
-    ask_manual_texture_cb: Optional[Callable[[str, List[str]], List[str]]] = None
+        self,
+        video_path: str,
+        project_name: str,
+        target_frames: int,
+        ask_manual_texture_cb: Optional[Callable[[str, List[str]], List[str]]] = None
     ) -> Tuple[str, object]:
 
         log, prog = self.on_log, self.on_progress
@@ -232,13 +264,13 @@ class PipelineRunner:
         else:
             cfg = {}
 
-        # 1) frames
+        # 1) Frames
         imgs = extract_and_save_frames(video_path, target_frames, paths.raw_frames, log, prog)
         if not imgs:
             raise RuntimeError("No frames were extracted.")
         log(f"[frames] saved: {len(imgs)}")
 
-        # 1b) Lowlight:
+        # 1b) Lowlight
         processed_imgs = None
         try:
             if _parse_bool(os.getenv("LOWLIGHT_ENABLE", "false"), False):
@@ -274,19 +306,18 @@ class PipelineRunner:
 
         imgs_for_features = processed_imgs if (processed_imgs and len(processed_imgs) == len(imgs)) else imgs
 
-        # 2) Masking
+        # 2) Masking (nur Masken-Dateien erzeugen; Bilder bleiben unverändert)
         prog(20, "Image preprocessing / masking")
         if _parse_bool(os.getenv("MASK_ENABLE", "false"), False):
             log("[mask] preprocessing enabled (SOURCE=raw_frames)")
             method = os.getenv("MASK_METHOD", "auto")
-
             overwrite = False
             mask_dir = os.path.join(paths.features, "masks")
             params = (cfg.get("masking", {}) or {}).get("params", {}) or {}
             log(f"[mask] method={method}, overwrite={overwrite}")
             log(f"[mask] params={params}")
             preprocess_images(
-                imgs,  # <-- RAW frames!
+                imgs,  # RAW frames!
                 out_mask_dir=mask_dir,
                 overwrite_images=overwrite,
                 method=method,
@@ -294,11 +325,12 @@ class PipelineRunner:
                 save_debug=True
             )
 
+        # 3) Features
         kps, descs, shapes, meta = extract_features(imgs_for_features, paths.features, log, prog)
         if not kps or not shapes:
             raise RuntimeError("Feature extraction returned no keypoints.")
 
-        # 4) matching
+        # 4) Matching (Neighbors ∪ Retrieval)
         ratio = float(os.getenv("MATCH_RATIO", "0.82"))
         device = os.getenv("FEATURE_DEVICE", "cuda")
         pairs_np, matches_list = build_pairs(
@@ -326,19 +358,37 @@ class PipelineRunner:
 
         matches_for_sfm = _as_sfm_matches(pairs_np, matches_list)
 
-        # 5) intrinsics (pinhole guess)
-        h, w = shapes[0]
-        focal = 0.92 * float(max(w, h))
-        pp = (w / 2.0, h / 2.0)
-        K = np.array([[focal, 0, pp[0]], [0, focal, pp[1]], [0, 0, 1]], dtype=float)
-        log(f"[pipeline] intrinsics: f={focal:.1f}, cx={pp[0]:.1f}, cy={pp[1]:.1f}")
+        # 5) Intrinsics (korrektes W,H; Auto-f aus F mit Fallback)
+        # shapes[i] ist (H,W) → wir leiten Breit/Höhe explizit ab
+        H0, W0 = shapes[0]
+        W, H = int(W0), int(H0)
+        cx, cy = W * 0.5, H * 0.5
+        focal_guess = 0.92 * float(max(W, H))
+
+        # bestes Match-Paar (für F-Schätzung) suchen
+        best = None
+        for (i, j), m in matches_for_sfm.items():
+            if best is None or len(m) > best[0]:
+                best = (len(m), i, j, m)
+        if best is not None and best[0] >= 16:
+            _, bi, bj, bm = best
+            p1 = np.float32([kps[bi][mm.queryIdx].pt for mm in bm])
+            p2 = np.float32([kps[bj][mm.trainIdx].pt for mm in bm])
+            f_est = _estimate_f_from_pair(p1, p2, W, H)
+        else:
+            f_est = None
+
+        f = float(f_est) if (f_est is not None and np.isfinite(f_est)) else focal_guess
+        K = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=float)
+        log(f"[pipeline] intrinsics: f={f:.1f}, cx={cx:.1f}, cy={cy:.1f} "
+            f"{'(auto)' if f_est is not None else '(heuristic)'}")
 
         poses_dir = os.path.join(paths.root, "poses")
         os.makedirs(poses_dir, exist_ok=True)
         snap = _dump_resolved_config(paths.root)
         log(f"[pipeline] saved resolved config -> {snap}")
 
-        # 6) SfM
+        # 6) SfM (interne Keyframe-Logik bleibt aktiv, wir liefern alle Frames)
         cfg_sfm = SfMConfig(
             INIT_WINDOW_RATIO=float(os.getenv("SFM_INIT_RATIO", "0.5")),
             INIT_MAX_SPAN=int(float(os.getenv("SFM_INIT_MAX_SPAN", "6"))),
@@ -356,7 +406,7 @@ class PipelineRunner:
             poses_out_dir=poses_dir, config=cfg_sfm
         )
 
-        # 7) save sparse cloud
+        # 7) Sparse Cloud speichern
         if not (isinstance(res, tuple) and len(res) >= 1):
             raise RuntimeError("SfM did not return a points array.")
         points3d = np.asarray(res[0], dtype=np.float64).reshape(-1, 3)
@@ -388,7 +438,7 @@ class PipelineRunner:
             except Exception as e:
                 log("[error]\nSparse-Paint failed: " + str(e))
 
-        # 9) Carving
+        # 9) Carving (optional)
         try:
             if _parse_bool(os.getenv("CARVE_ENABLE", "false"), False):
                 from meshing import carve_points_like_texturing
@@ -430,7 +480,6 @@ class PipelineRunner:
                     out_ply = os.getenv("TEXTURE_OUT_PLY", "fused_textured_points.ply")
                     wpow = float(os.getenv("TEXTURE_WEIGHT_POWER", "4.0"))
 
-
                     import glob as _glob
                     frames_dir = os.path.join(paths.root, "raw_frames")
                     frame_files = sorted(_glob.glob(os.path.join(frames_dir, "frame_*.png")))
@@ -444,13 +493,10 @@ class PipelineRunner:
                         return sorted(set(i for i in idxs if 0 <= i < len(universe)))
 
                     views: List[int] = []
-
                     if mode == "manual":
-
                         if ask_manual_texture_cb is not None:
                             selected_names = ask_manual_texture_cb(paths.root, frame_basenames)
                         else:
-
                             spec = (os.getenv("TEXTURE_VIEWS", "") or "").replace(";", ",")
                             selected_names = [t for t in spec.split(",") if t.strip()]
                         views = _names_to_indices(selected_names, frame_basenames)
@@ -459,7 +505,6 @@ class PipelineRunner:
                             log("[texture] manual selected but no frames chosen -> fallback to auto")
 
                     if mode != "manual":
-
                         divisor = int(float(os.getenv("TEXTURE_DIVISOR", "6")))
                         n = len(frame_files) if frame_files else len(imgs)
                         views = _auto_views(n, divisor)
@@ -479,7 +524,6 @@ class PipelineRunner:
                     log(f"[texture] skipped (no {fused_ply})")
         except Exception as e:
             log(f"[texture] failed: {e}")
-
 
         prog(100, "finished")
         return sparse_ply, paths

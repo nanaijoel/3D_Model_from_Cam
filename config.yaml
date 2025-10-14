@@ -16,7 +16,7 @@ features:
   debug_every: 5                # frequency of debug output (every N frames)
 
   lg:
-    detection_threshold: 0.000005  # threshold for LightGlue detector (lower → more keypoints)
+    detection_threshold: 0.000005  # threshold for LightGlue detector (lower -> more keypoints)
     nms: 2                        # non-maximum suppression radius (pixels)
     resize: 1024                  # image resize before keypoint detection
     remove_borders: 2             # ignore border region (pixels)
@@ -43,7 +43,7 @@ features:
     merge_r: 2               # merge radius for combining pass1+pass2 keypoints
 
     # enhanced preprocessing for dark regions (only in pass 2)
-    gamma: 0.3             # <1 brightens image (use 0.45 for darker scenes)
+    gamma: 0.5             # <1 brightens image (use 0.45 for darker scenes)
     clahe_clip: 8.0          # stronger local contrast
     clahe_tiles: 24
     unsharp_sigma: 1.0
@@ -58,7 +58,13 @@ matching:
   ratio: 0.82                   # ratio test threshold (Lowe’s ratio)
   depth_confidence: -1          # LightGlue depth confidence (use default if <0)
   width_confidence: -1          # LightGlue width confidence (use default if <0)
-  filter_threshold: 0.09        # LightGlue internal filtering threshold
+  filter_threshold: 0.07        # LightGlue internal filtering threshold
+  retr_enable: true
+  retr_k: 4096
+  retr_sample_per_img: 3000
+  retr_topk: 12
+  retr_min_sim: 0.05
+  neighbor_span: 6
 
 masking:
   enable: true                  # enable automatic background removal
@@ -91,29 +97,29 @@ mvs:
     ref_step: 3                 # step size between reference frames ('step' mode)
 
     # Seeds and fill
-    seed_radius: 4              # pixel radius for seeding depth hypotheses
+    seed_radius: 2              # pixel radius for seeding depth hypotheses
     seed_min: 200               # minimum number of valid seeds to start reconstruction
     seed_sample: 200000         # number of random seed samples for depth initialization
     beta: 4.0                   # depth regularization parameter
     fill_iters: 150             # number of filling/refinement iterations
     mask_pad: 6                 # padding (in pixels) around masks during processing
 
-    gap_fill_enable: true
+    gap_fill_enable: false
     fill_max_gap: 3
     fill_depth_std: 0.02
     fill_depth_rel: 0.04
-    fill_stride: 2
+    fill_stride: 1
 
 
 carve:
   enable: false
   use_all_masks: false
-  views: 18
+  views: 5
 
 texturing:
   enable: true
   mode: "auto"
-  divisor: 3
+  divisor: 12
   weight_power: 3.0
   use_masks: true
   mask_dilate: 2

@@ -1,11 +1,10 @@
-
-
 import os
 from typing import List, Tuple, Optional, Dict
 
 import numpy as np
 import cv2 as cv
 import torch
+from sklearn.cluster import MiniBatchKMeans  # neu: BoW-Retrieval
 
 PAIR = Tuple[int, int]
 
@@ -178,17 +177,89 @@ def build_pairs(
     elif lg is None:
         raise RuntimeError("LightGlue not available and descriptors are not 128-D; cannot match.")
 
-    # Neighbor pairs
-    span = 5
-    pair_list: List[PAIR] = []
+    # ---------------- Retrieval-Graph (BoW + Cosine) ----------------
+    retr_enable   = (os.getenv("RETR_ENABLE", "true").strip().lower() in ("1", "true", "yes", "on"))
+    retr_K        = int(float(os.getenv("RETR_K", "4096")))
+    retr_sample   = int(float(os.getenv("RETR_SAMPLE_PER_IMG", "3000")))
+    retr_topk     = int(float(os.getenv("RETR_TOPK", "12")))
+    retr_min_sim  = float(os.getenv("RETR_MIN_SIM", "0.0"))
+
+    pair_list_retr: List[PAIR] = []
+    if retr_enable:
+        _log(f"[match][retr] build BoW (K={retr_K}, sample/img={retr_sample})", on_log)
+
+        # 1) subsample of descriptors across images
+        desc_sub = []
+        for p in paths:
+            f = _safe_load_npz(p)
+            D = f["des"]
+            if D.ndim == 2 and len(D) > 0:
+                take = min(len(D), retr_sample)
+                if take < len(D):
+                    idx = np.random.choice(len(D), take, replace=False)
+                    D = D[idx]
+                desc_sub.append(D.astype(np.float32))
+
+        if len(desc_sub) >= 1:
+            X = np.vstack(desc_sub).astype(np.float32)
+
+            # 2) vocabulary
+            kmeans = MiniBatchKMeans(n_clusters=retr_K, batch_size=10000, n_init=1, verbose=False)
+            kmeans.fit(X)
+
+            # 3) BoW per image (TF-IDF + L2)
+            B = []
+            for p in paths:
+                f = _safe_load_npz(p)
+                D = f["des"]
+                if D.ndim != 2 or len(D) == 0:
+                    B.append(np.zeros((retr_K,), np.float32))
+                    continue
+                c = kmeans.predict(D.astype(np.float32))
+                h, _ = np.histogram(c, bins=np.arange(retr_K + 1))
+                B.append(h.astype(np.float32))
+            B = np.stack(B, axis=0)  # [N,K]
+
+            df = (B > 0).sum(axis=0).clip(1)
+            idf = np.log((len(B) + 1) / df).astype(np.float32)
+            B *= idf
+            B /= (np.linalg.norm(B, axis=1, keepdims=True) + 1e-9)
+
+            # 4) cosine similarity → Top-K similar per image
+            S = B @ B.T
+            np.fill_diagonal(S, -1.0)
+
+            for i in range(N):
+                js = np.argsort(-S[i])[:retr_topk]
+                for j in js:
+                    if S[i, j] >= retr_min_sim:
+                        a, b = (i, j) if i < j else (j, i)
+                        pair_list_retr.append((a, b))
+
+            pair_list_retr = sorted(list(set(pair_list_retr)))
+            _log(f"[match][retr] candidate pairs: {len(pair_list_retr)}", on_log)
+        else:
+            _log("[match][retr] skipped (no descriptors)", on_log)
+
+    # --------------- Neighbor pairs (konfigurierbar) ---------------
+    span = int(float(os.getenv("MATCH_NEIGHBOR_SPAN", "5")))
+    pair_list_ngb: List[PAIR] = []
     for i in range(N):
         for j in range(i + 1, min(N, i + 1 + span)):
-            pair_list.append((i, j))
+            pair_list_ngb.append((i, j))
 
+    # --------------- Union aus Retrieval ∪ Nachbarn ----------------
+    if retr_enable and pair_list_retr:
+        pair_list = sorted(list(set(pair_list_retr).union(pair_list_ngb)))
+        _log(f"[match] using {len(pair_list)} pairs (retrieval ∪ neighbors)", on_log)
+    else:
+        pair_list = pair_list_ngb
+        _log(f"[match] using {len(pair_list)} neighbor pairs (span={span})", on_log)
+
+    # ------------------------- Matching ----------------------------
     pairs_out: List[List[int]] = []
     matches_out: List[np.ndarray] = []
 
-    # Matching
     for (i, j) in pair_list:
         Fi = _safe_load_npz(paths[i])
         Fj = _safe_load_npz(paths[j])
@@ -224,7 +295,6 @@ def build_pairs(
                 device
             )
         else:
-
             knn = classic.knnMatch(d0, d1, k=2)
             good = []
             for a, b in knn:
