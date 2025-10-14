@@ -4,7 +4,7 @@
 lowlight:
   enable: true
   weights: "/home/joelnanai/PycharmProjects/Mobile_Robotik/3D_Model_Creation_from_Video/Zero-DCE_extension/Zero-DCE++/snapshots_Zero_DCE++/Epoch99.pth"  # oder wie deine .pth heißt
-  pattern: "*.png"   # falls deine Frames .jpg sind: "*.jpg"
+  pattern: "*.png"
   scale_factor: 1
 
 
@@ -33,9 +33,7 @@ features:
     noise_std: 1.5              # noise standard deviation (if enabled)
     mask_dilate: 6              # dilation radius for feature mask (pixels)
 
-  # ---------------------------------------------------------------------
-  # NEW: Iterative Feature-Fill (2nd pass for dark / featureless areas)
-  # ---------------------------------------------------------------------
+
   fill:
     enable: true             # enable second pass on "featureless" areas
     thr: 0.08                # density threshold [0..1]; higher = more areas filled
@@ -100,15 +98,21 @@ mvs:
     fill_iters: 150             # number of filling/refinement iterations
     mask_pad: 6                 # padding (in pixels) around masks during processing
 
+    gap_fill_enable: true
+    fill_max_gap: 3
+    fill_depth_std: 0.02
+    fill_depth_rel: 0.04
+    fill_stride: 2
+
 
 carve:
-  enable: true
+  enable: false
   use_all_masks: false
-  views: 10
+  views: 18
 
 texturing:
   enable: true
-  mode: "auto"      # wird im GUI auf "manual" gesetzt, wenn User auswählt
+  mode: "auto"
   divisor: 3
   weight_power: 3.0
   use_masks: true

@@ -195,7 +195,7 @@ def build_mask(
     method: 'rembg' | 'sam2'
     params (rembg):
       - model_name: 'isnet-general' | 'u2net' | 'u2net_human_seg' ...
-      - alpha_thr: 0..1 (Binär-Schwelle auf Alpha)
+      - alpha_thr: 0..1
       - alpha_matting: bool
       - fg_thr, bg_thr: 0..255
       - erode: int px
@@ -208,7 +208,7 @@ def build_mask(
     params = params or {}
     if method == "sam2":
         return _sam2_mask(img_bgr, keep=str(params.get("keep", "largest")))
-    # default: rembg mit erweiterten Optionen
+
     return _rembg_mask(
         img_bgr,
         alpha_thr=float(params.get("alpha_thr", 0.5)),

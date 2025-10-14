@@ -1,4 +1,4 @@
-# lowlight_enhancer.py
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -11,7 +11,7 @@ import torch
 import os, glob
 
 
-# --- Zero-DCE++ Model
+
 def _load_zerodce_model_module():
     root = Path(__file__).resolve().parent
     candidates = [
@@ -43,11 +43,7 @@ def _to_device(module: torch.nn.Module, device: torch.device) -> torch.nn.Module
 def load_zerodcepp(weights_path: str | Path,
                    device: torch.device | None = None,
                    scale_factor: int | float | None = None):
-    """
-    Lädt Zero-DCE++ Netz + Gewichte. Gibt (net, device) zurück.
-    - scale_factor: falls das Modell ihn verlangt (manche Varianten).
-      Wenn None, wird aus LOWLIGHT_SCALE (Default '1') gelesen.
-    """
+
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -57,15 +53,14 @@ def load_zerodcepp(weights_path: str | Path,
         except Exception:
             scale_factor = 1
 
-    # Robust gegen verschiedene Zero-DCE++-Varianten
     try:
-        net = enhance_net_nopool(scale_factor=scale_factor)  # typische Signatur
+        net = enhance_net_nopool(scale_factor=scale_factor)
     except TypeError:
-        # Manche Forks brauchen keinen Parameter
+
         net = enhance_net_nopool()
 
     ckpt = torch.load(str(weights_path), map_location=device)
-    state = ckpt.get("state_dict", ckpt)  # beides unterstützen
+    state = ckpt.get("state_dict", ckpt)
     net.load_state_dict(state, strict=False)
     net.eval()
     return _to_device(net, device), device
@@ -73,9 +68,7 @@ def load_zerodcepp(weights_path: str | Path,
 
 @torch.no_grad()
 def enhance_zerodcepp(img_bgr: np.ndarray, net, device: torch.device) -> np.ndarray:
-    """
-    Verbessert ein einzelnes BGR-Bild (np.uint8) mit Zero-DCE++ und gibt BGR zurück.
-    """
+
     h, w = img_bgr.shape[:2]
     rgb = cv.cvtColor(img_bgr, cv.COLOR_BGR2RGB).astype(np.float32) / 255.0
     x = torch.from_numpy(rgb.transpose(2, 0, 1)).unsqueeze(0).to(device)
@@ -89,17 +82,14 @@ def enhance_zerodcepp(img_bgr: np.ndarray, net, device: torch.device) -> np.ndar
     return out_bgr
 
 
-# --- Batch-Processing (in place) ---------------------------------------------
+
 def enhance_list_inplace(
     img_paths: Iterable[str | Path],
     weights_path: str | Path,
     device: torch.device | None = None,
     on_log: Optional[Callable[[str], None]] = None,
 ) -> None:
-    """
-    Liest die gegebenen Bildpfade, verbessert sie mit Zero-DCE++ und
-    überschreibt sie *in place* (gleicher Name, gleicher Ort).
-    """
+
     log = on_log or (lambda *_: None)
     img_paths = [str(p) for p in img_paths]
     if not img_paths:
@@ -130,10 +120,7 @@ def enhance_project_raw_frames_inplace(
     device: torch.device | None = None,
     on_log: Optional[Callable[[str], None]] = None,
 ) -> list[str]:
-    """
-    Sucht {project_root}/raw_frames, verbessert alle Bilder in place
-    und gibt die Liste der bearbeiteten Pfade zurück.
-    """
+
     log = on_log or (lambda *_: None)
     raw_dir = Path(project_root) / "raw_frames"
     if not raw_dir.is_dir():
@@ -142,7 +129,6 @@ def enhance_project_raw_frames_inplace(
     img_paths = sorted(str(p) for p in raw_dir.glob(pattern))
     enhance_list_inplace(img_paths, weights_path=weights_path, device=device, on_log=log)
     return img_paths
-# -----------------------------------------------------------------------------
 
 
 def enhance_project_raw_frames_to_dir(
@@ -153,16 +139,12 @@ def enhance_project_raw_frames_to_dir(
     device=None,
     on_log=print,
 ):
-    """
-    Liest {project_root}/raw_frames, bearbeitet jedes Bild mit Zero-DCE++ und
-    speichert nach {project_root}/{out_dir_name} – mit exakt gleichem Dateinamen.
-    Nutzt die bestehenden Helfer: load_zerodcepp(...) und enhance_zerodcepp(...).
-    """
+
     in_dir = os.path.join(project_root, "raw_frames")
     out_dir = os.path.join(project_root, out_dir_name)
     os.makedirs(out_dir, exist_ok=True)
 
-    # dein bestehender Loader liefert (net, dev)
+
     net, dev = load_zerodcepp(str(weights_path), device=device)
 
     paths = sorted(glob.glob(os.path.join(in_dir, pattern)))
@@ -179,8 +161,8 @@ def enhance_project_raw_frames_to_dir(
             out_paths.append("")
             continue
         try:
-            enhanced = enhance_zerodcepp(img, net, dev)  # <-- deine bestehende Funktion
-            out_p = os.path.join(out_dir, os.path.basename(p))  # gleicher Dateiname
+            enhanced = enhance_zerodcepp(img, net, dev)
+            out_p = os.path.join(out_dir, os.path.basename(p))
             cv.imwrite(out_p, enhanced)
             out_paths.append(out_p)
         except Exception as e:

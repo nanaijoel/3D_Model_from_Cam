@@ -32,7 +32,7 @@ def _make_lg_extractor(kind: str, device: str, max_kp: int, log=print):
     return extractor
 
 
-# ---------------- Utils ----------------
+
 def _rootsift(des: Optional[np.ndarray]) -> Optional[np.ndarray]:
     if des is None or des.size == 0: return des
     des = des.astype(np.float32)
@@ -145,7 +145,6 @@ def _density_mask_from_kps(shape_hw, kps_xy: np.ndarray, kp_radius=4, blur=21, t
 
 def _merge_by_radius(kpsA: List[cv.KeyPoint], desA: np.ndarray,
                      kpsB: List[cv.KeyPoint], desB: np.ndarray, r=2):
-    """de-dupe über Grid/Radius, behalte den mit höherer response"""
     if not kpsA:
         return kpsB, desB
     if not kpsB:
@@ -172,7 +171,7 @@ def _merge_by_radius(kpsA: List[cv.KeyPoint], desA: np.ndarray,
     return kps, des
 
 
-# ---------------- Hauptfunktion (mit 2. Pass) ----------------
+
 def extract_features(
     images: List[str],
     out_dir: str,
@@ -227,7 +226,7 @@ def extract_features(
         log(f"[features] SIFT (RootSIFT), max_kp={max_kp}")
     meta["lg_feature_name"] = lg_name
 
-    # ----- loop -----
+
     N = len(images)
     for i, path in enumerate(images):
         img_bgr = cv.imread(path, cv.IMREAD_COLOR)
@@ -238,7 +237,7 @@ def extract_features(
         gray0 = cv.cvtColor(img_bgr, cv.COLOR_BGR2GRAY)
         gray1 = _boost_gray(gray0)
 
-        # Grundmaske laden
+
         base = os.path.splitext(os.path.basename(path))[0]
         mask = None
         if use_mask:
@@ -246,7 +245,7 @@ def extract_features(
             if os.path.isfile(mpath):
                 mask = cv.imread(mpath, cv.IMREAD_GRAYSCALE)
 
-        # ---- PASS 1 ----
+
         if sp is not None:
             with torch.no_grad():
                 tin = _to_tensor(gray1).to(device)
@@ -267,31 +266,31 @@ def extract_features(
 
         shapes.append(gray1.shape)
 
-        # Debug Pass 1
+
         if debug_every and (i % debug_every == 0):
             dbg1 = cv.drawKeypoints(img_bgr, kps1, None, flags=cv.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
             if mask is not None:
                 dbg1 = cv.addWeighted(dbg1, 0.85, cv.cvtColor(mask, cv.COLOR_GRAY2BGR), 0.15, 0)
             cv.imwrite(os.path.join(out_dir, f"debug_{i:04d}.jpg"), dbg1)
 
-        # Restmaske berechnen (nur falls aktiviert & Maske vorhanden)
+
         rest_mask = None
         if fill_enable and (mask is not None):
-            # Dichtekarte
+
             kxy = np.array([[kp.pt[0], kp.pt[1]] for kp in (kps1 or [])], np.float32) if kps1 else np.empty((0,2),np.float32)
             norm, dense = _density_mask_from_kps(gray1.shape, kxy, kp_radius=fill_kpr, thr=fill_thr)
-            # Rest = Grundmaske AND (nicht dicht)
+
             rest_mask = ((mask > 127) & (~dense)).astype(np.uint8) * 255
-            # Morphologie (erst leicht erodieren, dann dilatieren → „Löcher“ schließen)
+
             if fill_morph_er > 0:
                 rest_mask = cv.erode(rest_mask, cv.getStructuringElement(cv.MORPH_ELLIPSE,(fill_morph_er,fill_morph_er)))
             if fill_morph_di > 0:
                 rest_mask = cv.dilate(rest_mask, cv.getStructuringElement(cv.MORPH_ELLIPSE,(fill_morph_di,fill_morph_di)))
 
-            # Restmaske debug speichern
+
             cv.imwrite(os.path.join(out_dir, f"restmask_{i:04d}.png"), rest_mask)
 
-        # ---- PASS 2 (nur Restmaske) ----
+
         kps2, des2 = [], np.empty((0, des1.shape[1] if des1 is not None and des1.ndim==2 else 128), np.float32)
         if fill_enable and (rest_mask is not None) and rest_mask.any():
             gray2 = _boost_gray_strong(gray0)
@@ -313,7 +312,7 @@ def extract_features(
                 kps2, des2 = sift.detectAndCompute(gray2, rest_mask)
                 des2 = _rootsift(des2); sc2 = np.array([kp.response for kp in (kps2 or [])], np.float32)
 
-            # Debug Pass 2
+
             if debug_every and (i % debug_every == 0):
                 dbg2 = img_bgr.copy()
                 overlay = cv.applyColorMap(rest_mask, cv.COLORMAP_HOT)
@@ -321,19 +320,19 @@ def extract_features(
                 dbg2 = cv.drawKeypoints(dbg2, kps2, None, color=(0,255,255), flags=cv.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
                 cv.imwrite(os.path.join(out_dir, f"debug_fill_{i:04d}.jpg"), dbg2)
 
-        # ---- Merge + Persist ----
+
         kps_merged, des_merged = _merge_by_radius(kps1 or [], des1 if des1 is not None else np.empty((0,128),np.float32),
                                                   kps2 or [], des2 if des2 is not None else np.empty((0,128),np.float32),
                                                   r=fill_merge_r)
         keypoints.append(kps_merged)
         descriptors.append(des_merged if des_merged is not None else np.empty((0,128),np.float32))
 
-        # Debug merged
+
         if debug_every and (i % debug_every == 0):
             dbgM = cv.drawKeypoints(img_bgr, kps_merged, None, flags=cv.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
             cv.imwrite(os.path.join(out_dir, f"debug_merged_{i:04d}.jpg"), dbgM)
 
-        # Speichern (wie gehabt)
+
         des_last = descriptors[-1]
         des_last = des_last.astype(np.float32).reshape(-1, des_last.shape[-1]) if des_last is not None else np.empty((0,128),np.float32)
         np.savez(
@@ -348,5 +347,5 @@ def extract_features(
 
     total_kp = sum(len(k) for k in keypoints)
     log(f"[features] done: {total_kp} keypoints (with fill={fill_enable}) | backend={lg_name or backend} | torch={torch.__version__}")
-    meta["sp_scores"] = None  # wir persistieren Scores aktuell nicht
+    meta["sp_scores"] = None
     return keypoints, descriptors, shapes, meta

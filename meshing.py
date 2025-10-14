@@ -10,11 +10,9 @@ try:
 except Exception:
     HAS_O3D = False
 
-# Wird vom pipeline_runner gesetzt
 GLOBAL_INTRINSICS_K = None
 
 
-# --------- kleine Utilities ---------
 
 def _mkdir(p: str):
     os.makedirs(p, exist_ok=True)
@@ -71,7 +69,6 @@ def _median_nn_distance(points_xyz: np.ndarray) -> float:
         return max(1e-3, diag / max(300.0, len(points_xyz)**(1/3)))
 
 
-# --------- PLY I/O ---------
 
 def save_point_cloud(points_xyz: np.ndarray, out_path: str, filter_min_points: int = 1000,
                      on_log=None, on_progress=None) -> str:
@@ -137,7 +134,6 @@ def _read_sparse_points(ply_path: str) -> np.ndarray | None:
     return np.array(pts, dtype=np.float32)
 
 
-# --------- Posen / Projektion ---------
 
 def _load_poses_npz(poses_npz_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     npz = np.load(poses_npz_path)
@@ -164,8 +160,6 @@ def _backproject_pixels_to_world(K: np.ndarray, R: np.ndarray, t: np.ndarray,
     Pw = (C[None, :] + (R.T @ Xc.T).T) # Nx3 world coords
     return Pw
 
-
-# --------- Sichtbarkeits-Scoring & Ref-View Auswahl ---------
 
 def _score_frames_by_visible_sparse(K: np.ndarray,
                                     R_all: np.ndarray, t_all: np.ndarray,
@@ -260,7 +254,6 @@ def _densify_small_gaps_depth(u: np.ndarray, v: np.ndarray, z: np.ndarray,
         var = np.maximum(sum_z2 / np.maximum(sum_w, 1e-6) - mean * mean, 0.0)
         std = np.sqrt(var)
 
-        # Kandidaten: noch nicht belegt, innerhalb Maske, nahe an Seeds, mind. 2 Nachbarn
         cand = (V == 0) & (fill_ok == 1) & (roi == 1) & (sum_w >= 2.0)
         if not np.any(cand):
             break
@@ -272,7 +265,6 @@ def _densify_small_gaps_depth(u: np.ndarray, v: np.ndarray, z: np.ndarray,
         D[accept] = mean[accept].astype(np.float32)
         V[accept] = 1
 
-    # Neue Pixel = jetzt gültig, aber nicht ursprüngliche Seeds
     seeds = np.zeros_like(V, dtype=np.uint8)
     seeds[vi2[valid], ui[valid]] = 1
     new_mask = (V == 1) & (seeds == 0)
@@ -369,7 +361,6 @@ def run_visible_sparse_with_fill(mesh_dir: str, frames_dir: str, poses_npz: str,
     keep_idx = np.zeros(P.shape[0], dtype=bool)
     new_points_world: list[np.ndarray] = []
 
-    # Fill-Parameter (ENV)
     FILL_ENABLE = (os.getenv("MVS_GAP_FILL_ENABLE", "true").strip().lower() in ("1", "true", "yes", "on"))
     MAX_GAP  = int(float(os.getenv("MVS_FILL_MAX_GAP", "4")))
     N_ITERS  = int(float(os.getenv("MVS_FILL_ITERS", "3")))
@@ -384,7 +375,6 @@ def run_visible_sparse_with_fill(mesh_dir: str, frames_dir: str, poses_npz: str,
 
         mask = masks[ridx] if masks[ridx] is not None else np.ones((H, W), np.uint8) * 255
 
-        # Welt → Kamera
         C = (-R_all[ridx].T @ t_all[ridx]).reshape(3)
         X_cam = (R_all[ridx] @ (P.T - C.reshape(3, 1))).T  # Nx3
         Z = X_cam[:, 2]
@@ -400,7 +390,6 @@ def run_visible_sparse_with_fill(mesh_dir: str, frames_dir: str, poses_npz: str,
         idx = np.nonzero(in_img)[0][ok]
         keep_idx[idx] = True
 
-        # Lücken füllen (optional)
         if FILL_ENABLE:
             u_valid = u[in_img][ok].astype(np.float32)
             v_valid = v[in_img][ok].astype(np.float32)
@@ -416,7 +405,6 @@ def run_visible_sparse_with_fill(mesh_dir: str, frames_dir: str, poses_npz: str,
                 Pw = _backproject_pixels_to_world(K, R_all[ridx], t_all[ridx], uf, vf, zf)
                 new_points_world.append(Pw.astype(np.float32))
 
-        # Optionales Debug: pro-View sichtbare Punkte farbig abspeichern
         if EXPORT_PER_VIEW and HAS_O3D:
             Pv = P[idx].astype(np.float32)
             im = images[ridx]
@@ -425,7 +413,6 @@ def run_visible_sparse_with_fill(mesh_dir: str, frames_dir: str, poses_npz: str,
             pcd.colors = o3d.utility.Vector3dVector(cols[:, ::-1] / 255.0)  # → RGB
             o3d.io.write_point_cloud(os.path.join(mesh_dir, f"points_ref_{ridx:04d}.ply"), pcd)
 
-    # Union: sichtbare Sparse + neu gefüllte Punkte
     fused_core = P[keep_idx].astype(np.float32)
     if len(new_points_world):
         fused = np.vstack([fused_core] + new_points_world).astype(np.float32)
@@ -438,7 +425,6 @@ def run_visible_sparse_with_fill(mesh_dir: str, frames_dir: str, poses_npz: str,
     return out_path
 
 
-# --------- Pipeline-API ---------
 
 def reconstruct_mvs_depth_and_mesh(paths, K,
                                    scale=1.0, max_views=0, n_planes=0,
@@ -446,9 +432,7 @@ def reconstruct_mvs_depth_and_mesh(paths, K,
                                    cost_thr=0.0, min_valid_frac=0.0,
                                    poisson_depth=0,
                                    on_log=None, on_progress=None):
-    """
-    Wird vom pipeline_runner aufgerufen.
-    """
+
     globals()["GLOBAL_INTRINSICS_K"] = K.copy()
     root = paths.root if hasattr(paths, "root") else paths["root"]
     mesh_dir   = os.path.join(root, "mesh")
@@ -490,10 +474,10 @@ def _dilate_mask(m: np.ndarray, px: int) -> np.ndarray:
 def _save_carve_debug(frame_bgr: np.ndarray, m: np.ndarray, u: np.ndarray, v: np.ndarray,
                       inside_img: np.ndarray, inside_mask: np.ndarray, out_path: str) -> None:
     dbg = frame_bgr.copy()
-    # Maske-Kontur
+
     cnts, _ = cv.findContours((m > 0).astype(np.uint8), cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
     cv.drawContours(dbg, cnts, -1, (0, 255, 0), 2)
-    # Punkte
+
     pts = np.stack([u, v], axis=1).astype(np.int32)
     ok  = inside_img & inside_mask
     bad = inside_img & (~inside_mask)
@@ -512,7 +496,6 @@ def carve_points_like_texturing(mesh_dir: str, frames_dir: str, poses_npz: str, 
     if K is None:
         raise RuntimeError("GLOBAL_INTRINSICS_K ist nicht gesetzt.")
 
-    # Punkte laden (fused > sparse)
     fused_path = os.path.join(mesh_dir, "fused_points.ply")
     P = _read_sparse_points(fused_path)
     if P is None or P.size == 0:
@@ -521,7 +504,6 @@ def carve_points_like_texturing(mesh_dir: str, frames_dir: str, poses_npz: str, 
     if P is None or P.size == 0:
         raise RuntimeError("Keine Punktwolke zum Carven gefunden.")
 
-    # Frames / Posen
     frame_files = _sorted_frames(frames_dir)
     if len(frame_files) == 0:
         raise RuntimeError(f"No frames found in {frames_dir}.")
@@ -532,7 +514,6 @@ def carve_points_like_texturing(mesh_dir: str, frames_dir: str, poses_npz: str, 
 
     H, W = _load_color(frame_files[0]).shape[:2]
 
-    # Masken-Frames sammeln
     mask_indices: list[int] = []
     masks: dict[int, np.ndarray] = {}
     if masks_dir and os.path.isdir(masks_dir):
@@ -547,14 +528,13 @@ def carve_points_like_texturing(mesh_dir: str, frames_dir: str, poses_npz: str, 
         _log("[carve] no masks found -> skip", on_log)
         return os.path.join(mesh_dir, "fused_points.ply")
 
-    # View-Auswahl
+
     if use_all_masks:
         refs = list(mask_indices)
     else:
         refs = _evenly_pick_from_index_list(mask_indices, max(1, int(n_views)))
 
-    # Robustheits-Parameter
-    TAU = float(os.getenv("CARVE_TAU", "0.8"))
+    TAU = float(os.getenv("CARVE_TAU", "0.6"))
     TAU = min(1.0, max(0.01, TAU))
     DIL = int(float(os.getenv("CARVE_MASK_DILATE_PX", "1")))
     DO_DBG = str(os.getenv("CARVE_DEBUG", "false")).lower() in ("1","true","yes","y","on")

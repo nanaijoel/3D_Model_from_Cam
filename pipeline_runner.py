@@ -224,7 +224,6 @@ class PipelineRunner:
         paths = make_project_paths(self.base_dir, project_name)
         log(f"[pipeline] Project: {paths.root}")
 
-        # --- config
         cfg_path = _maybe_find_config(self.base_dir)
         if cfg_path:
             cfg = _load_yaml_or_json(cfg_path)
@@ -239,7 +238,7 @@ class PipelineRunner:
             raise RuntimeError("No frames were extracted.")
         log(f"[frames] saved: {len(imgs)}")
 
-        # 1b) Lowlight: separat nach processed_frames ODER inplace
+        # 1b) Lowlight:
         processed_imgs = None
         try:
             if _parse_bool(os.getenv("LOWLIGHT_ENABLE", "false"), False):
@@ -273,15 +272,14 @@ class PipelineRunner:
         except Exception as e:
             log(f"[lowlight] failed: {e}")
 
-        # Welche Bilder für Masking/Features?
         imgs_for_features = processed_imgs if (processed_imgs and len(processed_imgs) == len(imgs)) else imgs
 
-        # 2) Masking immer auf RAW-Frames, niemals auf processed_frames
+        # 2) Masking
         prog(20, "Image preprocessing / masking")
         if _parse_bool(os.getenv("MASK_ENABLE", "false"), False):
             log("[mask] preprocessing enabled (SOURCE=raw_frames)")
             method = os.getenv("MASK_METHOD", "auto")
-            # Originals NICHT überschreiben – sicherheitshalber auf False pinnen
+
             overwrite = False
             mask_dir = os.path.join(paths.features, "masks")
             params = (cfg.get("masking", {}) or {}).get("params", {}) or {}
@@ -312,7 +310,6 @@ class PipelineRunner:
             save_dir=paths.matches
         )
 
-        # in SfM-Format konvertieren
         def _as_sfm_matches(pairs_arr: np.ndarray, matches_any) -> Dict[tuple[int, int], list]:
             mdict: Dict[tuple[int, int], list] = {}
             for (i, j), m in zip(pairs_arr.tolist(), matches_any):
@@ -391,7 +388,7 @@ class PipelineRunner:
             except Exception as e:
                 log("[error]\nSparse-Paint failed: " + str(e))
 
-        # 9) Carving (nutzt weiterhin raw_frames + masks aus features/masks)
+        # 9) Carving
         try:
             if _parse_bool(os.getenv("CARVE_ENABLE", "false"), False):
                 from meshing import carve_points_like_texturing
@@ -422,7 +419,7 @@ class PipelineRunner:
         except Exception as e:
             log(f"[carve] failed: {e}")
 
-        # 10) Texturing (weiterhin raw_frames)
+        # 10) Texturing
         try:
             if _parse_bool(os.getenv("TEXTURE_ENABLE", "true"), True):
                 mesh_dir = os.path.join(paths.root, "mesh")
@@ -433,38 +430,38 @@ class PipelineRunner:
                     out_ply = os.getenv("TEXTURE_OUT_PLY", "fused_textured_points.ply")
                     wpow = float(os.getenv("TEXTURE_WEIGHT_POWER", "4.0"))
 
-                    # Alle verfügbaren RAW-Frames auflisten (Basenames für GUI)
+
                     import glob as _glob
                     frames_dir = os.path.join(paths.root, "raw_frames")
                     frame_files = sorted(_glob.glob(os.path.join(frames_dir, "frame_*.png")))
                     frame_basenames = [os.path.basename(p) for p in frame_files]
 
-                    def _names_to_indices(names: list[str], universe: list[str]) -> list[int]:
-                        if not names: return []
+                    def _names_to_indices(names: List[str], universe: List[str]) -> List[int]:
+                        if not names:
+                            return []
                         s = {n.strip() for n in names if n and n.strip()}
                         idxs = [i for i, base in enumerate(universe) if base in s]
                         return sorted(set(i for i in idxs if 0 <= i < len(universe)))
 
-                    views: list[int] = []
+                    views: List[int] = []
 
                     if mode == "manual":
-                        # --- BLOCKING Callback in Schritt 10 ---
+
                         if ask_manual_texture_cb is not None:
                             selected_names = ask_manual_texture_cb(paths.root, frame_basenames)
                         else:
-                            # Fallback: falls kein Callback konfiguriert
+
                             spec = (os.getenv("TEXTURE_VIEWS", "") or "").replace(";", ",")
                             selected_names = [t for t in spec.split(",") if t.strip()]
                         views = _names_to_indices(selected_names, frame_basenames)
                         if not views:
-                            # Keine Auswahl -> sinnvoller Fallback
                             mode = "auto"
                             log("[texture] manual selected but no frames chosen -> fallback to auto")
 
                     if mode != "manual":
-                        # Auto-Auswahl wie bisher
+
                         divisor = int(float(os.getenv("TEXTURE_DIVISOR", "6")))
-                        n = len(frame_files) if frame_files else len(imgs)  # robust
+                        n = len(frame_files) if frame_files else len(imgs)
                         views = _auto_views(n, divisor)
                         log(f"[texture] auto-views (div={divisor}) -> {views}")
                     else:

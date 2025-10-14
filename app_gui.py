@@ -11,14 +11,13 @@ from pipeline_runner import PipelineRunner
 
 
 class Worker(QtCore.QThread):
-    # Fortschritt/Logs/Ergebnis
+
     progress = QtCore.Signal(int, str)      # value, label
     log = QtCore.Signal(str)
     done = QtCore.Signal(str, str)          # ply_path, project_root
     failed = QtCore.Signal(str)
 
-    # NEU: Anforderung aus Pipeline Schritt 10 -> GUI soll Frames abfragen
-    # Übergabe: project_root, frame_basenames (Liste möglicher Frames)
+
     ask_manual_texture = QtCore.Signal(str, list)
 
     def __init__(self, base_dir: str, video_path: str, project_name: str, target_frames: int, manual_mode: bool):
@@ -29,45 +28,41 @@ class Worker(QtCore.QThread):
         self.target_frames = target_frames
         self.manual_mode = manual_mode
 
-        # Sync-Objekte für blocking Callback
+
         self._manual_evt = None
         self._manual_result = None  # list[str] mit Basenames
 
     @QtCore.Slot(list)
     def receive_manual_texture_selection(self, names: list):
-        # Wird vom GUI nach Dialog-OK/CANCEL aufgerufen
+
         if self._manual_evt is not None:
             self._manual_result = names or []
             self._manual_evt.set()
 
     def _ask_manual_texture_blocking(self, project_root: str, frame_basenames: list[str]) -> list[str]:
-        """
-        Diese Methode wird im Worker-Thread (aus der Pipeline) aufgerufen.
-        Sie blockt bis das GUI (Main-Thread) die Auswahl geliefert hat.
-        Rückgabe: Liste der ausgewählten Basenames.
-        """
+
         self._manual_evt = threading.Event()
         self._manual_result = None
-        # Signal an Main-Thread: Dialog öffnen
+
         self.ask_manual_texture.emit(project_root, frame_basenames)
-        # Warten bis GUI antwortet
+
         self._manual_evt.wait()
         sel = self._manual_result or []
-        # Aufräumen
+
         self._manual_evt = None
         self._manual_result = None
         return sel
 
     def run(self):
         try:
-            # Logging/Progress Weiterleitung
+
             def on_log(msg: str):
                 self.log.emit(msg)
 
             def on_progress(v, label):
                 self.progress.emit(int(v), label)
 
-            # ENV setzen: nur Modus, keine Views (die liefert der GUI-Dialog)
+
             env = os.environ
             if self.manual_mode:
                 env["TEXTURE_MODE"] = "manual"
@@ -77,8 +72,6 @@ class Worker(QtCore.QThread):
 
             runner = PipelineRunner(base_dir=self.base_dir, on_log=on_log, on_progress=on_progress)
 
-            # Pipeline starten – mit Callback, das in Schritt 10 (Texturing) abgefragt wird
-            # Signatur-Erweiterung: ask_manual_texture_cb ist optional
             try:
                 ply_path, paths = runner.run(
                     self.video_path,
@@ -87,7 +80,7 @@ class Worker(QtCore.QThread):
                     ask_manual_texture_cb=self._ask_manual_texture_blocking
                 )
             except TypeError:
-                # Rückfall, falls deine PipelineRunner.run die neue Signatur noch nicht hat:
+
                 ply_path, paths = runner.run(self.video_path, self.project_name, self.target_frames)
 
             self.done.emit(ply_path, paths.root)
@@ -119,7 +112,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spin_frames.setValue(120)
         self.spin_frames.setSuffix(" Frames")
 
-        # NEU: Texturing-Modus (Auto / Manual)
+
         self.cmb_tex_mode = QtWidgets.QComboBox()
         self.cmb_tex_mode.addItems(["Auto (recommended)", "Manual (select frames at step 10)"])
         self.cmb_tex_mode.setCurrentIndex(0)
@@ -180,7 +173,7 @@ class MainWindow(QtWidgets.QMainWindow):
         v.addWidget(bottom)
         self.setCentralWidget(container)
 
-        # Signals
+
         self.btn_pick.clicked.connect(self.pick_video)
         self.btn_compute.clicked.connect(self.compute)
         self.btn_show.clicked.connect(self.show_mesh)
@@ -190,7 +183,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scan_meshes()
         self.worker = None
 
-    # ---------- Utility / UI ----------
+
 
     def scan_meshes(self):
         self.cmb_mesh.blockSignals(True)
@@ -260,7 +253,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress.setValue(val)
         self.lbl_stage.setText(label)
 
-    # ---------- Main actions ----------
 
     def compute(self):
         if not self.video_path:
@@ -274,13 +266,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_compute.setEnabled(False)
         self.worker = Worker(self.base_dir, self.video_path, project, target_frames, manual_mode)
 
-        # Standard-Verbindungen
+
         self.worker.progress.connect(self.set_progress)
         self.worker.log.connect(self.append_log)
         self.worker.done.connect(self.on_done)
         self.worker.failed.connect(self.on_failed)
 
-        # WICHTIG: Callback-Brücke (Pipeline -> GUI)
+
         self.worker.ask_manual_texture.connect(self.on_ask_manual_texture)
 
         self.worker.start()
@@ -302,7 +294,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.append_log("[error]\n" + msg)
         QtWidgets.QMessageBox.critical(self, "Error", msg)
 
-    # ---------- Mesh viewing ----------
+
 
     def _current_ply_path(self) -> str:
         ply_path = self.last_ply
@@ -322,7 +314,7 @@ class MainWindow(QtWidgets.QMainWindow):
         exe = os.path.join(appdir, "usr", "bin", "meshlab")
 
         env = os.environ.copy()
-        # Qt-Umgebungen säubern
+
         for k in ["QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH", "QT_STYLE_OVERRIDE",
                   "QT_API", "QT_QPA_PLATFORMTHEME", "PYTHONPATH", "LD_LIBRARY_PATH"]:
             env.pop(k, None)
@@ -346,11 +338,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str, list)
     def on_ask_manual_texture(self, project_root: str, frame_basenames: list):
-        """
-        Wird vom Worker (aus der Pipeline) aufgerufen, wenn TEXTURE_MODE=manual
-        in Schritt 10 erreicht ist. Öffnet einen Dialog zur Auswahl und gibt
-        die Basenames zurück an den Worker.
-        """
+
         # Falls vom Pipeline-Callback keine Liste mitkam, lese selbst
         if not frame_basenames:
             frames_dir = os.path.join(project_root, "raw_frames")
@@ -364,8 +352,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         vbox = QtWidgets.QVBoxLayout(dlg)
         info = QtWidgets.QLabel(
-            "Bitte wähle die Frames, die für das Texturing verwendet werden sollen.\n"
-            "Hinweis: Mehrfachauswahl möglich (Strg/Shift)."
+            "Choose the frames for texturing process\n"
         )
         vbox.addWidget(info)
 
@@ -392,7 +379,7 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_all.clicked.connect(do_all)
         btn_none.clicked.connect(do_none)
 
-        # OK/Cancel
+
         btns = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok |
             QtWidgets.QDialogButtonBox.StandardButton.Cancel
@@ -401,7 +388,7 @@ class MainWindow(QtWidgets.QMainWindow):
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)
 
-        # Anzeigen & Ergebnis
+
         if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             names = [i.text() for i in listw.selectedItems()]
             self.append_log(f"[ui] Manual texture frames selected: {', '.join(names) if names else '(none)'}")
@@ -409,7 +396,7 @@ class MainWindow(QtWidgets.QMainWindow):
             names = []
             self.append_log("[ui] Manual texture selection canceled (fallback behavior applies)")
 
-        # Ergebnis zurück an Worker (entblockt Pipeline)
+
         if self.worker is not None:
             self.worker.receive_manual_texture_selection(names)
 
