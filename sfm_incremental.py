@@ -20,15 +20,15 @@ class SfMConfig:
     FORCE_INIT_PAIR: Optional[Tuple[int, int]] = None
 
     # PnP
-    MIN_INLIERS_PNP: int = 200         # hard acceptance
-    MIN_TRY_PNP: int = 80              # soft gate: try PnP from this many 2D-3D
-    PNP_ITERS: int = 8000
+    MIN_INLIERS_PNP: int = 120         # hard acceptance
+    MIN_TRY_PNP: int = 60              # soft gate: try PnP from this many 2D-3D
+    PNP_ITERS: int = 10000
     PNP_ERR_PX: float = 3.0
     PNP_REPROJ_ACCEPT: float = 2.5
 
     # Triangulation (pairwise during expansion)
-    TRI_MIN_CORR: int = 10
-    TRI_REPROJ_MAX: float = 2.0
+    TRI_MIN_CORR: int = 8
+    TRI_REPROJ_MAX: float = 2.1
     TRI_MIN_PARALLAX_DEG: float = 3.0
 
     # Local stereo seeding

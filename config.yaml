@@ -93,7 +93,7 @@ mvs:
     ref_step: 3                 # step size between reference frames ('step' mode)
 
     # Seeds and fill
-    seed_radius: 2              # pixel radius for seeding depth hypotheses
+    seed_radius: 4              # pixel radius for seeding depth hypotheses
     seed_min: 200               # minimum number of valid seeds to start reconstruction
     seed_sample: 200000         # number of random seed samples for depth initialization
     beta: 4.0                   # depth regularization parameter
@@ -104,13 +104,13 @@ mvs:
 carve:
   enable: true
   use_all_masks: false
-  views: 6
+  views: 10
 
 texturing:
   enable: true
-  divisor: 8
+  divisor: 3
   weight_power: 3.0
   use_masks: true
-  mask_dilate: 8   # etwas Puffer an den Rändern
+  mask_dilate: 2   # etwas Puffer an den Rändern
   in_ply: fused_points.ply      # input point cloud file
   out_ply: fused_textured_points.ply  # output textured point cloud file
