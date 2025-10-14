@@ -7,6 +7,7 @@ from typing import Callable, Tuple, Any, Dict
 from image_masking import preprocess_images
 from io_paths import make_project_paths
 from frame_extractor import extract_and_save_frames
+from lowlight_enhancer import enhance_project_raw_frames_inplace
 from feature_extraction import extract_features
 from image_matching import build_pairs
 from sfm_incremental import run_sfm, SfMConfig
@@ -63,6 +64,15 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
             try: return float(x)
             except Exception: return default
         return default
+
+
+    ll = cfg.get("lowlight", {}) or {}
+    setenv("LOWLIGHT_ENABLE", pick_bool(ll.get("enable", False)))
+    setenv("LOWLIGHT_WEIGHTS", ll.get("weights"))
+    setenv("LOWLIGHT_PATTERN", ll.get("pattern", "*.png"))
+    setenv("LOWLIGHT_SCALE", ll.get("scale_factor", 1))
+
+
 
 
     fe = cfg.get("features", {})
@@ -229,6 +239,27 @@ class PipelineRunner:
         if not imgs:
             raise RuntimeError("No frames were extracted.")
         log(f"[frames] saved: {len(imgs)}")
+
+        # 1b) optional: Lowlight/Zero-DCE++ (in place auf {project}/raw_frames)
+        try:
+            if _parse_bool(os.getenv("LOWLIGHT_ENABLE", "false"), False):
+                weights = os.getenv("LOWLIGHT_WEIGHTS", "") or ""
+                pattern = os.getenv("LOWLIGHT_PATTERN", "*.png")
+                if not weights:
+                    log("[lowlight] skipped (no LOWLIGHT_WEIGHTS given)")
+                else:
+                    log(f"[lowlight] start -> {paths.root}/raw_frames (pattern={pattern})")
+                    enhance_project_raw_frames_inplace(
+                        project_root=paths.root,
+                        weights_path=weights,
+                        pattern=pattern,
+                        device=None,           # auto CUDA/CPU
+                        on_log=log
+                    )
+                    log("[lowlight] finished (in place)")
+        except Exception as e:
+            log(f"[lowlight] failed: {e}")
+
 
         # 2) optional masking / preprocessing
         prog(20, "Image preprocessing / masking")

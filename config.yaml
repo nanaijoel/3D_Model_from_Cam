@@ -1,6 +1,13 @@
 # CONFIG.YAML — Full pipeline config
 # All parameters are mapped 1:1 into environment variables
 
+lowlight:
+  enable: true
+  weights: "/home/joelnanai/PycharmProjects/Mobile_Robotik/3D_Model_Creation_from_Video/Zero-DCE_extension/Zero-DCE++/snapshots_Zero_DCE++/Epoch99.pth"  # oder wie deine .pth heißt
+  pattern: "*.png"   # falls deine Frames .jpg sind: "*.jpg"
+  scale_factor: 1
+
+
 features:
   backend: disk                 # feature extractor type: 'disk', 'superpoint', or 'aliked'
   device: cuda                  # compute device used for feature extraction ('cuda' or 'cpu')
