@@ -104,11 +104,11 @@ mvs:
 carve:
   enable: true
   use_all_masks: false
-  views: 12
+  views: 6
 
 texturing:
   enable: true                  # enable texturing / color projection
-  divisor: 6                    # determines number of selected views (divisor + 1 views)
-  weight_power: 2.0             # weight exponent for blending view contributions
+  divisor: 3                    # determines number of selected views (divisor + 1 views)
+  weight_power: 4.0             # weight exponent for blending view contributions
   in_ply: fused_points.ply      # input point cloud file
   out_ply: fused_textured_points.ply  # output textured point cloud file

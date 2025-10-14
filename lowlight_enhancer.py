@@ -8,10 +8,10 @@ from typing import Iterable, Callable, Optional
 import numpy as np
 import cv2 as cv
 import torch
-import os
+import os, glob
 
 
-# --- Zero-DCE++ Model direkt aus Datei laden ---------------------------------
+# --- Zero-DCE++ Model
 def _load_zerodce_model_module():
     root = Path(__file__).resolve().parent
     candidates = [
@@ -143,3 +143,50 @@ def enhance_project_raw_frames_inplace(
     enhance_list_inplace(img_paths, weights_path=weights_path, device=device, on_log=log)
     return img_paths
 # -----------------------------------------------------------------------------
+
+
+def enhance_project_raw_frames_to_dir(
+    project_root: str,
+    weights_path: str,
+    pattern: str = "*.png",
+    out_dir_name: str = "processed_frames",
+    device=None,
+    on_log=print,
+):
+    """
+    Liest {project_root}/raw_frames, bearbeitet jedes Bild mit Zero-DCE++ und
+    speichert nach {project_root}/{out_dir_name} – mit exakt gleichem Dateinamen.
+    Nutzt die bestehenden Helfer: load_zerodcepp(...) und enhance_zerodcepp(...).
+    """
+    in_dir = os.path.join(project_root, "raw_frames")
+    out_dir = os.path.join(project_root, out_dir_name)
+    os.makedirs(out_dir, exist_ok=True)
+
+    # dein bestehender Loader liefert (net, dev)
+    net, dev = load_zerodcepp(str(weights_path), device=device)
+
+    paths = sorted(glob.glob(os.path.join(in_dir, pattern)))
+    if not paths:
+        on_log(f"[lowlight] no inputs in {in_dir} matching {pattern}")
+        return []
+
+    on_log(f"[lowlight] Zero-DCE++ loaded ({dev}), processing {len(paths)} frames -> {out_dir}")
+    out_paths = []
+    for p in paths:
+        img = cv.imread(p, cv.IMREAD_COLOR)
+        if img is None:
+            on_log(f"[lowlight] skip (cannot read): {p}")
+            out_paths.append("")
+            continue
+        try:
+            enhanced = enhance_zerodcepp(img, net, dev)  # <-- deine bestehende Funktion
+            out_p = os.path.join(out_dir, os.path.basename(p))  # gleicher Dateiname
+            cv.imwrite(out_p, enhanced)
+            out_paths.append(out_p)
+        except Exception as e:
+            on_log(f"[lowlight] error: {p}: {e}")
+            out_paths.append("")
+            continue
+
+    on_log("[lowlight] done (separate dir).")
+    return out_paths

@@ -1,4 +1,3 @@
-
 import os, json
 import numpy as np
 import cv2 as cv
@@ -7,7 +6,10 @@ from typing import Callable, Tuple, Any, Dict
 from image_masking import preprocess_images
 from io_paths import make_project_paths
 from frame_extractor import extract_and_save_frames
-from lowlight_enhancer import enhance_project_raw_frames_inplace
+from lowlight_enhancer import (
+    enhance_project_raw_frames_inplace,
+    enhance_project_raw_frames_to_dir
+)
 from feature_extraction import extract_features
 from image_matching import build_pairs
 from sfm_incremental import run_sfm, SfMConfig
@@ -16,6 +18,7 @@ from meshing import (
     reconstruct_mvs_depth_and_mesh,
     reconstruct_mvs_depth_and_mesh_all)
 from texturing import texture_points_from_views
+
 
 def _load_yaml_or_json(path: str) -> Dict[str, Any]:
     ext = os.path.splitext(path)[1].lower()
@@ -65,15 +68,14 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
             except Exception: return default
         return default
 
-
     ll = cfg.get("lowlight", {}) or {}
     setenv("LOWLIGHT_ENABLE", pick_bool(ll.get("enable", False)))
     setenv("LOWLIGHT_WEIGHTS", ll.get("weights"))
     setenv("LOWLIGHT_PATTERN", ll.get("pattern", "*.png"))
     setenv("LOWLIGHT_SCALE", ll.get("scale_factor", 1))
-
-
-
+    # NEU: Output-Steuerung
+    setenv("LOWLIGHT_OUTPUT_MODE", (ll.get("output_mode", "separate") or "separate"))
+    setenv("LOWLIGHT_OUT_DIR", ll.get("out_dir", "processed_frames"))
 
     fe = cfg.get("features", {})
     setenv("FEATURE_BACKEND", fe.get("backend"))
@@ -89,7 +91,6 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("FEATURE_FILL_ERODE", fill.get("erode", 2))
     setenv("FEATURE_FILL_DILATE", fill.get("dilate", 4))
     setenv("FEATURE_FILL_MERGE_R", fill.get("merge_r", 2))
-
     setenv("FEATURE_FILL_GAMMA", fill.get("gamma", 0.75))
     setenv("FEATURE_FILL_CLAHE_CLIP", fill.get("clahe_clip", 6.0))
     setenv("FEATURE_FILL_CLAHE_TILES", fill.get("clahe_tiles", 8))
@@ -109,7 +110,6 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("FEATURE_PREPROC_NOISE_STD", pick_num(pp.get("noise_std", 1.5)))
     setenv("FEATURE_MASK_DILATE", int(pick_num(pp.get("mask_dilate", 5))))
 
-
     lg = fe.get("lg", {})
     setenv("FEATURE_LG_DET_THR", pick_num(lg.get("detection_threshold", 0.001)))
     setenv("FEATURE_LG_NMS", int(pick_num(lg.get("nms", 3))))
@@ -122,12 +122,10 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("FEATURE_SIFT_EDGE", int(pick_num(sf.get("edge", 12))))
     setenv("FEATURE_SIFT_SIGMA", pick_num(sf.get("sigma", 1.2)))
 
-
     mask_cfg = cfg.get("masking", {})
     setenv("MASK_ENABLE", pick_bool(mask_cfg.get("enable", False)))
     setenv("MASK_METHOD", mask_cfg.get("method"))
     setenv("MASK_OVERWRITE_IMAGES", pick_bool(mask_cfg.get("overwrite_images", False)))
-
 
     ma = cfg.get("matching", {})
     setenv("MATCH_BACKEND", ma.get("backend"))
@@ -138,7 +136,6 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     if "features" in ma:
         setenv("MATCH_FEATURES", str(ma["features"]).lower())
 
-
     sfm = cfg.get("sfm", {})
     setenv("SFM_INIT_RATIO", pick_num(sfm.get("init_ratio", 0.5)))
     setenv("SFM_INIT_MAX_SPAN", pick_num(sfm.get("init_max_span", 6)))
@@ -148,21 +145,17 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("SFM_POSE_SMOOTHING", pick_bool(sfm.get("pose_smoothing", True)))
     setenv("SFM_SMOOTH_LAMBDA", pick_num(sfm.get("smooth_lambda", 0.25)))
 
-
     mvs = cfg.get("mvs", {})
     setenv("MVS_ENABLE", pick_bool(mvs.get("enable", True)))
     setenv("MVS_MODE", (mvs.get("mode", "all") or "all"))
-
     mp = mvs.get("params", {}) or {}
     setenv("MVS_DEVICE", mp.get("device", fe.get("device", "cuda")))
     setenv("MVS_SCALE", mp.get("scale"))
-
-    setenv("MVS_REF_STRATEGY", mp.get("ref_strategy"))       # auto|bestk|step
-    setenv("MVS_REF_TOPK", mp.get("ref_topk"))               # z.B. 40
-    setenv("MVS_REF_MIN_GAP", mp.get("ref_min_gap"))         # z.B. 2
-    setenv("MVS_REF_STEP", mp.get("ref_step"))               # z.B. 3
+    setenv("MVS_REF_STRATEGY", mp.get("ref_strategy"))
+    setenv("MVS_REF_TOPK", mp.get("ref_topk"))
+    setenv("MVS_REF_MIN_GAP", mp.get("ref_min_gap"))
+    setenv("MVS_REF_STEP", mp.get("ref_step"))
     setenv("MVS_REF_BUCKETS", mp.get("ref_buckets", mp.get("ref_topk", 6)))
-
     setenv("MVS_SEED_RADIUS", mp.get("seed_radius"))
     setenv("MVS_SEED_MIN", mp.get("seed_min"))
     setenv("MVS_SEED_SAMPLE", mp.get("seed_sample"))
@@ -172,15 +165,14 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("MVS_EXPORT_MESH", mp.get("export_mesh"))
     setenv("MVS_POISSON_DEPTH", mp.get("poisson_depth"))
 
-
-    cv = cfg.get("carve", {}) or {}
-    setenv("CARVE_ENABLE", cv.get("enable"))
-    setenv("CARVE_USE_ALL_MASKS", cv.get("use_all_masks"))
-    setenv("CARVE_MODE", cv.get("mode"))                 # all | majority | any
-    setenv("CARVE_USE_DEPTH", cv.get("use_depth"))       # true/false
-    setenv("CARVE_DEPTH_TOL", cv.get("depth_tol"))       # 0.03
-    setenv("CARVE_CHUNK", cv.get("chunk"))
-    setenv("CARVE_VIEWS", cv.get("views"))
+    cv_cfg = cfg.get("carve", {}) or {}
+    setenv("CARVE_ENABLE", cv_cfg.get("enable"))
+    setenv("CARVE_USE_ALL_MASKS", cv_cfg.get("use_all_masks"))
+    setenv("CARVE_MODE", cv_cfg.get("mode"))
+    setenv("CARVE_USE_DEPTH", cv_cfg.get("use_depth"))
+    setenv("CARVE_DEPTH_TOL", cv_cfg.get("depth_tol"))
+    setenv("CARVE_CHUNK", cv_cfg.get("chunk"))
+    setenv("CARVE_VIEWS", cv_cfg.get("views"))
 
     tx = cfg.get("texturing", {}) or {}
     setenv("TEXTURE_ENABLE", pick_bool(tx.get("enable", True)))
@@ -188,7 +180,6 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("TEXTURE_WEIGHT_POWER", pick_num(tx.get("weight_power", 2.0)))
     setenv("TEXTURE_IN_PLY", tx.get("in_ply", "fused_points.ply"))
     setenv("TEXTURE_OUT_PLY", tx.get("out_ply", "fused_textured_points.ply"))
-
 
 def _auto_views(n_frames: int, divisor: int) -> list[int]:
     import numpy as _np
@@ -199,9 +190,8 @@ def _auto_views(n_frames: int, divisor: int) -> list[int]:
     idx = _np.unique(_np.clip(idx, 0, n_frames - 1))
     return idx.tolist()
 
-
 def _dump_resolved_config(project_root: str) -> str:
-    keys = [k for k in os.environ.keys() if k.startswith(("FEATURE_", "MATCH_", "SFM_", "MVS_", "MASK_"))]
+    keys = [k for k in os.environ.keys() if k.startswith(("FEATURE_", "MATCH_", "SFM_", "MVS_", "MASK_", "LOWLIGHT_"))]
     kv = {k: os.environ[k] for k in sorted(keys)}
     out_path = os.path.join(project_root, "resolved_config.yaml")
     try:
@@ -212,7 +202,6 @@ def _dump_resolved_config(project_root: str) -> str:
         with open(out_path.replace(".yaml", ".json"), "w", encoding="utf-8") as f:
             json.dump(kv, f, indent=2, ensure_ascii=False)
     return out_path
-
 
 class PipelineRunner:
     def __init__(self, base_dir: str, on_log: Callable[[str], None], on_progress: Callable[[int, str], None]):
@@ -240,28 +229,44 @@ class PipelineRunner:
             raise RuntimeError("No frames were extracted.")
         log(f"[frames] saved: {len(imgs)}")
 
-        # 1b) optional: Lowlight/Zero-DCE++ (in place auf {project}/raw_frames)
+        # 1b) Lowlight: separat nach processed_frames ODER inplace
+        processed_imgs = None
         try:
             if _parse_bool(os.getenv("LOWLIGHT_ENABLE", "false"), False):
                 weights = os.getenv("LOWLIGHT_WEIGHTS", "") or ""
                 pattern = os.getenv("LOWLIGHT_PATTERN", "*.png")
+                mode = (os.getenv("LOWLIGHT_OUTPUT_MODE", "separate") or "separate").lower()
+                out_dir = os.getenv("LOWLIGHT_OUT_DIR", "processed_frames")
                 if not weights:
                     log("[lowlight] skipped (no LOWLIGHT_WEIGHTS given)")
                 else:
-                    log(f"[lowlight] start -> {paths.root}/raw_frames (pattern={pattern})")
-                    enhance_project_raw_frames_inplace(
-                        project_root=paths.root,
-                        weights_path=weights,
-                        pattern=pattern,
-                        device=None,           # auto CUDA/CPU
-                        on_log=log
-                    )
-                    log("[lowlight] finished (in place)")
+                    if mode == "inplace":
+                        log(f"[lowlight] start -> {paths.root}/raw_frames (pattern={pattern})")
+                        enhance_project_raw_frames_inplace(
+                            project_root=paths.root,
+                            weights_path=weights,
+                            pattern=pattern,
+                            device=None,
+                            on_log=log
+                        )
+                        log("[lowlight] finished (in place)")
+                    else:
+                        log(f"[lowlight] start(separate) -> {paths.root}/{out_dir} (from raw_frames, pattern={pattern})")
+                        processed_imgs = enhance_project_raw_frames_to_dir(
+                            project_root=paths.root,
+                            weights_path=weights,
+                            pattern=pattern,
+                            out_dir_name=out_dir,
+                            device=None,
+                            on_log=log
+                        )
         except Exception as e:
             log(f"[lowlight] failed: {e}")
 
+        # Welche Bilder für Masking/Features?
+        imgs_for_features = processed_imgs if (processed_imgs and len(processed_imgs) == len(imgs)) else imgs
 
-        # 2) optional masking / preprocessing
+        # 2) optional masking / preprocessing —> auf denselben Bildern wie Feature-Extraction!
         prog(20, "Image preprocessing / masking")
         if _parse_bool(os.getenv("MASK_ENABLE", "false"), False):
             log("[mask] preprocessing enabled")
@@ -269,8 +274,10 @@ class PipelineRunner:
             overwrite = _parse_bool(os.getenv("MASK_OVERWRITE_IMAGES", "false"), False)
             mask_dir = os.path.join(paths.features, "masks")
             params = (cfg.get("masking", {}) or {}).get("params", {}) or {}
+            log(f"[mask] method={method}, overwrite={overwrite}")
+            log(f"[mask] params={params}")
             preprocess_images(
-                imgs,
+                imgs_for_features,
                 out_mask_dir=mask_dir,
                 overwrite_images=overwrite,
                 method=method,
@@ -278,8 +285,8 @@ class PipelineRunner:
                 save_debug=True
             )
 
-        # 3) features
-        kps, descs, shapes, meta = extract_features(imgs, paths.features, log, prog)
+        # 3) features —> ausschließlich von processed_frames (falls vorhanden)
+        kps, descs, shapes, meta = extract_features(imgs_for_features, paths.features, log, prog)
         if not kps or not shapes:
             raise RuntimeError("Feature extraction returned no keypoints.")
 
@@ -295,7 +302,7 @@ class PipelineRunner:
             save_dir=paths.matches
         )
 
-        # convert to SfM format
+        # in SfM-Format konvertieren
         def _as_sfm_matches(pairs_arr: np.ndarray, matches_any) -> Dict[tuple[int, int], list]:
             mdict: Dict[tuple[int, int], list] = {}
             for (i, j), m in zip(pairs_arr.tolist(), matches_any):
@@ -354,7 +361,7 @@ class PipelineRunner:
         log(f"[sfm] raw_points(after validation)={points3d.shape[0]:d}")
         log(f"[ui] Done: {sparse_ply}")
 
-        # 8) Sparse-Paint (GPU)
+        # 8) Sparse-Paint (MVS)
         if _parse_bool(os.getenv("MVS_ENABLE", "true"), True):
             log("Sparse-Paint (sparse-guided depth completion)")
             try:
@@ -367,7 +374,6 @@ class PipelineRunner:
                     poisson_depth=int(os.getenv("MVS_POISSON_DEPTH","10")),
                     on_log=log, on_progress=prog
                 )
-
                 if mode == "all":
                     reconstruct_mvs_depth_and_mesh_all(**common_kwargs)
                 else:
@@ -375,22 +381,18 @@ class PipelineRunner:
             except Exception as e:
                 log("[error]\nSparse-Paint failed: " + str(e))
 
-
-
-            # 9) Carving
+        # 9) Carving (nutzt weiterhin raw_frames + masks aus features/masks)
         try:
             if _parse_bool(os.getenv("CARVE_ENABLE", "false"), False):
                 from meshing import carve_points_like_texturing
                 import meshing as _meshing
                 _meshing.GLOBAL_INTRINSICS_K = K
 
-                mesh_dir = os.path.join(paths.root, "mesh")
                 frames_dir = os.path.join(paths.root, "raw_frames")
-                masks_dir = os.path.join(paths.root, "features", "masks")
+                masks_dir = os.path.join(paths.features, "masks")
                 poses_npz = os.path.join(paths.root, "poses", "camera_poses.npz")
 
                 use_all = _parse_bool(os.getenv("CARVE_USE_ALL_MASKS", "false"), False)
-                # fixe Anzahl aus CARVE_VIEWS; fallback: TEXTURE_DIVISOR+1 (nur falls CARVE_VIEWS fehlt)
                 n_req = os.getenv("CARVE_VIEWS", "").strip()
                 if n_req.isdigit():
                     n_req = int(n_req)
@@ -399,7 +401,7 @@ class PipelineRunner:
 
                 log(f"[carve] start (use_all={use_all}, views={n_req})")
                 carve_points_like_texturing(
-                    mesh_dir=mesh_dir,
+                    mesh_dir=os.path.join(paths.root, "mesh"),
                     frames_dir=frames_dir,
                     poses_npz=poses_npz,
                     masks_dir=masks_dir,
@@ -410,7 +412,7 @@ class PipelineRunner:
         except Exception as e:
             log(f"[carve] failed: {e}")
 
-        # 10) Texturing
+        # 10) Texturing (weiterhin raw_frames)
         try:
             if _parse_bool(os.getenv("TEXTURE_ENABLE", "true"), True):
                 mesh_dir = os.path.join(paths.root, "mesh")
@@ -418,10 +420,9 @@ class PipelineRunner:
                 fused_ply = os.path.join(mesh_dir, in_ply)
                 if os.path.isfile(fused_ply):
                     divisor = int(float(os.getenv("TEXTURE_DIVISOR", "6")))
-                    views = _auto_views(len(imgs), divisor)
+                    views = _auto_views(len(imgs), divisor)  # <- Anzahl aus Original-Frames
                     out_ply = os.getenv("TEXTURE_OUT_PLY", "fused_textured_points.ply")
-                    wpow = float(os.getenv("TEXTURE_WEIGHT_POWER", "2.0"))
-
+                    wpow = float(os.getenv("TEXTURE_WEIGHT_POWER", "4.0"))
                     log(f"[texture] auto-views (div={divisor}) -> {views}")
                     out_path = texture_points_from_views(
                         project_root=paths.root,
@@ -438,5 +439,3 @@ class PipelineRunner:
 
         prog(100, "finished")
         return sparse_ply, paths
-
-
