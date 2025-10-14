@@ -107,7 +107,6 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("FEATURE_LG_REMOVE_BORDERS", int(pick_num(lg.get("remove_borders", 2))))
     setenv("FEATURE_LG_FORCE_NUM", pick_bool(lg.get("force_num", False)))
 
-
     sf = fe.get("sift", {})
     setenv("FEATURE_SIFT_CONTRAST", pick_num(sf.get("contrast", 0.004)))
     setenv("FEATURE_SIFT_EDGE", int(pick_num(sf.get("edge", 12))))
