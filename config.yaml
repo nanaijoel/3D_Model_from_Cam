@@ -108,9 +108,10 @@ carve:
 
 texturing:
   enable: true
+  mode: "auto"      # wird im GUI auf "manual" gesetzt, wenn User auswählt
   divisor: 3
   weight_power: 3.0
   use_masks: true
-  mask_dilate: 2   # etwas Puffer an den Rändern
-  in_ply: fused_points.ply      # input point cloud file
-  out_ply: fused_textured_points.ply  # output textured point cloud file
+  mask_dilate: 2
+  in_ply: fused_points.ply
+  out_ply: fused_textured_points.ply

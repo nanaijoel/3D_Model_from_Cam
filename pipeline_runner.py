@@ -1,7 +1,7 @@
 import os, json
 import numpy as np
 import cv2 as cv
-from typing import Callable, Tuple, Any, Dict
+from typing import Callable, Tuple, Any, Dict, Optional, List
 
 from image_masking import preprocess_images
 from io_paths import make_project_paths
@@ -212,7 +212,14 @@ class PipelineRunner:
         self.on_log = on_log
         self.on_progress = on_progress
 
-    def run(self, video_path: str, project_name: str, target_frames: int) -> Tuple[str, object]:
+    def run(
+    self,
+    video_path: str,
+    project_name: str,
+    target_frames: int,
+    ask_manual_texture_cb: Optional[Callable[[str, List[str]], List[str]]] = None
+    ) -> Tuple[str, object]:
+
         log, prog = self.on_log, self.on_progress
         paths = make_project_paths(self.base_dir, project_name)
         log(f"[pipeline] Project: {paths.root}")
@@ -422,11 +429,47 @@ class PipelineRunner:
                 in_ply = os.getenv("TEXTURE_IN_PLY", "fused_points.ply")
                 fused_ply = os.path.join(mesh_dir, in_ply)
                 if os.path.isfile(fused_ply):
-                    divisor = int(float(os.getenv("TEXTURE_DIVISOR", "6")))
-                    views = _auto_views(len(imgs), divisor)  # <- Anzahl aus Original-Frames
+                    mode = (os.getenv("TEXTURE_MODE", "auto") or "auto").strip().lower()
                     out_ply = os.getenv("TEXTURE_OUT_PLY", "fused_textured_points.ply")
                     wpow = float(os.getenv("TEXTURE_WEIGHT_POWER", "4.0"))
-                    log(f"[texture] auto-views (div={divisor}) -> {views}")
+
+                    # Alle verfügbaren RAW-Frames auflisten (Basenames für GUI)
+                    import glob as _glob
+                    frames_dir = os.path.join(paths.root, "raw_frames")
+                    frame_files = sorted(_glob.glob(os.path.join(frames_dir, "frame_*.png")))
+                    frame_basenames = [os.path.basename(p) for p in frame_files]
+
+                    def _names_to_indices(names: list[str], universe: list[str]) -> list[int]:
+                        if not names: return []
+                        s = {n.strip() for n in names if n and n.strip()}
+                        idxs = [i for i, base in enumerate(universe) if base in s]
+                        return sorted(set(i for i in idxs if 0 <= i < len(universe)))
+
+                    views: list[int] = []
+
+                    if mode == "manual":
+                        # --- BLOCKING Callback in Schritt 10 ---
+                        if ask_manual_texture_cb is not None:
+                            selected_names = ask_manual_texture_cb(paths.root, frame_basenames)
+                        else:
+                            # Fallback: falls kein Callback konfiguriert
+                            spec = (os.getenv("TEXTURE_VIEWS", "") or "").replace(";", ",")
+                            selected_names = [t for t in spec.split(",") if t.strip()]
+                        views = _names_to_indices(selected_names, frame_basenames)
+                        if not views:
+                            # Keine Auswahl -> sinnvoller Fallback
+                            mode = "auto"
+                            log("[texture] manual selected but no frames chosen -> fallback to auto")
+
+                    if mode != "manual":
+                        # Auto-Auswahl wie bisher
+                        divisor = int(float(os.getenv("TEXTURE_DIVISOR", "6")))
+                        n = len(frame_files) if frame_files else len(imgs)  # robust
+                        views = _auto_views(n, divisor)
+                        log(f"[texture] auto-views (div={divisor}) -> {views}")
+                    else:
+                        log(f"[texture] manual-views -> {views}")
+
                     out_path = texture_points_from_views(
                         project_root=paths.root,
                         view_ids=views,
@@ -439,6 +482,7 @@ class PipelineRunner:
                     log(f"[texture] skipped (no {fused_ply})")
         except Exception as e:
             log(f"[texture] failed: {e}")
+
 
         prog(100, "finished")
         return sparse_ply, paths
