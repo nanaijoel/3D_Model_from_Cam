@@ -1,127 +1,131 @@
-# CONFIG.YAML — Full pipeline config
-# All parameters are mapped 1:1 into environment variables
+# CONFIG.YAML — Full pipeline config (überarbeitet)
 
 lowlight:
   enable: true
-  weights: "/home/joelnanai/PycharmProjects/Mobile_Robotik/3D_Model_Creation_from_Video/Zero-DCE_extension/Zero-DCE++/snapshots_Zero_DCE++/Epoch99.pth"  # oder wie deine .pth heißt
+  weights: "/home/joelnanai/PycharmProjects/Mobile_Robotik/3D_Model_Creation_from_Video/Zero-DCE_extension/Zero-DCE++/snapshots_Zero_DCE++/Epoch99.pth"
   pattern: "*.png"
   scale_factor: 1
 
-
 features:
-  backend: disk                 # feature extractor type: 'disk', 'superpoint', or 'aliked'
-  device: cuda                  # compute device used for feature extraction ('cuda' or 'cpu')
-  use_mask: true                # apply segmentation mask to filter keypoints
-  max_kp: 25000                 # maximum number of keypoints per frame
-  debug_every: 5                # frequency of debug output (every N frames)
+  backend: disk
+  device: cuda
+  use_mask: true
+  max_kp: 25000
+  debug_every: 5
 
   lg:
-    detection_threshold: 0.000005  # threshold for LightGlue detector (lower -> more keypoints)
-    nms: 2                        # non-maximum suppression radius (pixels)
-    resize: 1024                  # image resize before keypoint detection
-    remove_borders: 2             # ignore border region (pixels)
-    force_num: true               # force fixed number of keypoints per image
+    detection_threshold: 0.0000045   # etwas sensibler
+    nms: 3                           # gleichmäßigere KP-Verteilung
+    resize: 1024
+    remove_borders: 2
+    force_num: true
 
   preproc:
-    clahe: true                 # enable CLAHE (contrast-limited adaptive histogram equalization)
-    clahe_clip: 4.0             # CLAHE clip limit (contrast strength)
-    clahe_tiles: 16             # CLAHE tile grid size
-    unsharp: true               # enable unsharp mask sharpening
-    unsharp_sigma: 1.0          # Gaussian blur sigma for unsharp mask
-    unsharp_amount: 1.3         # blending amount for unsharp enhancement
-    noise: false                # optionally add small random noise (for stability)
-    noise_std: 1.5              # noise standard deviation (if enabled)
-    mask_dilate: 6              # dilation radius for feature mask (pixels)
-
+    clahe: true
+    clahe_clip: 4.0
+    clahe_tiles: 16
+    unsharp: true
+    unsharp_sigma: 1.0
+    unsharp_amount: 1.3
+    noise: false
+    noise_std: 1.5
+    mask_dilate: 5                   # etwas sanfter als 6
 
   fill:
-    enable: true             # enable second pass on "featureless" areas
-    thr: 0.08                # density threshold [0..1]; higher = more areas filled
-    kp_radius: 4             # radius (pixels) per keypoint in density map
-    erode: 2                 # Restmask morphology: erosion iterations
-    dilate: 6                # Restmask morphology: dilation iterations
-    merge_r: 2               # merge radius for combining pass1+pass2 keypoints
-
-    # enhanced preprocessing for dark regions (only in pass 2)
-    gamma: 0.5             # <1 brightens image (use 0.45 for darker scenes)
-    clahe_clip: 8.0          # stronger local contrast
+    enable: true
+    thr: 0.08
+    kp_radius: 4
+    erode: 2
+    dilate: 6
+    merge_r: 3
+    gamma: 0.5
+    clahe_clip: 8.0
     clahe_tiles: 24
     unsharp_sigma: 1.0
     unsharp_amount: 1.5
-    noise: true             # optional texture noise addition
+    noise: true
     noise_std: 1.4
 
-
 matching:
-  backend: lightglue            # matching backend ('lightglue' or 'classic')
-  features: disk                # must match feature extractor type above
-  ratio: 0.82                   # ratio test threshold (Lowe’s ratio)
-  depth_confidence: -1          # LightGlue depth confidence (use default if <0)
-  width_confidence: -1          # LightGlue width confidence (use default if <0)
-  filter_threshold: 0.07        # LightGlue internal filtering threshold
+  backend: lightglue
+  features: disk
+  ratio: 0.82
+  depth_confidence: -1
+  width_confidence: -1
+  filter_threshold: 0.07
   retr_enable: true
   retr_k: 4096
   retr_sample_per_img: 3000
-  retr_topk: 12
-  retr_min_sim: 0.05
+  retr_topk: 32                 # höher, um weite Loops zu erwischen
+  retr_min_sim: 0.07
   neighbor_span: 6
 
 masking:
-  enable: true                  # enable automatic background removal
-  method: rembg                 # masking backend ('rembg', etc.)
-  overwrite_images: false       # whether to overwrite original input images
+  enable: true
+  method: rembg
+  overwrite_images: false
   params:
-    alpha_thr: 0.2              # alpha transparency cutoff (lower keeps more pixels)
-    save_debug: true            # save debug images showing mask results
+    alpha_thr: 0.18              # etwas toleranter
+    save_debug: true
 
 sfm:
-  init_ratio: 0.5               # fraction of total frames used for initial reconstruction
-  init_max_span: 8              # maximum frame distance when searching for initialization pair
-  densify: true                 # enable densification (more points after initial SfM)
-  use_keyframes: true           # use keyframe selection instead of all frames
-  use_loops: true               # detect and use loop-closure constraints
-  pose_smoothing: true          # apply light smoothing to camera poses
-  smooth_lambda: 0.01           # smoothing weight (higher = stronger smoothing)
+  init_ratio: 0.5
+  init_max_span: 8
+  densify: true
+  use_keyframes: true
+  use_loops: true
+  pose_smoothing: true
+  smooth_lambda: 0.01
 
 mvs:
-  enable: true                  # enable multi-view stereo (dense reconstruction)
-  mode: "single"                # reconstruction mode ('single' or 'multi')
+  enable: true
+  mode: "single"
   params:
-    device: cuda                # device for depth estimation (cuda/cpu)
-    scale: 1.0                  # input image scaling factor (1.0 = full res)
+    device: cuda
+    scale: 1.0
 
-    # Frame selection
-    ref_strategy: "step"      # reference frame selection strategy: 'bestk', or 'step'
-    ref_topk: 60                # number of reference views to sample
-    ref_min_gap: 3              # minimum temporal gap between frames ('bestk' mode)
-    ref_step: 3                 # step size between reference frames ('step' mode)
+    # Referenz-Auswahl
+    ref_strategy: "step"
+    ref_topk: 60
+    ref_min_gap: 3
+    ref_step: 2                   # dichter als vorher
 
-    # Seeds and fill
-    seed_radius: 2              # pixel radius for seeding depth hypotheses
-    seed_min: 200               # minimum number of valid seeds to start reconstruction
-    seed_sample: 200000         # number of random seed samples for depth initialization
-    beta: 4.0                   # depth regularization parameter
-    fill_iters: 150             # number of filling/refinement iterations
-    mask_pad: 6                 # padding (in pixels) around masks during processing
+    # Seeds & Fill
+    seed_radius: 2
+    seed_min: 200
+    seed_sample: 200000
+    beta: 4.0
+    fill_iters: 150
+    mask_pad: 6
 
-    gap_fill_enable: false
-    fill_max_gap: 3
-    fill_depth_std: 0.02
-    fill_depth_rel: 0.04
+    # Gap-Fill (deutlich dichter)
+    gap_fill_enable: true
+    fill_max_gap: 4
+    fill_depth_std: 0.03
+    fill_depth_rel: 0.06
     fill_stride: 1
 
-
 carve:
-  enable: false
+  enable: true
   use_all_masks: false
-  views: 5
+  views: 24
+  tau: 0.50                 # toleranter, schont Rand/Füllpunkte
+  mask_dilate: 2            # kleine Pufferzone um Masken
 
 texturing:
   enable: true
-  mode: "auto"
-  divisor: 12
-  weight_power: 3.0
+  mode: "auto"              # GUI setzt bei Bedarf "manual"
+  divisor: 12               # mehr Views -> dichtere Farbabdeckung
+  weight_power: 2.0         # weicherer 1/z-Falloff
   use_masks: true
   mask_dilate: 2
-  in_ply: fused_points.ply
+  backfill: "nearest"       # füllt graue Löcher aus
+  in_ply: fused_points.ply  # wird im Runner vor Schritt 10 auf "last_ply" gesetzt
   out_ply: fused_textured_points.ply
+
+# Feineres Speichern / keine „groben Voxel“
+mesh:
+  downsample: 1             # 0 = aus
+  voxel_size: 0.0           # leer/0.0 = auto (fein). Beispiel fix: 0.001
+  outlier_nb: 20
+  outlier_std: 1.6

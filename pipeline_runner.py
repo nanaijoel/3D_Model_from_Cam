@@ -1,28 +1,28 @@
-import os, json
-import numpy as np
-import cv2 as cv
+# pipeline_runner.py
+import os
+import json
 from typing import Callable, Tuple, Any, Dict, Optional, List
 
-from image_masking import preprocess_images
+import numpy as np
+import cv2 as cv
+
 from io_paths import make_project_paths
 from frame_extractor import extract_and_save_frames
 from lowlight_enhancer import (
     enhance_project_raw_frames_inplace,
     enhance_project_raw_frames_to_dir
 )
+from image_masking import preprocess_images
 from feature_extraction import extract_features
 from image_matching import build_pairs
 from sfm_incremental import run_sfm, SfMConfig
-from meshing import (
-    save_point_cloud,
-    reconstruct_mvs_depth_and_mesh,
-    reconstruct_mvs_depth_and_mesh_all)
-from texturing import texture_points_from_views
+
+# Korrekte Herkunft:
+from meshing import save_point_cloud, run_mvs_and_carve
+from texturing import run_texturing
 
 
-# -----------------------------------------------------------------------------#
-# Konfig laden & in ENV spiegeln
-# -----------------------------------------------------------------------------#
+# -------------------------- Config laden & spiegeln ---------------------------
 
 def _load_yaml_or_json(path: str) -> Dict[str, Any]:
     ext = os.path.splitext(path)[1].lower()
@@ -36,7 +36,7 @@ def _load_yaml_or_json(path: str) -> Dict[str, Any]:
     else:
         raise RuntimeError(f"Unknown config extension: {ext}")
 
-def _maybe_find_config(base_dir: str) -> str | None:
+def _maybe_find_config(base_dir: str) -> Optional[str]:
     for name in ("config.yaml", "config.yml", "config.json"):
         p = os.path.join(base_dir, name)
         if os.path.isfile(p): return p
@@ -45,9 +45,9 @@ def _maybe_find_config(base_dir: str) -> str | None:
         if os.path.isfile(p): return p
     return None
 
-def _parse_bool(s: str, default: bool) -> bool:
+def _parse_bool(s: Any, default: bool) -> bool:
     if s is None: return default
-    return str(s).strip().lower() in ("1", "true", "yes", "y", "on")
+    return str(s).strip().lower() in ("1","true","yes","y","on")
 
 def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     def setenv(k, v):
@@ -62,7 +62,9 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
 
     def pick_num(x, default=0):
         if isinstance(x, dict):
-            for k in ("iters","n","value","val","amount","k","grid","target","radius","r","thr","threshold","std","sigma","resize","topk","gap"):
+            for k in ("iters","n","value","val","amount","k","grid","target",
+                      "radius","r","thr","threshold","std","sigma","resize",
+                      "topk","gap","step"):
                 if k in x and isinstance(x[k], (int, float)):
                     return x[k]
             return default
@@ -84,7 +86,7 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("FEATURE_BACKEND", fe.get("backend"))
     setenv("FEATURE_DEVICE", fe.get("device"))
     setenv("FEATURE_USE_MASK", fe.get("use_mask"))
-    setenv("FEATURE_MAX_KP", pick_num(fe.get("max_kp", 4096)))
+    setenv("FEATURE_MAX_KP", pick_num(fe.get("max_kp", 25000)))
     setenv("FEATURE_DEBUG_EVERY", pick_num(fe.get("debug_every", 0)))
 
     fill = fe.get("fill", {}) or {}
@@ -92,151 +94,151 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("FEATURE_FILL_THR", fill.get("thr", 0.05))
     setenv("FEATURE_FILL_KP_RADIUS", fill.get("kp_radius", 4))
     setenv("FEATURE_FILL_ERODE", fill.get("erode", 2))
-    setenv("FEATURE_FILL_DILATE", fill.get("dilate", 4))
-    setenv("FEATURE_FILL_MERGE_R", fill.get("merge_r", 2))
-    setenv("FEATURE_FILL_GAMMA", fill.get("gamma", 0.75))
-    setenv("FEATURE_FILL_CLAHE_CLIP", fill.get("clahe_clip", 6.0))
-    setenv("FEATURE_FILL_CLAHE_TILES", fill.get("clahe_tiles", 8))
-    setenv("FEATURE_FILL_UNSHARP_SIGMA", fill.get("unsharp_sigma", 1.2))
-    setenv("FEATURE_FILL_UNSHARP_AMOUNT", fill.get("unsharp_amount", 1.8))
+    setenv("FEATURE_FILL_DILATE", fill.get("dilate", 6))
+    setenv("FEATURE_FILL_MERGE_R", fill.get("merge_r", 3))
+    setenv("FEATURE_FILL_GAMMA", fill.get("gamma", 0.5))
+    setenv("FEATURE_FILL_CLAHE_CLIP", fill.get("clahe_clip", 8.0))
+    setenv("FEATURE_FILL_CLAHE_TILES", fill.get("clahe_tiles", 24))
+    setenv("FEATURE_FILL_UNSHARP_SIGMA", fill.get("unsharp_sigma", 1.0))
+    setenv("FEATURE_FILL_UNSHARP_AMOUNT", fill.get("unsharp_amount", 1.5))
     setenv("FEATURE_FILL_NOISE", fill.get("noise", False))
-    setenv("FEATURE_FILL_NOISE_STD", fill.get("noise_std", 2.0))
+    setenv("FEATURE_FILL_NOISE_STD", fill.get("noise_std", 1.4))
 
     pp = fe.get("preproc", {}) or {}
     setenv("FEATURE_PREPROC_CLAHE", pick_bool(pp.get("clahe", True)))
-    setenv("FEATURE_PREPROC_CLAHE_CLIP", pick_num(pp.get("clahe_clip", 3.0)))
-    setenv("FEATURE_PREPROC_CLAHE_TILES", int(pick_num(pp.get("clahe_tiles", 8))))
+    setenv("FEATURE_PREPROC_CLAHE_CLIP", pick_num(pp.get("clahe_clip", 4.0)))
+    setenv("FEATURE_PREPROC_CLAHE_TILES", int(pick_num(pp.get("clahe_tiles", 16))))
     setenv("FEATURE_PREPROC_UNSHARP", pick_bool(pp.get("unsharp", True)))
     setenv("FEATURE_PREPROC_UNSHARP_SIGMA", pick_num(pp.get("unsharp_sigma", 1.0)))
-    setenv("FEATURE_PREPROC_UNSHARP_AMOUNT", pick_num(pp.get("unsharp_amount", 1.5)))
-    setenv("FEATURE_PREPROC_NOISE", pick_bool(pp.get("noise", True)))
+    setenv("FEATURE_PREPROC_UNSHARP_AMOUNT", pick_num(pp.get("unsharp_amount", 1.3)))
+    setenv("FEATURE_PREPROC_NOISE", pick_bool(pp.get("noise", False)))
     setenv("FEATURE_PREPROC_NOISE_STD", pick_num(pp.get("noise_std", 1.5)))
     setenv("FEATURE_MASK_DILATE", int(pick_num(pp.get("mask_dilate", 5))))
 
     lg = fe.get("lg", {}) or {}
-    setenv("FEATURE_LG_DET_THR", pick_num(lg.get("detection_threshold", 0.001)))
+    setenv("FEATURE_LG_DET_THR", pick_num(lg.get("detection_threshold", 0.0000045)))
     setenv("FEATURE_LG_NMS", int(pick_num(lg.get("nms", 3))))
     setenv("FEATURE_LG_RESIZE", int(pick_num(lg.get("resize", 1024))))
     setenv("FEATURE_LG_REMOVE_BORDERS", int(pick_num(lg.get("remove_borders", 2))))
-    setenv("FEATURE_LG_FORCE_NUM", pick_bool(lg.get("force_num", False)))
-
-    sf = fe.get("sift", {}) or {}
-    setenv("FEATURE_SIFT_CONTRAST", pick_num(sf.get("contrast", 0.004)))
-    setenv("FEATURE_SIFT_EDGE", int(pick_num(sf.get("edge", 12))))
-    setenv("FEATURE_SIFT_SIGMA", pick_num(sf.get("sigma", 1.2)))
+    setenv("FEATURE_LG_FORCE_NUM", pick_bool(lg.get("force_num", True)))
 
     mask_cfg = cfg.get("masking", {}) or {}
-    setenv("MASK_ENABLE", pick_bool(mask_cfg.get("enable", False)))
-    setenv("MASK_METHOD", mask_cfg.get("method"))
+    setenv("MASK_ENABLE", pick_bool(mask_cfg.get("enable", True)))
+    setenv("MASK_METHOD", mask_cfg.get("method", "rembg"))
     setenv("MASK_OVERWRITE_IMAGES", pick_bool(mask_cfg.get("overwrite_images", False)))
 
     ma = cfg.get("matching", {}) or {}
-    setenv("MATCH_BACKEND", ma.get("backend"))
+    setenv("MATCH_BACKEND", ma.get("backend", "lightglue"))
     setenv("MATCH_RATIO", pick_num(ma.get("ratio", 0.82)))
-    setenv("MATCH_DEPTH", ma.get("depth_confidence"))
-    setenv("MATCH_WIDTH", ma.get("width_confidence"))
-    setenv("MATCH_FILTER", ma.get("filter_threshold"))
+    setenv("MATCH_DEPTH", ma.get("depth_confidence", -1))
+    setenv("MATCH_WIDTH", ma.get("width_confidence", -1))
+    setenv("MATCH_FILTER", ma.get("filter_threshold", 0.07))
     if "features" in ma:
         setenv("MATCH_FEATURES", str(ma["features"]).lower())
+    setenv("MATCH_RETR_ENABLE", pick_bool(ma.get("retr_enable", True)))
+    setenv("MATCH_RETR_K", pick_num(ma.get("retr_k", 4096)))
+    setenv("MATCH_RETR_SAMPLE_PER_IMG", pick_num(ma.get("retr_sample_per_img", 3000)))
+    setenv("MATCH_RETR_TOPK", pick_num(ma.get("retr_topk", 32)))
+    setenv("MATCH_RETR_MIN_SIM", pick_num(ma.get("retr_min_sim", 0.07)))
+    setenv("MATCH_NEIGHBOR_SPAN", pick_num(ma.get("neighbor_span", 6)))
 
     sfm = cfg.get("sfm", {}) or {}
     setenv("SFM_INIT_RATIO", pick_num(sfm.get("init_ratio", 0.5)))
-    setenv("SFM_INIT_MAX_SPAN", pick_num(sfm.get("init_max_span", 6)))
+    setenv("SFM_INIT_MAX_SPAN", pick_num(sfm.get("init_max_span", 8)))
     setenv("SFM_DENSIFY", pick_bool(sfm.get("densify", True)))
     setenv("SFM_USE_KEYFRAMES", pick_bool(sfm.get("use_keyframes", True)))
     setenv("SFM_USE_LOOP_CONSTRAINTS", pick_bool(sfm.get("use_loops", True)))
     setenv("SFM_POSE_SMOOTHING", pick_bool(sfm.get("pose_smoothing", True)))
-    setenv("SFM_SMOOTH_LAMBDA", pick_num(sfm.get("smooth_lambda", 0.25)))
+    setenv("SFM_SMOOTH_LAMBDA", pick_num(sfm.get("smooth_lambda", 0.01)))
 
     mvs = cfg.get("mvs", {}) or {}
     setenv("MVS_ENABLE", pick_bool(mvs.get("enable", True)))
-    setenv("MVS_MODE", (mvs.get("mode", "all") or "all"))
+    setenv("MVS_MODE", (mvs.get("mode", "single") or "single"))
     mp = mvs.get("params", {}) or {}
     setenv("MVS_DEVICE", mp.get("device", fe.get("device", "cuda")))
-    setenv("MVS_SCALE", mp.get("scale"))
-    setenv("MVS_REF_STRATEGY", mp.get("ref_strategy"))
-    setenv("MVS_REF_TOPK", mp.get("ref_topk"))
-    setenv("MVS_REF_MIN_GAP", mp.get("ref_min_gap"))
-    setenv("MVS_REF_STEP", mp.get("ref_step"))
-    setenv("MVS_REF_BUCKETS", mp.get("ref_buckets", mp.get("ref_topk", 6)))
-    setenv("MVS_SEED_RADIUS", mp.get("seed_radius"))
-    setenv("MVS_SEED_MIN", mp.get("seed_min"))
-    setenv("MVS_SEED_SAMPLE", mp.get("seed_sample"))
-    setenv("MVS_BETA", mp.get("beta"))
-    setenv("MVS_FILL_ITERS", mp.get("fill_iters"))
-    setenv("MVS_MASK_PAD", mp.get("mask_pad"))
-    setenv("MVS_EXPORT_MESH", mp.get("export_mesh"))
-    setenv("MVS_POISSON_DEPTH", mp.get("poisson_depth"))
+    setenv("MVS_SCALE", mp.get("scale", 1.0))
+    setenv("MVS_REF_STRATEGY", mp.get("ref_strategy", "step"))
+    setenv("MVS_REF_TOPK", mp.get("ref_topk", 60))
+    setenv("MVS_REF_MIN_GAP", mp.get("ref_min_gap", 3))
+    setenv("MVS_REF_STEP", mp.get("ref_step", 2))
+    setenv("MVS_SEED_RADIUS", mp.get("seed_radius", 2))
+    setenv("MVS_SEED_MIN", mp.get("seed_min", 200))
+    setenv("MVS_SEED_SAMPLE", mp.get("seed_sample", 200000))
+    setenv("MVS_BETA", mp.get("beta", 4.0))
+    setenv("MVS_FILL_ITERS", mp.get("fill_iters", 150))
+    setenv("MVS_MASK_PAD", mp.get("mask_pad", 6))
+    setenv("MVS_GAP_FILL_ENABLE", mp.get("gap_fill_enable", True))
+    setenv("MVS_FILL_MAX_GAP", mp.get("fill_max_gap", 4))
+    setenv("MVS_FILL_DEPTH_STD", mp.get("fill_depth_std", 0.03))
+    setenv("MVS_FILL_DEPTH_REL", mp.get("fill_depth_rel", 0.06))
+    setenv("MVS_FILL_STRIDE", mp.get("fill_stride", 1))
+    # Cap/Downsample nach Fill (gegen Punkt-Explosion)
+    setenv("MVS_FILL_MAX_POINTS", mp.get("fill_max_points", 3000000))
+    setenv("MVS_VOXEL_AFTER_FILL", mp.get("voxel_after_fill", 0.0015))
 
     cv_cfg = cfg.get("carve", {}) or {}
-    setenv("CARVE_ENABLE", cv_cfg.get("enable"))
-    setenv("CARVE_USE_ALL_MASKS", cv_cfg.get("use_all_masks"))
-    setenv("CARVE_MODE", cv_cfg.get("mode"))
-    setenv("CARVE_USE_DEPTH", cv_cfg.get("use_depth"))
-    setenv("CARVE_DEPTH_TOL", cv_cfg.get("depth_tol"))
-    setenv("CARVE_CHUNK", cv_cfg.get("chunk"))
-    setenv("CARVE_VIEWS", cv_cfg.get("views"))
+    setenv("CARVE_ENABLE", cv_cfg.get("enable", True))
+    setenv("CARVE_USE_ALL_MASKS", cv_cfg.get("use_all_masks", False))
+    setenv("CARVE_VIEWS", cv_cfg.get("views", 24))
+    setenv("CARVE_TAU", cv_cfg.get("tau", 0.50))
+    setenv("CARVE_MASK_DILATE_PX", cv_cfg.get("mask_dilate", 2))
 
     tx = cfg.get("texturing", {}) or {}
     setenv("TEXTURE_ENABLE", pick_bool(tx.get("enable", True)))
-    setenv("TEXTURE_DIVISOR", int(pick_num(tx.get("divisor", 6))))
+    setenv("TEXTURE_MODE", (tx.get("mode", "auto") or "auto"))
+    setenv("TEXTURE_DIVISOR", int(pick_num(tx.get("divisor", 12))))
     setenv("TEXTURE_WEIGHT_POWER", pick_num(tx.get("weight_power", 2.0)))
     setenv("TEXTURE_IN_PLY", tx.get("in_ply", "fused_points.ply"))
     setenv("TEXTURE_OUT_PLY", tx.get("out_ply", "fused_textured_points.ply"))
     setenv("TEXTURE_USE_MASKS", tx.get("use_masks", True))
-    setenv("TEXTURE_MASK_DILATE", int(pick_num(tx.get("mask_dilate", 5))))
+    setenv("TEXTURE_MASK_DILATE", int(pick_num(tx.get("mask_dilate", 2))))
+    setenv("TEXTURE_BACKFILL", tx.get("backfill", "nearest"))
+    setenv("TEXTURE_DROP_UNTEXTURED", tx.get("drop_untextured", False))
 
-def _auto_views(n_frames: int, divisor: int) -> list[int]:
-    import numpy as _np
-    divisor = max(1, int(divisor))
-    if n_frames <= 1:
-        return [0]
-    idx = _np.linspace(0, n_frames - 1, num=divisor + 1, dtype=int)
-    idx = _np.unique(_np.clip(idx, 0, n_frames - 1))
-    return idx.tolist()
+    mesh_cfg = cfg.get("mesh", {}) or {}
+    setenv("MESH_DOWNSAMPLE", mesh_cfg.get("downsample", 1))
+    setenv("MESH_VOXEL_SIZE", mesh_cfg.get("voxel_size", 0.0))
+    setenv("MESH_OUTLIER_NB", mesh_cfg.get("outlier_nb", 20))
+    setenv("MESH_OUTLIER_STD", mesh_cfg.get("outlier_std", 1.6))
 
-def _dump_resolved_config(project_root: str) -> str:
-    keys = [k for k in os.environ.keys() if k.startswith(("FEATURE_", "MATCH_", "SFM_", "MVS_", "MASK_", "LOWLIGHT_"))]
-    kv = {k: os.environ[k] for k in sorted(keys)}
-    out_path = os.path.join(project_root, "resolved_config.yaml")
+
+def _dump_resolved_config(project_root):
+    out = os.path.join(project_root, "resolved_config.yaml")
     try:
         import yaml
-        with open(out_path, "w", encoding="utf-8") as f:
-            yaml.safe_dump(kv, f, sort_keys=True, allow_unicode=True)
+        cfg = {}
+        for k, v in os.environ.items():
+            if k.startswith(("FEATURE_", "MATCH_", "SFM_", "MVS_", "CARVE_", "TEXTURE_", "MASK_", "MESH_","LOWLIGHT_")):
+                cfg[k] = v
+        with open(out, "w") as f:
+            yaml.safe_dump(cfg, f, sort_keys=True)
     except Exception:
-        with open(out_path.replace(".yaml", ".json"), "w", encoding="utf-8") as f:
-            json.dump(kv, f, indent=2, ensure_ascii=False)
-    return out_path
+        with open(out, "w") as f:
+            for k, v in sorted(os.environ.items()):
+                if k.startswith(("FEATURE_", "MATCH_", "SFM_", "MVS_", "CARVE_", "TEXTURE_", "MASK_", "MESH_","LOWLIGHT_")):
+                    f.write(f"{k}: {v}\n")
+    return out
 
 
-# -----------------------------------------------------------------------------#
-# optionale Auto-Fokalschätzung aus Fundamental-Matrix (robuste Approximation)
-# -----------------------------------------------------------------------------#
+# ------------------------------ Intrinsics ------------------------------------
 
-def _estimate_f_from_pair(p1: np.ndarray, p2: np.ndarray, W: int, H: int) -> Optional[float]:
-    F, _ = cv.findFundamentalMat(p1, p2, cv.FM_RANSAC, 1.0, 0.999)
-    if F is None or F.size == 0:
+def _estimate_f_from_pair(p1, p2, W, H):
+    # robuste F-Schätzung → heuristische f-Näherung (stabiler als blinde Raterei)
+    F, _ = cv.findFundamentalMat(p1, p2, cv.FM_RANSAC, 1.0, 0.999, 5000)
+    if F is None or F.shape != (3, 3):
         return None
-    cx, cy = W * 0.5, H * 0.5
+    return 0.92 * float(max(W, H))  # konservative Heuristik
 
-    def err_for_f(f):
-        if not np.isfinite(f) or f <= 10: return 1e6
-        K = np.array([[f,0,cx],[0,f,cy],[0,0,1]], float)
-        E = K.T @ F @ K
-        _, S, _ = np.linalg.svd(E)
-        # „Essentiell“: Rang≈2, S1≈S2, S3≈0
-        return abs(S[2]) + abs(S[0] - S[1])
-
-    grid = np.linspace(0.4, 2.0, 25) * max(W, H)
-    f_best = float(min(grid, key=err_for_f))
-    fine = np.linspace(max(50.0, f_best*0.7), f_best*1.3, 21)
-    f_best = float(min(fine, key=err_for_f))
-    return f_best if np.isfinite(f_best) else None
+def _clamp_f(f_est, W, H):
+    f_min = 0.70 * float(max(W, H))
+    f_max = 1.80 * float(max(W, H))
+    f_heur = 0.92 * float(max(W, H))
+    if f_est is not None and np.isfinite(f_est) and (f_min <= float(f_est) <= f_max):
+        return float(f_est), "(auto)"
+    return f_heur, "(heuristic)"
 
 
-# -----------------------------------------------------------------------------#
-# PipelineRunner (ohne Keyframe-Vorauswahl; SfM-internes KF bleibt unberührt)
-# -----------------------------------------------------------------------------#
+# --------------------------------- Runner ------------------------------------
 
 class PipelineRunner:
     def __init__(self, base_dir: str, on_log: Callable[[str], None], on_progress: Callable[[int, str], None]):
@@ -244,25 +246,17 @@ class PipelineRunner:
         self.on_log = on_log
         self.on_progress = on_progress
 
-    def run(
-        self,
-        video_path: str,
-        project_name: str,
-        target_frames: int,
-        ask_manual_texture_cb: Optional[Callable[[str, List[str]], List[str]]] = None
-    ) -> Tuple[str, object]:
-
+    def run(self, video_path: str, project_name: str, target_frames: int) -> Tuple[str, object]:
         log, prog = self.on_log, self.on_progress
         paths = make_project_paths(self.base_dir, project_name)
         log(f"[pipeline] Project: {paths.root}")
 
         cfg_path = _maybe_find_config(self.base_dir)
+        cfg = {}
         if cfg_path:
             cfg = _load_yaml_or_json(cfg_path)
             _apply_env_from_config(cfg)
             log(f"[pipeline] config loaded: {cfg_path}")
-        else:
-            cfg = {}
 
         # 1) Frames
         imgs = extract_and_save_frames(video_path, target_frames, paths.raw_frames, log, prog)
@@ -270,7 +264,7 @@ class PipelineRunner:
             raise RuntimeError("No frames were extracted.")
         log(f"[frames] saved: {len(imgs)}")
 
-        # 1b) Lowlight
+        # 1b) Lowlight → bevorzugt separates Verzeichnis (Texturing nutzt weiterhin raw_frames)
         processed_imgs = None
         try:
             if _parse_bool(os.getenv("LOWLIGHT_ENABLE", "false"), False):
@@ -283,64 +277,44 @@ class PipelineRunner:
                 else:
                     if mode == "inplace":
                         log(f"[lowlight] start -> {paths.root}/raw_frames (pattern={pattern})")
-                        enhance_project_raw_frames_inplace(
-                            project_root=paths.root,
-                            weights_path=weights,
-                            pattern=pattern,
-                            device=None,
-                            on_log=log
-                        )
-                        log("[lowlight] finished (in place)")
+                        enhance_project_raw_frames_inplace(paths.root, weights, pattern, None, log)
+                        log("[lowlight] done (in place).")
                     else:
                         log(f"[lowlight] start(separate) -> {paths.root}/{out_dir} (from raw_frames, pattern={pattern})")
-                        processed_imgs = enhance_project_raw_frames_to_dir(
-                            project_root=paths.root,
-                            weights_path=weights,
-                            pattern=pattern,
-                            out_dir_name=out_dir,
-                            device=None,
-                            on_log=log
-                        )
+                        processed_imgs = enhance_project_raw_frames_to_dir(paths.root, weights, pattern, out_dir, None, log)
+                        log("[lowlight] done (separate dir).")
         except Exception as e:
             log(f"[lowlight] failed: {e}")
 
         imgs_for_features = processed_imgs if (processed_imgs and len(processed_imgs) == len(imgs)) else imgs
 
-        # 2) Masking (nur Masken-Dateien erzeugen; Bilder bleiben unverändert)
+        # 2) Masking
         prog(20, "Image preprocessing / masking")
         if _parse_bool(os.getenv("MASK_ENABLE", "false"), False):
             log("[mask] preprocessing enabled (SOURCE=raw_frames)")
-            method = os.getenv("MASK_METHOD", "auto")
-            overwrite = False
+            method = os.getenv("MASK_METHOD", "rembg")
             mask_dir = os.path.join(paths.features, "masks")
             params = (cfg.get("masking", {}) or {}).get("params", {}) or {}
-            log(f"[mask] method={method}, overwrite={overwrite}")
+            log(f"[mask] method={method}, overwrite=False")
             log(f"[mask] params={params}")
-            preprocess_images(
-                imgs,  # RAW frames!
-                out_mask_dir=mask_dir,
-                overwrite_images=overwrite,
-                method=method,
-                params=params,
-                save_debug=True
-            )
+            preprocess_images(imgs, out_mask_dir=mask_dir, overwrite_images=False, method=method, params=params, save_debug=True)
 
         # 3) Features
-        kps, descs, shapes, meta = extract_features(imgs_for_features, paths.features, log, prog)
+        kps, descs, shapes, _ = extract_features(imgs_for_features, paths.features, log, prog)
         if not kps or not shapes:
             raise RuntimeError("Feature extraction returned no keypoints.")
 
-        # 4) Matching (Neighbors ∪ Retrieval)
+        # 4) Matching
         ratio = float(os.getenv("MATCH_RATIO", "0.82"))
         device = os.getenv("FEATURE_DEVICE", "cuda")
-        pairs_np, matches_list = build_pairs(
-            paths.features,
-            ratio=ratio,
-            device=device,
-            backend=os.getenv("MATCH_BACKEND", "lightglue"),
-            on_log=log,
-            save_dir=paths.matches
-        )
+        pairs_np, matches_list = build_pairs(paths.features, ratio=ratio, device=device,
+                                             backend=os.getenv("MATCH_BACKEND", "lightglue"),
+                                             on_log=log, save_dir=paths.matches)
+
+        # 5) Intrinsics
+        H0, W0 = shapes[0]  # (H,W)
+        W, H = int(W0), int(H0)
+        cx, cy = W * 0.5, H * 0.5
 
         def _as_sfm_matches(pairs_arr: np.ndarray, matches_any) -> Dict[tuple[int, int], list]:
             mdict: Dict[tuple[int, int], list] = {}
@@ -358,40 +332,32 @@ class PipelineRunner:
 
         matches_for_sfm = _as_sfm_matches(pairs_np, matches_list)
 
-        # 5) Intrinsics (korrektes W,H; Auto-f aus F mit Fallback)
-        # shapes[i] ist (H,W) → wir leiten Breit/Höhe explizit ab
-        H0, W0 = shapes[0]
-        W, H = int(W0), int(H0)
-        cx, cy = W * 0.5, H * 0.5
-        focal_guess = 0.92 * float(max(W, H))
-
-        # bestes Match-Paar (für F-Schätzung) suchen
+        # bestes Paar für f-Schätzung
         best = None
         for (i, j), m in matches_for_sfm.items():
             if best is None or len(m) > best[0]:
                 best = (len(m), i, j, m)
+
+        f_est = None
         if best is not None and best[0] >= 16:
             _, bi, bj, bm = best
             p1 = np.float32([kps[bi][mm.queryIdx].pt for mm in bm])
             p2 = np.float32([kps[bj][mm.trainIdx].pt for mm in bm])
             f_est = _estimate_f_from_pair(p1, p2, W, H)
-        else:
-            f_est = None
 
-        f = float(f_est) if (f_est is not None and np.isfinite(f_est)) else focal_guess
+        f, f_tag = _clamp_f(f_est, W, H)
         K = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=float)
-        log(f"[pipeline] intrinsics: f={f:.1f}, cx={cx:.1f}, cy={cy:.1f} "
-            f"{'(auto)' if f_est is not None else '(heuristic)'}")
+        log(f"[pipeline] intrinsics: f={f:.1f}, cx={cx:.1f}, cy={cy:.1f} {f_tag}")
 
         poses_dir = os.path.join(paths.root, "poses")
         os.makedirs(poses_dir, exist_ok=True)
         snap = _dump_resolved_config(paths.root)
         log(f"[pipeline] saved resolved config -> {snap}")
 
-        # 6) SfM (interne Keyframe-Logik bleibt aktiv, wir liefern alle Frames)
+        # 6) SfM
         cfg_sfm = SfMConfig(
             INIT_WINDOW_RATIO=float(os.getenv("SFM_INIT_RATIO", "0.5")),
-            INIT_MAX_SPAN=int(float(os.getenv("SFM_INIT_MAX_SPAN", "6"))),
+            INIT_MAX_SPAN=int(float(os.getenv("SFM_INIT_MAX_SPAN", "8"))),
             DENSIFY_ENABLE=_parse_bool(os.getenv("SFM_DENSIFY", "true"), True),
             USE_KEYFRAMES=_parse_bool(os.getenv("SFM_USE_KEYFRAMES", "true"), True),
             USE_LOOP_CONSTRAINTS=_parse_bool(os.getenv("SFM_USE_LOOP_CONSTRAINTS", "true"), True),
@@ -399,14 +365,10 @@ class PipelineRunner:
             SMOOTH_LAMBDA=float(os.getenv("SFM_SMOOTH_LAMBDA", "0.01")),
         )
 
-        res = run_sfm(
-            kps, descs, shapes,
-            pairs_np, matches_for_sfm,
-            K, log, prog,
-            poses_out_dir=poses_dir, config=cfg_sfm
-        )
+        res = run_sfm(kps, descs, shapes, pairs_np, matches_for_sfm, K, log, prog,
+                      poses_out_dir=poses_dir, config=cfg_sfm)
 
-        # 7) Sparse Cloud speichern
+        # 7) Sparse speichern (keine harte Drosselung hier)
         if not (isinstance(res, tuple) and len(res) >= 1):
             raise RuntimeError("SfM did not return a points array.")
         points3d = np.asarray(res[0], dtype=np.float64).reshape(-1, 3)
@@ -418,112 +380,34 @@ class PipelineRunner:
         log(f"[sfm] raw_points(after validation)={points3d.shape[0]:d}")
         log(f"[ui] Done: {sparse_ply}")
 
-        # 8) Sparse-Paint (MVS)
-        if _parse_bool(os.getenv("MVS_ENABLE", "true"), True):
-            log("Sparse-Paint (sparse-guided depth completion)")
-            try:
-                mode = os.getenv("MVS_MODE", "all").strip().lower()
-                common_kwargs = dict(
-                    paths=paths, K=K,
-                    scale=float(os.getenv("MVS_SCALE","1.0")),
-                    max_views=0, n_planes=0, depth_expand=0.0, patch=0,
-                    cost_thr=0.0, min_valid_frac=0.0,
-                    poisson_depth=int(os.getenv("MVS_POISSON_DEPTH","10")),
-                    on_log=log, on_progress=prog
-                )
-                if mode == "all":
-                    reconstruct_mvs_depth_and_mesh_all(**common_kwargs)
-                else:
-                    reconstruct_mvs_depth_and_mesh(**common_kwargs)
-            except Exception as e:
-                log("[error]\nSparse-Paint failed: " + str(e))
+        # 8) Dense + Carving (gekapselt in meshing.run_mvs_and_carve)
+        fused_ply = run_mvs_and_carve(paths, K, on_log=log, on_progress=prog)
 
-        # 9) Carving (optional)
+        # 9) Intrinsics für Texturing persistieren
+        intr_npy = os.path.join(mesh_dir, "intrinsics.npy")
         try:
-            if _parse_bool(os.getenv("CARVE_ENABLE", "false"), False):
-                from meshing import carve_points_like_texturing
-                import meshing as _meshing
-                _meshing.GLOBAL_INTRINSICS_K = K
-
-                frames_dir = os.path.join(paths.root, "raw_frames")
-                masks_dir = os.path.join(paths.features, "masks")
-                poses_npz = os.path.join(paths.root, "poses", "camera_poses.npz")
-
-                use_all = _parse_bool(os.getenv("CARVE_USE_ALL_MASKS", "false"), False)
-                n_req = os.getenv("CARVE_VIEWS", "").strip()
-                if n_req.isdigit():
-                    n_req = int(n_req)
-                else:
-                    n_req = int(float(os.getenv("TEXTURE_DIVISOR", "6"))) + 1
-
-                log(f"[carve] start (use_all={use_all}, views={n_req})")
-                carve_points_like_texturing(
-                    mesh_dir=os.path.join(paths.root, "mesh"),
-                    frames_dir=frames_dir,
-                    poses_npz=poses_npz,
-                    masks_dir=masks_dir,
-                    use_all_masks=use_all,
-                    n_views=n_req,
-                    on_log=log, on_progress=prog
-                )
+            np.save(intr_npy, K)
+            log(f"[texture] saved intrinsics -> {intr_npy}")
         except Exception as e:
-            log(f"[carve] failed: {e}")
+            log(f"[texture] warn: could not save intrinsics.npy ({e})")
 
-        # 10) Texturing
+        # 10) Texturing – Manual-Flow unterstützen
+        os.environ["TEXTURE_IN_PLY"] = os.getenv("TEXTURE_IN_PLY", "fused_points.ply")
+        os.environ["TEXTURE_OUT_PLY"] = os.getenv("TEXTURE_OUT_PLY", "fused_textured_points.ply")
+
+        # Manual-Modus: wenn (noch) keine Auswahl gesetzt → GUI soll Textur-Views sammeln,
+        # Pipeline liefert erstmal die nicht-texturierte fused_ply zurück.
+        if (os.getenv("TEXTURE_MODE", "auto").lower() == "manual"
+            and not os.getenv("TEXTURE_MANUAL_VIEWS", "").strip()):
+            log("[texture] manual mode selected – waiting for GUI to set TEXTURE_MANUAL_VIEWS …")
+            return fused_ply, paths
+
         try:
-            if _parse_bool(os.getenv("TEXTURE_ENABLE", "true"), True):
-                mesh_dir = os.path.join(paths.root, "mesh")
-                in_ply = os.getenv("TEXTURE_IN_PLY", "fused_points.ply")
-                fused_ply = os.path.join(mesh_dir, in_ply)
-                if os.path.isfile(fused_ply):
-                    mode = (os.getenv("TEXTURE_MODE", "auto") or "auto").strip().lower()
-                    out_ply = os.getenv("TEXTURE_OUT_PLY", "fused_textured_points.ply")
-                    wpow = float(os.getenv("TEXTURE_WEIGHT_POWER", "4.0"))
-
-                    import glob as _glob
-                    frames_dir = os.path.join(paths.root, "raw_frames")
-                    frame_files = sorted(_glob.glob(os.path.join(frames_dir, "frame_*.png")))
-                    frame_basenames = [os.path.basename(p) for p in frame_files]
-
-                    def _names_to_indices(names: List[str], universe: List[str]) -> List[int]:
-                        if not names:
-                            return []
-                        s = {n.strip() for n in names if n and n.strip()}
-                        idxs = [i for i, base in enumerate(universe) if base in s]
-                        return sorted(set(i for i in idxs if 0 <= i < len(universe)))
-
-                    views: List[int] = []
-                    if mode == "manual":
-                        if ask_manual_texture_cb is not None:
-                            selected_names = ask_manual_texture_cb(paths.root, frame_basenames)
-                        else:
-                            spec = (os.getenv("TEXTURE_VIEWS", "") or "").replace(";", ",")
-                            selected_names = [t for t in spec.split(",") if t.strip()]
-                        views = _names_to_indices(selected_names, frame_basenames)
-                        if not views:
-                            mode = "auto"
-                            log("[texture] manual selected but no frames chosen -> fallback to auto")
-
-                    if mode != "manual":
-                        divisor = int(float(os.getenv("TEXTURE_DIVISOR", "6")))
-                        n = len(frame_files) if frame_files else len(imgs)
-                        views = _auto_views(n, divisor)
-                        log(f"[texture] auto-views (div={divisor}) -> {views}")
-                    else:
-                        log(f"[texture] manual-views -> {views}")
-
-                    out_path = texture_points_from_views(
-                        project_root=paths.root,
-                        view_ids=views,
-                        in_ply=in_ply,
-                        out_ply=out_ply,
-                        weight_power=wpow
-                    )
-                    log(f"[texture] saved: {out_path}")
-                else:
-                    log(f"[texture] skipped (no {fused_ply})")
+            out_tex = run_texturing(mesh_dir, on_log=log)
+            if out_tex:
+                return out_tex, paths
         except Exception as e:
             log(f"[texture] failed: {e}")
 
-        prog(100, "finished")
-        return sparse_ply, paths
+        # Fallback: gib zumindest die gefusete Punktwolke zurück
+        return fused_ply, paths
