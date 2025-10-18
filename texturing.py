@@ -1,317 +1,431 @@
 # texturing.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Robustes Texturing mit sauberem Frame↔Pose-Mapping, kompatibel zu pipeline_runner.run_texturing(mesh_dir, on_log).
+
+Projektstruktur:
+- projects/NAME/raw_frames/{000123.png|frame_0123.png|*.jpg}
+- projects/NAME/features/masks/{000123.png|frame_0123_mask.png|*.jpg}
+- projects/NAME/poses/camera_poses.npz               (R, t, frame_idx)
+- projects/NAME/mesh/{fused_points.ply, intrinsics.npy}
+- projects/NAME/mesh/fused_textured_points.ply       (output)
+"""
+
 import os
+import re
 import glob
-import traceback
 import numpy as np
 import cv2 as cv
+from typing import List, Tuple, Dict, Optional
 
-# ----------- Utils -----------
+try:
+    import open3d as o3d
+    HAS_O3D = True
+except Exception:
+    HAS_O3D = False
+
+
+# ----------------------------- I/O Utilities ------------------------------
 
 def _log(msg, on_log=None):
-    if on_log: on_log(msg)
-    else: print(msg, flush=True)
+    if on_log:
+        on_log(msg)
+    else:
+        print(msg, flush=True)
 
-def _safe_imread(path):
+def _imread_color(path: str) -> np.ndarray:
     im = cv.imread(path, cv.IMREAD_UNCHANGED)
-    if im is None: raise IOError(f"Failed to load image: {path}")
-    if im.ndim == 2: im = cv.cvtColor(im, cv.COLOR_GRAY2BGR)
-    if im.shape[2] == 4: im = im[:, :, :3]
+    if im is None:
+        raise FileNotFoundError(path)
+    if im.ndim == 2:
+        im = cv.cvtColor(im, cv.COLOR_GRAY2BGR)
+    if im.shape[2] == 4:
+        im = im[:, :, :3]
     return im
 
-def _list_raw_frames(raw_dir, pattern="*.png"):
-    paths = sorted(glob.glob(os.path.join(raw_dir, pattern)))
-    if not paths:
-        paths = sorted(glob.glob(os.path.join(raw_dir, "*.jpg")))
-    return paths
+def _frame_id_from_name(path: str) -> int:
+    """Extrahiert die letzte zusammenhängende Zahl aus dem Dateinamen (sonst -1)."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    m = re.findall(r"(\d+)", stem)
+    return int(m[-1]) if m else -1
 
-def _load_intrinsics(npy_path):
-    k = np.load(npy_path)
-    if k.shape != (3, 3):
-        raise ValueError(f"intrinsics.npy has wrong shape {k.shape}")
-    return k
+def _list_frames_with_ids(frames_dir: str) -> List[Tuple[str, int]]:
+    files = sorted(glob.glob(os.path.join(frames_dir, "*.png")) + glob.glob(os.path.join(frames_dir, "*.jpg")))
+    return [(p, _frame_id_from_name(p)) for p in files]
 
-def _read_poses_npz(npz_path):
-    d = np.load(npz_path, allow_pickle=True)
-    if "poses" in d:
-        poses = np.asarray(d["poses"])
-        idx = np.asarray(d["indices"]) if "indices" in d else np.arange(len(poses))
-        return idx.tolist(), poses
-    if "Tcw_list" in d:
-        poses = np.asarray(d["Tcw_list"])
-        idx = np.arange(len(poses))
-        return idx.tolist(), poses
-    # unser SfM-Export: R,t
-    if "R" in d and "t" in d:
-        R = d["R"]; t = d["t"].reshape(-1, 3, 1)
-        T = np.repeat(np.eye(4)[None, :, :], R.shape[0], axis=0)
-        T[:, :3, :3] = R
-        T[:, :3, 3:4] = t
-        idx = d.get("frame_idx", np.arange(R.shape[0]))
-        return idx.tolist(), T
-    raise ValueError("Unsupported pose npz format")
-
-# ----------- Open3D optional I/O (robust) -----------
-
-def _o3d_safe():
-    try:
-        import open3d as o3d
-        return o3d
-    except Exception:
+def _mask_for_frame(masks_dir: str, frame_path: str, frame_id: int, dilate_px: int = 0) -> Optional[np.ndarray]:
+    """Findet passende Maske zu einem Frame – mehrere Namensschemata werden probiert."""
+    if not (masks_dir and os.path.isdir(masks_dir)):
         return None
+    base = os.path.basename(frame_path)
+    stem, _ = os.path.splitext(base)
+    cands = [
+        os.path.join(masks_dir, f"{stem}_mask.png"),
+        os.path.join(masks_dir, f"{stem}_mask.jpg"),
+        os.path.join(masks_dir, f"{stem}.png"),
+        os.path.join(masks_dir, f"{stem}.jpg"),
+    ]
+    if frame_id >= 0:
+        cands += [
+            os.path.join(masks_dir, f"{frame_id:06d}.png"),
+            os.path.join(masks_dir, f"{frame_id:06d}.jpg"),
+            os.path.join(masks_dir, f"frame_{frame_id:04d}_mask.png"),
+            os.path.join(masks_dir, f"frame_{frame_id:04d}_mask.jpg"),
+        ]
+    for c in cands:
+        if os.path.isfile(c):
+            m = cv.imread(c, cv.IMREAD_GRAYSCALE)
+            if m is not None and dilate_px > 0:
+                m = cv.dilate(m, np.ones((dilate_px, dilate_px), np.uint8))
+            return m
+    return None
 
-def _read_ply_ascii(in_path):
-    with open(in_path, "r") as f:
-        header = []
-        while True:
-            line = f.readline()
-            if not line: raise IOError("Invalid PLY (no end_header)")
-            header.append(line.strip())
-            if line.strip() == "end_header": break
+def _read_points_ply(path: str) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    if HAS_O3D:
+        pc = o3d.io.read_point_cloud(path)
+        if pc is None or np.asarray(pc.points).size == 0:
+            raise RuntimeError(f"Empty point cloud: {path}")
+        P = np.asarray(pc.points, dtype=np.float64)
+        C = None
+        if len(pc.colors) > 0:
+            # open3d colors sind RGB [0..1]; intern BGR [0..255]
+            C = (np.asarray(pc.colors)[:, ::-1] * 255.0).astype(np.float64)
+        return P, C
+
+    # ASCII fallback
+    with open(path, "r") as f:
+        header = True
         n = 0
-        for h in header:
-            if h.startswith("element vertex"):
-                n = int(h.split()[-1]); break
-        if n <= 0: raise IOError("PLY missing 'element vertex'")
-        xyz, rgb = [], []
+        has_col = False
+        while header:
+            line = f.readline()
+            if not line:
+                break
+            if line.startswith("element vertex"):
+                n = int(line.split()[-1])
+            if line.startswith("property uchar red"):
+                has_col = True
+            if line.strip() == "end_header":
+                header = False
+                break
+        pts, cols = [], []
         for _ in range(n):
             parts = f.readline().strip().split()
+            if len(parts) < 3:
+                continue
             x, y, z = map(float, parts[:3])
-            if len(parts) >= 6:
+            pts.append((x, y, z))
+            if has_col and len(parts) >= 6:
                 r, g, b = map(float, parts[3:6])
-                if max(r,g,b) > 1.5: rgb.append([r/255.0, g/255.0, b/255.0])
-                else:                rgb.append([r, g, b])
-            else:
-                rgb.append([0,0,0])
-            xyz.append([x, y, z])
-    return np.asarray(xyz, np.float64), np.asarray(rgb, np.float64)
+                cols.append((b, g, r))  # BGR
+    P = np.asarray(pts, dtype=np.float64)
+    C = np.asarray(cols, dtype=np.float64) if cols else None
+    return P, C
 
-def _read_ply(in_path, on_log=None):
-    o3d = _o3d_safe()
-    if o3d is not None:
-        try:
-            pcd = o3d.io.read_point_cloud(in_path)
-            if pcd is None or pcd.is_empty(): raise IOError("open3d read empty")
-            xyz = np.asarray(pcd.points, dtype=np.float64)
-            rgb = np.asarray(pcd.colors, dtype=np.float64) if len(pcd.colors) else np.zeros_like(xyz)
-            return xyz, rgb
-        except Exception as e:
-            _log(f"[texture] open3d read failed → ASCII fallback ({e})", on_log)
-    return _read_ply_ascii(in_path)
+def _save_points_ply(path: str, P: np.ndarray, C: Optional[np.ndarray] = None) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    if HAS_O3D:
+        pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P.astype(np.float64)))
+        if C is not None and C.shape[0] == P.shape[0]:
+            pc.colors = o3d.utility.Vector3dVector((C[:, ::-1] / 255.0).astype(np.float64))  # BGR->RGB
+        o3d.io.write_point_cloud(path, pc)
+        return
 
-def _write_ply(out_path, xyz, rgb, on_log=None):
-    o3d = _o3d_safe()
-    if o3d is not None:
-        try:
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(np.asarray(xyz, np.float64))
-            pcd.colors = o3d.utility.Vector3dVector(np.clip(np.asarray(rgb, np.float64), 0, 1))
-            ok = o3d.io.write_point_cloud(out_path, pcd, write_ascii=False, compressed=False)
-            if not ok: raise IOError("open3d write returned False")
-            return
-        except Exception as e:
-            _log(f"[texture] open3d write failed → ASCII fallback ({e})", on_log)
-    # ASCII fallback
-    xyz = np.asarray(xyz, np.float64); rgb = np.asarray(rgb, np.float64)
-    rgb255 = np.clip(np.round(rgb * 255.0), 0, 255).astype(np.uint8)
-    with open(out_path, "w") as f:
+    with open(path, "w") as f:
         f.write("ply\nformat ascii 1.0\n")
-        f.write(f"element vertex {xyz.shape[0]}\n")
-        f.write("property double x\nproperty double y\nproperty double z\n")
-        f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+        f.write(f"element vertex {P.shape[0]}\n")
+        f.write("property float x\nproperty float y\nproperty float z\n")
+        if C is not None:
+            f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
         f.write("end_header\n")
-        for p, c in zip(xyz, rgb255):
-            f.write(f"{p[0]} {p[1]} {p[2]} {int(c[0])} {int(c[1])} {int(c[2])}\n")
+        if C is None:
+            for p in P:
+                f.write(f"{p[0]} {p[1]} {p[2]}\n")
+        else:
+            Cu8 = np.clip(C, 0, 255).astype(np.uint8)
+            for p, c in zip(P, Cu8):
+                f.write(f"{p[0]} {p[1]} {p[2]} {int(c[2])} {int(c[1])} {int(c[0])}\n")
 
-# ----------- Projektion & Sampling -----------
 
-def _project_points(K, Tcw, pts3d):
-    R = Tcw[:3, :3]; t = Tcw[:3, 3:4]
-    P = (R @ pts3d.T) + t
-    z = P[2, :]
-    valid = z > 1e-6
-    u = (K[0, 0] * (P[0, :] / z)) + K[0, 2]
-    v = (K[1, 1] * (P[1, :] / z)) + K[1, 2]
-    return np.stack([u, v], axis=1), valid
+# --------------------------- Poses & Intrinsics ----------------------------
 
-def _bilinear_sample(img, uv):
-    h, w = img.shape[:2]
-    u = uv[:, 0]; v = uv[:, 1]
-    u0 = np.floor(u).astype(np.int32); v0 = np.floor(v).astype(np.int32)
-    u1 = u0 + 1; v1 = v0 + 1
-    u0c = np.clip(u0, 0, w - 1); u1c = np.clip(u1, 0, w - 1)
-    v0c = np.clip(v0, 0, h - 1); v1c = np.clip(v1, 0, h - 1)
+def _read_poses_rt_idx(npz_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    d = np.load(npz_path, allow_pickle=True)
+    if "R" in d and "t" in d:
+        R = d["R"]                 # (N,3,3) world->cam
+        t = d["t"].reshape(-1, 3, 1)
+        idx = d.get("frame_idx", np.arange(len(R)))
+        return np.asarray(R), np.asarray(t), np.asarray(idx)
+    if "poses" in d and "indices" in d:
+        T = np.asarray(d["poses"])     # 4x4; wir nehmen als w->c
+        idx = np.asarray(d["indices"])
+        R = T[:, :3, :3]
+        t = T[:, :3, 3:4]
+        return R, t, idx
+    raise ValueError("camera_poses.npz missing (R,t) or (poses,indices)")
 
-    Ia = img[v0c, u0c, :].astype(np.float64)
-    Ib = img[v0c, u1c, :].astype(np.float64)
-    Ic = img[v1c, u0c, :].astype(np.float64)
-    Id = img[v1c, u1c, :].astype(np.float64)
+def _load_intrinsics(mesh_dir: str, fallback_image: np.ndarray) -> np.ndarray:
+    npy = os.path.join(mesh_dir, "intrinsics.npy")
+    if os.path.isfile(npy):
+        K = np.load(npy)
+        if K.shape == (3, 3):
+            return K.astype(np.float64)
+    # robuste Heuristik
+    h, w = fallback_image.shape[:2]
+    f = 0.92 * float(max(w, h))
+    return np.array([[f, 0, w / 2.0],
+                     [0, f, h / 2.0],
+                     [0, 0, 1.0]], dtype=np.float64)
 
-    wa = (u1 - u) * (v1 - v)
-    wb = (u - u0) * (v1 - v)
-    wc = (u1 - u) * (v - v0)
-    wd = (u - u0) * (v - v0)
 
-    out = (Ia * wa[:, None] + Ib * wb[:, None] + Ic * wc[:, None] + Id * wd[:, None])
-    return out / 255.0
+# ------------------------- Projection & Sampling ---------------------------
 
-def _inside_mask(mask, uv, margin=1):
-    h, w = mask.shape[:2]
-    u = np.round(uv[:, 0]).astype(np.int32)
-    v = np.round(uv[:, 1]).astype(np.int32)
-    ok = (u >= margin) & (v >= margin) & (u < (w - margin)) & (v < (h - margin))
+def _project_points(K: np.ndarray, R: np.ndarray, t: np.ndarray, Pw: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    # world->camera
+    C = (-R.T @ t).reshape(3)                 # camera center in world
+    Xc = (R @ (Pw.T - C.reshape(3, 1))).T     # N x 3 in camera
+    z = Xc[:, 2]
+    u = K[0, 0] * Xc[:, 0] / np.maximum(z, 1e-9) + K[0, 2]
+    v = K[1, 1] * Xc[:, 1] / np.maximum(z, 1e-9) + K[1, 2]
+    return u, v, z
+
+def _inside_mask(mask: np.ndarray, u: np.ndarray, v: np.ndarray, w: int, h: int) -> np.ndarray:
+    ui = np.floor(u).astype(np.int32)
+    vi = np.floor(v).astype(np.int32)
+    ok = (ui >= 0) & (ui < w) & (vi >= 0) & (vi < h)
     res = np.zeros_like(ok)
     idx = np.where(ok)[0]
-    res[idx] = mask[v[idx], u[idx]] > 127
+    res[idx] = (mask[vi[idx], ui[idx]] > 0)
     return res
 
-def _weight_by_angle_and_dist(Tcw, pts3d):
-    cam_z = Tcw[:3, 2]
-    cam_pos = -Tcw[:3, :3].T @ Tcw[:3, 3]
-    vec = pts3d - cam_pos[None, :]
-    dist = np.linalg.norm(vec, axis=1) + 1e-6
-    vec_n = vec / dist[:, None]
-    cosang = np.abs(np.dot(vec_n, cam_z))
-    return (cosang ** 3) / (dist ** 1.0)
+def _weight_by_depth(z: np.ndarray, power: float) -> np.ndarray:
+    return 1.0 / np.maximum(z, 1e-6) ** power
 
-# ----------- View-Auswahl -----------
+def _in_image_ratio(u, v, z, w, h) -> float:
+    ok = (z > 1e-6) & (u >= 0) & (u < (w - 1)) & (v >= 0) & (v < (h - 1))
+    if ok.size == 0:
+        return 0.0
+    return float(np.mean(ok))
 
-def _parse_views_env(on_log=None):
-    mode = os.getenv("TEXTURE_MODE", "auto").strip().lower()
-    divisor = max(1, int(float(os.getenv("TEXTURE_DIVISOR", "12"))))
-    manual_csv = os.getenv("TEXTURE_MANUAL_VIEWS", "").strip()
-    manual = []
-    if manual_csv:
-        try:
-            manual = [int(x) for x in manual_csv.replace(" ", "").split(",") if x != ""]
-        except Exception:
-            _log(f"[texture] WARN: cannot parse TEXTURE_MANUAL_VIEWS='{manual_csv}'", on_log)
-    return mode, divisor, manual
 
-def _select_views(n_total, mode, divisor, manual):
-    if n_total <= 0: return []
-    if mode == "manual" and manual:
-        return sorted({i for i in manual if 0 <= i < n_total})
-    step = max(1, int(round(n_total / max(1, divisor))))
-    idx = list(range(0, n_total, step))
-    if (n_total - 1) not in idx: idx.append(n_total - 1)
-    return sorted(idx)
+# ------------------------------- Public Core --------------------------------
 
-# ----------- Kern-Texturing -----------
+def compute_auto_views(n_frames: int, divisor: int) -> List[int]:
+    """Gleichmäßig verteilte View-Indizes (divisor+1 Stück, inkl. erster/letzter)."""
+    divisor = max(1, int(divisor))
+    if n_frames <= 1:
+        return [0]
+    idx = np.linspace(0, n_frames - 1, num=divisor + 1, dtype=int)
+    idx = np.unique(np.clip(idx, 0, n_frames - 1))
+    return idx.tolist()
 
-def texture_points_from_views(in_ply, out_ply, intrinsics_npy, poses_npz,
-                              raw_frames_dir, view_indices, use_masks=True,
-                              mask_dir=None, mask_dilate=0, weight_power=2.0,
-                              drop_untextured=False, on_log=None):
-    _log(f"[texture] input ply: {os.path.basename(in_ply)}", on_log)
+def texture_points_from_views(
+    project_root: str,
+    view_ids: List[int],
+    in_ply: str = "fused_points.ply",
+    out_ply: str = "fused_textured_points.ply",
+    use_masks: bool = True,
+    mask_dilate: int = 0,
+    weight_power: float = 2.0,
+    on_log=None
+) -> str:
+    """
+    Robuste Farbprojektion:
+    - Frame-Dateien werden über numerische ID auf Posen (frame_idx) gemappt,
+      mit automatischem Fallback auf Reihenfolge (per-View), falls die ID-Mapping-Hypothese unplausibel ist.
+    - Z-Buffer pro Pixel (nächster Punkt gewinnt)
+    - Gewichtet per 1/z^power
+    """
+    frames_dir = os.path.join(project_root, "raw_frames")
+    masks_dir  = os.path.join(project_root, "features", "masks")
+    mesh_dir   = os.path.join(project_root, "mesh")
+    poses_npz  = os.path.join(project_root, "poses", "camera_poses.npz")
 
-    pts3d, _ = _read_ply(in_ply, on_log=on_log)
-    if pts3d.size == 0:
-        raise RuntimeError("No points in input PLY.")
+    # 3D Punkte laden
+    P, C_init = _read_points_ply(os.path.join(mesh_dir, in_ply))
+    N = P.shape[0]
+    col_sum = np.zeros((N, 3), dtype=np.float64)
+    w_sum   = np.zeros((N,), dtype=np.float64)
 
-    K = _load_intrinsics(intrinsics_npy)
-    _, Tcw_all = _read_poses_npz(poses_npz)
-    frames = _list_raw_frames(raw_frames_dir)
+    # Frames & Posen
+    frames = _list_frames_with_ids(frames_dir)
     if len(frames) == 0:
-        raise RuntimeError("No frames found for texturing.")
+        raise RuntimeError(f"No frames in {frames_dir}.")
+    R_all, t_all, idx = _read_poses_rt_idx(poses_npz)
 
-    used = [i for i in view_indices if 0 <= i < len(frames)]
-    if not used: raise RuntimeError("No valid views for texturing.")
+    # Intrinsics
+    im0 = _imread_color(frames[0][0])
+    K = _load_intrinsics(mesh_dir, im0)
 
-    masks = {}
-    if use_masks and mask_dir and os.path.isdir(mask_dir):
-        for vi in used:
-            # mask-Dateinamen: 000000.png, 000001.png, …
-            mp = os.path.join(mask_dir, f"{vi:06d}.png")
-            if os.path.isfile(mp):
-                m = cv.imread(mp, cv.IMREAD_GRAYSCALE)
-                if m is not None and mask_dilate > 0:
-                    m = cv.dilate(m, np.ones((mask_dilate, mask_dilate), np.uint8))
-                masks[vi] = m
+    # Maps
+    pose_by_id   = {int(fi): (R_all[k], t_all[k]) for k, fi in enumerate(idx)}
+    pose_by_rank = {k: (R_all[k], t_all[k]) for k in range(len(R_all))}
 
-    acc = np.zeros((pts3d.shape[0], 3), dtype=np.float64)
-    wsum = np.zeros((pts3d.shape[0],), dtype=np.float64)
+    # Nur valide view ids
+    vmax = len(frames)
+    view_ids = [int(v) for v in view_ids if 0 <= int(v) < vmax]
+    if not view_ids:
+        view_ids = [0]
 
-    for vi in used:
-        img = _safe_imread(frames[vi])
-        h, w = img.shape[:2]
-        if vi >= len(Tcw_all): continue
-        Tcw = Tcw_all[vi]
+    # Plausibilitätswarnung bei massiv fehlenden Posen (ID-Mapping)
+    missing = [vi for vi in view_ids if frames[vi][1] not in pose_by_id]
+    if missing and (len(missing) / max(1, len(view_ids))) > 0.3:
+        _log(f"[texture] WARN: pose/frame mismatch likely – falling back to order for many views", on_log)
 
-        uv, z_ok = _project_points(K, Tcw, pts3d)
-        in_img = ((uv[:, 0] >= 0) & (uv[:, 1] >= 0) &
-                  (uv[:, 0] < w - 1) & (uv[:, 1] < h - 1) & z_ok)
+    for vi in view_ids:
+        fpath, fid = frames[vi]
+        im = _imread_color(fpath)
+        h, w = im.shape[:2]
+        mask = _mask_for_frame(masks_dir, fpath, fid, dilate_px=mask_dilate) if use_masks else None
+        if mask is None:
+            mask = np.ones((h, w), np.uint8) * 255
 
-        if use_masks and vi in masks:
-            in_mask = _inside_mask(masks[vi], uv, margin=1)
-            in_img = in_img & in_mask
+        # 1) Versuch: Mapping per frame-id
+        R, t = pose_by_id.get(fid, (None, None))
+        choose_rank = False
+        if R is None:
+            choose_rank = True
+        else:
+            u_try, v_try, z_try = _project_points(K, R, t, P)
+            if _in_image_ratio(u_try, v_try, z_try, w, h) < 0.15:
+                choose_rank = True
 
-        idx = np.where(in_img)[0]
-        if idx.size == 0: continue
+        # Fallback: Mapping per Reihenfolge (vi)
+        if choose_rank:
+            Rt = pose_by_rank.get(vi, (None, None))
+            if Rt[0] is None:
+                continue
+            R, t = Rt
+            u_try, v_try, z_try = _project_points(K, R, t, P)
 
-        samp = _bilinear_sample(img, uv[idx, :])
-        ww = _weight_by_angle_and_dist(Tcw, pts3d[idx, :]) ** float(weight_power)
-        acc[idx, :] += samp * ww[:, None]
-        wsum[idx] += ww
+        # endgültige Projektion
+        u, v, z = u_try, v_try, z_try
 
-    colored = wsum > 1e-9
-    rgb = np.zeros_like(acc)
-    rgb[colored, :] = (acc[colored, :] / wsum[colored, None])
+        inside = (z > 1e-6) & (u >= 0) & (u < (w - 1)) & (v >= 0) & (v < (h - 1))
+        if not np.any(inside):
+            continue
 
-    if not colored.all() and drop_untextured:
-        keep_idx = np.where(colored)[0]
-        _log(f"[texture] dropping {pts3d.shape[0]-keep_idx.size} untextured points", on_log)
-        pts3d = pts3d[keep_idx, :]
-        rgb = rgb[keep_idx, :]
+        in_mask = np.zeros_like(inside)
+        idx_in  = np.where(inside)[0]
+        in_mask[idx_in] = _inside_mask(mask, u[idx_in], v[idx_in], w, h)
+        vis = inside & in_mask
+        if not np.any(vis):
+            continue
 
-    _write_ply(out_ply, pts3d, rgb, on_log=on_log)
-    _log(f"[texture] wrote: {out_ply}", on_log)
+        # Z-Buffer pro Pixel (Nearest wins)
+        ui = np.floor(u[vis]).astype(np.int32)
+        vi_pix = np.floor(v[vis]).astype(np.int32)
+        z_vis  = z[vis]
+        pidx   = np.nonzero(vis)[0]
 
-# ----------- Public Entry -----------
+        lin = vi_pix * w + ui
+        order = np.argsort(z_vis)  # nahe zuerst
+        lin_sorted = lin[order]
+        _, first_idx = np.unique(lin_sorted, return_index=True)
+        sel = order[first_idx]  # Indizes innerhalb pidx
 
-def run_texturing(mesh_dir, on_log=None):
-    if os.getenv("TEXTURE_ENABLE", "true").lower() not in ("1","true","yes","on"):
+        cols = im[vi_pix[sel], ui[sel]].astype(np.float64)
+        ww   = _weight_by_depth(z_vis[sel], weight_power)
+
+        np.add.at(col_sum, pidx[sel], (cols.T * ww).T)
+        np.add.at(w_sum,   pidx[sel], ww)
+
+    # Finalfarben
+    C = np.zeros((N, 3), dtype=np.float64)
+    have = (w_sum > 1e-9)
+    C[have] = (col_sum[have] / w_sum[have][:, None])
+
+    # Fallback: alte Farben beibehalten, sonst neutrales Grau
+    if C_init is not None and C_init.shape[0] == N:
+        C[~have] = C_init[~have]
+    else:
+        C[~have] = 127.0
+
+    out_path = os.path.join(mesh_dir, out_ply)
+    _save_points_ply(out_path, P, C)
+    _log(f"[texture] wrote: {out_path}", on_log)
+    return out_path
+
+
+def texture_project_auto(
+    project_root: str,
+    divisor: int = 12,
+    in_ply: str = "fused_points.ply",
+    out_ply: str = "fused_textured_points.ply",
+    use_masks: bool = True,
+    mask_dilate: int = 0,
+    weight_power: float = 2.0,
+    on_log=None
+) -> Tuple[str, List[int]]:
+    frames_dir = os.path.join(project_root, "raw_frames")
+    n_frames = len(_list_frames_with_ids(frames_dir))
+    views = compute_auto_views(n_frames, divisor)
+    out_path = texture_points_from_views(
+        project_root=project_root,
+        view_ids=views,
+        in_ply=in_ply,
+        out_ply=out_ply,
+        use_masks=use_masks,
+        mask_dilate=mask_dilate,
+        weight_power=weight_power,
+        on_log=on_log
+    )
+    return out_path, views
+
+
+# ---------------------------- Runner-kompatibel ------------------------------
+
+def _parse_bool_env(s: Optional[str], default: bool = False) -> bool:
+    if s is None: return default
+    return str(s).strip().lower() in ("1","true","yes","y","on")
+
+def run_texturing(mesh_dir: str, on_log=None) -> Optional[str]:
+    """
+    Wrapper für pipeline_runner:
+    - liest ENV: TEXTURE_ENABLE, TEXTURE_MODE, TEXTURE_DIVISOR, TEXTURE_MANUAL_VIEWS,
+                 TEXTURE_IN_PLY, TEXTURE_OUT_PLY, TEXTURE_USE_MASKS, TEXTURE_MASK_DILATE,
+                 TEXTURE_WEIGHT_POWER
+    - ruft texture_points_from_views(...) mit Auto- oder Manual-Views.
+    """
+    if not _parse_bool_env(os.getenv("TEXTURE_ENABLE", "true"), True):
         _log("[texture] disabled.", on_log)
         return None
 
-    in_ply = os.getenv("TEXTURE_IN_PLY", "fused_points.ply")
+    in_ply  = os.getenv("TEXTURE_IN_PLY", "fused_points.ply")
     out_ply = os.getenv("TEXTURE_OUT_PLY", "fused_textured_points.ply")
-    use_masks = os.getenv("TEXTURE_USE_MASKS", "true").lower() in ("1","true","yes","on")
+    use_masks = _parse_bool_env(os.getenv("TEXTURE_USE_MASKS", "true"), True)
     mask_dilate = int(float(os.getenv("TEXTURE_MASK_DILATE", "2")))
     weight_power = float(os.getenv("TEXTURE_WEIGHT_POWER", "2.0"))
-    drop_untextured = os.getenv("TEXTURE_DROP_UNTEXTURED", "false").lower() in ("1","true","yes","on")
+    mode = (os.getenv("TEXTURE_MODE", "auto") or "auto").strip().lower()
+    divisor = max(1, int(float(os.getenv("TEXTURE_DIVISOR", "12"))))
+    manual_csv = (os.getenv("TEXTURE_MANUAL_VIEWS", "") or "").strip()
 
-    intr = os.path.join(mesh_dir, "intrinsics.npy")
-    in_ply_path = os.path.join(mesh_dir, in_ply)
-    out_ply_path = os.path.join(mesh_dir, out_ply)
+    project_root = os.path.abspath(os.path.join(mesh_dir, os.pardir))
 
-    root = os.path.abspath(os.path.join(mesh_dir, os.pardir))
-    poses_npz = os.path.join(root, "poses", "camera_poses.npz")
-    raw_dir = os.path.join(root, "raw_frames")
-    mask_dir = os.path.join(root, "features", "masks") if use_masks else None
+    # Views bestimmen
+    frames_dir = os.path.join(project_root, "raw_frames")
+    n_frames = len(_list_frames_with_ids(frames_dir))
+    if mode == "manual" and manual_csv:
+        try:
+            view_ids = sorted({int(x) for x in manual_csv.replace(" ", "").split(",") if x != ""})
+        except Exception:
+            _log(f"[texture] WARN: cannot parse TEXTURE_MANUAL_VIEWS='{manual_csv}'", on_log)
+            view_ids = compute_auto_views(n_frames, divisor)
+        _log(f"[texture] manual-views -> {view_ids}", on_log)
+    else:
+        view_ids = compute_auto_views(n_frames, divisor)
+        _log(f"[texture] auto-views (div={divisor}) -> {view_ids}", on_log)
 
-    frames = _list_raw_frames(raw_dir)
-    n_total = len(frames)
-
-    mode, divisor, manual = _parse_views_env(on_log)
-    views = _select_views(n_total, mode, divisor, manual)
-    _log(f"[texture] auto-views (div={divisor}) -> {views}" if mode!="manual" else f"[texture] manual-views -> {views}", on_log)
-
-    try:
-        texture_points_from_views(
-            in_ply=in_ply_path,
-            out_ply=out_ply_path,
-            intrinsics_npy=intr,
-            poses_npz=poses_npz,
-            raw_frames_dir=raw_dir,
-            view_indices=views,
-            use_masks=use_masks,
-            mask_dir=mask_dir,
-            mask_dilate=mask_dilate,
-            weight_power=weight_power,
-            drop_untextured=drop_untextured,
-            on_log=on_log
-        )
-        return out_ply_path
-    except Exception as e:
-        _log(f"[texture] failed (robust path): {e}\n{traceback.format_exc()}", on_log)
-        raise
+    # Texturierung
+    out_path = texture_points_from_views(
+        project_root=project_root,
+        view_ids=view_ids,
+        in_ply=in_ply,
+        out_ply=out_ply,
+        use_masks=use_masks,
+        mask_dilate=mask_dilate,
+        weight_power=weight_power,
+        on_log=on_log
+    )
+    return out_path

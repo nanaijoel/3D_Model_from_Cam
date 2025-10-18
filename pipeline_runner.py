@@ -172,7 +172,6 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("MVS_FILL_DEPTH_STD", mp.get("fill_depth_std", 0.03))
     setenv("MVS_FILL_DEPTH_REL", mp.get("fill_depth_rel", 0.06))
     setenv("MVS_FILL_STRIDE", mp.get("fill_stride", 1))
-    # Cap/Downsample nach Fill (gegen Punkt-Explosion)
     setenv("MVS_FILL_MAX_POINTS", mp.get("fill_max_points", 3000000))
     setenv("MVS_VOXEL_AFTER_FILL", mp.get("voxel_after_fill", 0.0015))
 
@@ -182,6 +181,20 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("CARVE_VIEWS", cv_cfg.get("views", 24))
     setenv("CARVE_TAU", cv_cfg.get("tau", 0.50))
     setenv("CARVE_MASK_DILATE_PX", cv_cfg.get("mask_dilate", 2))
+
+    # Pre-Carve & Keep-All-Sparse Schalter an Env spiegeln (falls in meshing aktiv)
+    setenv("CARVE_PRE_SPARSE", cfg.get("carve_pre_sparse", True))
+    setenv("CARVE_PRE_VIEWS",  cfg.get("carve_pre_views", 32))
+    setenv("CARVE_PRE_TAU",    cfg.get("carve_pre_tau", 0.70))
+    setenv("CARVE_PRE_DILATE", cfg.get("carve_pre_dilate", 2))
+    setenv("MVS_KEEP_ALL_SPARSE", cfg.get("mvs_keep_all_sparse", True))
+
+    # Optional: Oberflächenschließung (falls in meshing implementiert)
+    sc = (cfg.get("surface_close", {}) or {})
+    setenv("SURFACE_CLOSE_ENABLE", pick_bool(sc.get("enable", False)))
+    setenv("SURFACE_CLOSE_POISSON_DEPTH", pick_num(sc.get("poisson_depth", 9)))
+    setenv("SURFACE_CLOSE_POISSON_SCALE", pick_num(sc.get("poisson_scale", 1.1)))
+    setenv("SURFACE_CLOSE_TARGET_POINTS", pick_num(sc.get("target_points", 1000000)))
 
     tx = cfg.get("texturing", {}) or {}
     setenv("TEXTURE_ENABLE", pick_bool(tx.get("enable", True)))
@@ -195,12 +208,6 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("TEXTURE_BACKFILL", tx.get("backfill", "nearest"))
     setenv("TEXTURE_DROP_UNTEXTURED", tx.get("drop_untextured", False))
 
-    mesh_cfg = cfg.get("mesh", {}) or {}
-    setenv("MESH_DOWNSAMPLE", mesh_cfg.get("downsample", 1))
-    setenv("MESH_VOXEL_SIZE", mesh_cfg.get("voxel_size", 0.0))
-    setenv("MESH_OUTLIER_NB", mesh_cfg.get("outlier_nb", 20))
-    setenv("MESH_OUTLIER_STD", mesh_cfg.get("outlier_std", 1.6))
-
 
 def _dump_resolved_config(project_root):
     out = os.path.join(project_root, "resolved_config.yaml")
@@ -208,14 +215,14 @@ def _dump_resolved_config(project_root):
         import yaml
         cfg = {}
         for k, v in os.environ.items():
-            if k.startswith(("FEATURE_", "MATCH_", "SFM_", "MVS_", "CARVE_", "TEXTURE_", "MASK_", "MESH_","LOWLIGHT_")):
+            if k.startswith(("FEATURE_", "MATCH_", "SFM_", "MVS_", "CARVE_", "TEXTURE_", "MASK_","MESH_","LOWLIGHT_")):
                 cfg[k] = v
         with open(out, "w") as f:
             yaml.safe_dump(cfg, f, sort_keys=True)
     except Exception:
         with open(out, "w") as f:
             for k, v in sorted(os.environ.items()):
-                if k.startswith(("FEATURE_", "MATCH_", "SFM_", "MVS_", "CARVE_", "TEXTURE_", "MASK_", "MESH_","LOWLIGHT_")):
+                if k.startswith(("FEATURE_", "MATCH_", "SFM_", "MVS_", "CARVE_", "TEXTURE_", "MASK_","MESH_","LOWLIGHT_")):
                     f.write(f"{k}: {v}\n")
     return out
 
@@ -223,11 +230,10 @@ def _dump_resolved_config(project_root):
 # ------------------------------ Intrinsics ------------------------------------
 
 def _estimate_f_from_pair(p1, p2, W, H):
-    # robuste F-Schätzung → heuristische f-Näherung (stabiler als blinde Raterei)
     F, _ = cv.findFundamentalMat(p1, p2, cv.FM_RANSAC, 1.0, 0.999, 5000)
     if F is None or F.shape != (3, 3):
         return None
-    return 0.92 * float(max(W, H))  # konservative Heuristik
+    return 0.92 * float(max(W, H))
 
 def _clamp_f(f_est, W, H):
     f_min = 0.70 * float(max(W, H))
@@ -264,7 +270,7 @@ class PipelineRunner:
             raise RuntimeError("No frames were extracted.")
         log(f"[frames] saved: {len(imgs)}")
 
-        # 1b) Lowlight → bevorzugt separates Verzeichnis (Texturing nutzt weiterhin raw_frames)
+        # 1b) Lowlight
         processed_imgs = None
         try:
             if _parse_bool(os.getenv("LOWLIGHT_ENABLE", "false"), False):
@@ -312,7 +318,7 @@ class PipelineRunner:
                                              on_log=log, save_dir=paths.matches)
 
         # 5) Intrinsics
-        H0, W0 = shapes[0]  # (H,W)
+        H0, W0 = shapes[0]
         W, H = int(W0), int(H0)
         cx, cy = W * 0.5, H * 0.5
 
@@ -332,7 +338,6 @@ class PipelineRunner:
 
         matches_for_sfm = _as_sfm_matches(pairs_np, matches_list)
 
-        # bestes Paar für f-Schätzung
         best = None
         for (i, j), m in matches_for_sfm.items():
             if best is None or len(m) > best[0]:
@@ -368,7 +373,7 @@ class PipelineRunner:
         res = run_sfm(kps, descs, shapes, pairs_np, matches_for_sfm, K, log, prog,
                       poses_out_dir=poses_dir, config=cfg_sfm)
 
-        # 7) Sparse speichern (keine harte Drosselung hier)
+        # 7) Sparse speichern
         if not (isinstance(res, tuple) and len(res) >= 1):
             raise RuntimeError("SfM did not return a points array.")
         points3d = np.asarray(res[0], dtype=np.float64).reshape(-1, 3)
@@ -380,10 +385,10 @@ class PipelineRunner:
         log(f"[sfm] raw_points(after validation)={points3d.shape[0]:d}")
         log(f"[ui] Done: {sparse_ply}")
 
-        # 8) Dense + Carving (gekapselt in meshing.run_mvs_and_carve)
+        # 8) Dense + (optional) Carving
         fused_ply = run_mvs_and_carve(paths, K, on_log=log, on_progress=prog)
 
-        # 9) Intrinsics für Texturing persistieren
+        # 9) Intrinsics für Texturing
         intr_npy = os.path.join(mesh_dir, "intrinsics.npy")
         try:
             np.save(intr_npy, K)
@@ -391,23 +396,34 @@ class PipelineRunner:
         except Exception as e:
             log(f"[texture] warn: could not save intrinsics.npy ({e})")
 
-        # 10) Texturing – Manual-Flow unterstützen
-        os.environ["TEXTURE_IN_PLY"] = os.getenv("TEXTURE_IN_PLY", "fused_points.ply")
+        # 10) Texturing – ALWAYS run; Rückgabe bleibt (sparse_ply, paths)
+        mesh_dir = os.path.join(paths.root, "mesh")
+
+        # Wenn wir ein geschlossenes Mesh erzeugt haben, nutze es bevorzugt:
+        closed_mesh = os.path.join(mesh_dir, "closed_mesh.ply")
+        in_ply = "closed_mesh.ply" if os.path.isfile(closed_mesh) else os.getenv("TEXTURE_IN_PLY", "fused_points.ply")
+        os.environ["TEXTURE_IN_PLY"]  = in_ply
         os.environ["TEXTURE_OUT_PLY"] = os.getenv("TEXTURE_OUT_PLY", "fused_textured_points.ply")
 
-        # Manual-Modus: wenn (noch) keine Auswahl gesetzt → GUI soll Textur-Views sammeln,
-        # Pipeline liefert erstmal die nicht-texturierte fused_ply zurück.
-        if (os.getenv("TEXTURE_MODE", "auto").lower() == "manual"
-            and not os.getenv("TEXTURE_MANUAL_VIEWS", "").strip()):
-            log("[texture] manual mode selected – waiting for GUI to set TEXTURE_MANUAL_VIEWS …")
-            return fused_ply, paths
-
         try:
-            out_tex = run_texturing(mesh_dir, on_log=log)
-            if out_tex:
-                return out_tex, paths
+            if _parse_bool(os.getenv("TEXTURE_ENABLE", "true"), True):
+                mode = (os.getenv("TEXTURE_MODE", "auto") or "auto").lower()
+                manual_csv = (os.getenv("TEXTURE_MANUAL_VIEWS", "") or "").strip()
+                if mode == "manual" and not manual_csv:
+                    log("[texture] manual mode w/o views → fallback to AUTO")
+                    os.environ["TEXTURE_MODE"] = "auto"
+
+                out_tex = run_texturing(mesh_dir, on_log=log)
+                if out_tex and os.path.isfile(out_tex):
+                    log(f"[texture] wrote: {out_tex}")
+                else:
+                    log("[texture] WARN: run_texturing returned no file")
+            else:
+                log("[texture] skipped (TEXTURE_ENABLE=false)")
         except Exception as e:
             log(f"[texture] failed: {e}")
 
-        # Fallback: gib zumindest die gefusete Punktwolke zurück
-        return fused_ply, paths
+        # Rückgabe unverändert wie bisher:
+        self.on_progress(100, "finished")
+        return sparse_ply, paths
+

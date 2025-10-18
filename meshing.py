@@ -373,7 +373,7 @@ def run_visible_sparse_with_fill(mesh_dir: str, frames_dir: str, poses_npz: str,
     fused = fused_core if not len(new_points_world) else np.vstack([fused_core] + new_points_world).astype(np.float32)
 
     # --- Cap & Downsample nach Füllen (gegen 20M+ Punkte) ---
-    MAX_FILL_POINTS = int(float(os.getenv("MVS_FILL_MAX_POINTS", "3000000")))
+    MAX_FILL_POINTS = int(float(os.getenv("MVS_FILL_MAX_POINTS", "4000000")))
     VOX_AFTER = float(os.getenv("MVS_VOXEL_AFTER_FILL", "0.0015"))
     if fused.shape[0] > MAX_FILL_POINTS and HAS_O3D:
         _log(f"[fill] too many points ({fused.shape[0]}) -> voxel downsample to ~{MAX_FILL_POINTS}", on_log)
@@ -457,6 +457,202 @@ def carve_points_like_texturing(mesh_dir: str, frames_dir: str, poses_npz: str, 
     _log(f"[carve] kept {np.count_nonzero(keep)}/{P.shape[0]} points", on_log)
     return out
 
+# --- in meshing.py (zusätzlich einfügen) ---
+def carve_sparse_by_masks(mesh_dir: str, frames_dir: str, poses_npz: str, masks_dir: str | None,
+                          n_views: int = 32, tau: float = 0.70, mask_dilate_px: int = 2,
+                          on_log=None, on_progress=None) -> str:
+    """
+    Pre-Carve direkt auf sparse.ply mit Mehrheitsvoting über Masken.
+    Behalte Punkte, die in >= tau Anteil der geprüften Views IN der Maske liegen,
+    sofern sie überhaupt in genügend Views ins Bild projizieren.
+    """
+    K = globals().get("GLOBAL_INTRINSICS_K", None)
+    if K is None: raise RuntimeError("GLOBAL_INTRINSICS_K ist nicht gesetzt.")
+
+    sparse_path = os.path.join(mesh_dir, "sparse.ply")
+    P = _read_ply_xyz(sparse_path)
+    if P is None or P.size == 0:
+        return sparse_path
+
+    frame_files = _sorted_frames(frames_dir)
+    if len(frame_files) == 0: return sparse_path
+    R_all, t_all, _ = _load_poses_npz(poses_npz)
+
+    V = min(len(frame_files), len(R_all))
+    sel = list(range(0, V, max(1, V // max(1, n_views))))
+    sel = sorted(set(np.clip(sel, 0, V - 1)))
+    _log(f"[pre-carve] using {len(sel)} views (tau={tau:.2f}, dil={mask_dilate_px}px)", on_log)
+
+    # Masken laden (oder Full-On)
+    masks = []
+    for i in sel:
+        m = _mask_for_frame(masks_dir, frame_files[i]) if (masks_dir and os.path.isdir(masks_dir)) else None
+        if m is None:
+            m = np.ones((1080, 1920), np.uint8) * 255
+        if mask_dilate_px > 0:
+            m = _dilate_mask(m, mask_dilate_px)
+        masks.append(m)
+
+    votes_in = np.zeros(P.shape[0], dtype=np.int32)
+    votes_vis = np.zeros(P.shape[0], dtype=np.int32)
+
+    for idx_k, i in enumerate(sel):
+        if on_progress: on_progress(int(100.0 * idx_k / max(1, len(sel))), f"pre-carve view={i}")
+        C = (-R_all[i].T @ t_all[i]).reshape(3)
+        X_cam = (R_all[i] @ (P.T - C.reshape(3, 1))).T
+        Z = X_cam[:, 2]
+        u, v = _project(K, X_cam)
+        m = masks[idx_k]; H, W = m.shape[:2]
+
+        inside = (u >= 0) & (u < W) & (v >= 0) & (v < H) & (Z > 1e-6)
+        votes_vis += inside.astype(np.int32)
+
+        if np.any(inside):
+            ui = np.clip(np.floor(u[inside]).astype(np.int32), 0, W - 1)
+            vi = np.clip(np.floor(v[inside]).astype(np.int32), 0, H - 1)
+            ok = (m[vi, ui] > 0)
+            idx_in = np.where(inside)[0][ok]
+            votes_in[idx_in] += 1
+
+    # Konsensus: mindestens ein paar valide Projektionen (robust), und
+    # Anteil innerhalb Maske >= tau
+    MIN_VIS = max(3, int(round(0.25 * len(sel))))  # z.B. mindestens 25% der geprüften Views sichtbar
+    keep = (votes_vis >= MIN_VIS) & (votes_in >= np.ceil(tau * np.maximum(votes_vis, 1)))
+
+    out_sparse = os.path.join(mesh_dir, "sparse.ply")
+    save_point_cloud(P[keep], out_sparse, on_log=on_log, on_progress=on_progress)
+    _log(f"[pre-carve] kept {np.count_nonzero(keep)}/{P.shape[0]} points (min_vis={MIN_VIS})", on_log)
+    return out_sparse
+
+
+
+## meshing.py — Ersatz für close_surface_after_fill
+def close_surface_after_fill(mesh_dir: str,
+                             target_points: int = 800_000,
+                             poisson_depth: int = -1,
+                             poisson_scale: float = 1.1,
+                             max_poisson_points: int = 450_000,
+                             on_log=None, on_progress=None) -> str:
+    """
+    Robuster 'zweiter Gang':
+      1) adaptiv ausdünnen (<= max_poisson_points)
+      2) Poisson (auto depth 7..10, wenn poisson_depth<0)
+      3) Dichte-Trim + Hole-Fill
+      4) Speichere geschlossenes Mesh: closed_mesh.ply
+      5) Zurück sampeln -> fused_points.ply (für Punkt-Texturing)
+    """
+    if not HAS_O3D:
+        _log("[surface-close] skipped (open3d not available)", on_log)
+        return os.path.join(mesh_dir, "fused_points.ply")
+
+    src = os.path.join(mesh_dir, "fused_points.ply")
+    if not os.path.isfile(src):
+        raise FileNotFoundError(src)
+
+    pcd = o3d.io.read_point_cloud(src)
+    n_in = np.asarray(pcd.points).shape[0]
+    if n_in == 0:
+        _log("[surface-close] empty point cloud", on_log)
+        return src
+
+    _log(f"[surface-close] input points={n_in}", on_log)
+
+    # 1) adaptiv ausdünnen
+    def median_nn_dist(pcd_in, k=16):
+        p = np.asarray(pcd_in.points)
+        if p.shape[0] < k+1:
+            return 0.01
+        kdt = o3d.geometry.KDTreeFlann(pcd_in)
+        dists = []
+        step = max(1, p.shape[0] // 50_000)
+        for i in range(0, p.shape[0], step):
+            _, idx, _ = kdt.search_knn_vector_3d(pcd_in.points[i], k)
+            nn = p[idx[1:], :] - p[i]
+            dd = np.linalg.norm(nn, axis=1)
+            dists.append(np.median(dd))
+        return float(np.median(dists)) if dists else 0.01
+
+    if n_in > max_poisson_points:
+        dmed = median_nn_dist(pcd)
+        vox = max(1e-4, 0.6 * dmed)
+        pcd = pcd.voxel_down_sample(voxel_size=vox)
+        n_ds = np.asarray(pcd.points).shape[0]
+        _log(f"[surface-close] pre-voxel: voxel={vox:.5f} -> {n_ds} pts", on_log)
+
+    # Normals
+    try:
+        rad = max(1e-3, 4.0 * median_nn_dist(pcd))
+        pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=rad, max_nn=32))
+        pcd.orient_normals_consistent_tangent_plane(40)
+    except Exception:
+        pcd.estimate_normals()
+
+    # 2) Poisson (auto depth)
+    n_poisson = np.asarray(pcd.points).shape[0]
+    if poisson_depth <= 0:
+        if n_poisson < 120_000: depth = 8
+        elif n_poisson < 300_000: depth = 9
+        else: depth = 10
+    else:
+        depth = int(poisson_depth)
+
+    _log(f"[surface-close] poisson: n={n_poisson}, depth={depth}, scale={poisson_scale}", on_log)
+
+    try:
+        if on_progress: on_progress(5, "Poisson reconstruction")
+        mesh, dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            pcd, depth=int(depth), scale=float(poisson_scale), linear_fit=True
+        )
+
+        dens = np.asarray(dens)
+        keep = dens > np.percentile(dens, 5.0)
+        mesh = mesh.select_by_index(np.where(keep)[0])
+
+        mesh.remove_degenerate_triangles()
+        mesh.remove_duplicated_triangles()
+        mesh.remove_duplicated_vertices()
+        mesh.remove_non_manifold_edges()
+        try:
+            mesh = mesh.fill_holes()
+        except Exception:
+            pass
+
+    except Exception as e:
+        _log(f"[surface-close] Poisson failed ({e}) → fallback BPA", on_log)
+        r = 1.5 * median_nn_dist(pcd)
+        try:
+            mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
+                pcd, o3d.utility.DoubleVector([r, 2.0 * r])
+            )
+            mesh.remove_degenerate_triangles()
+            mesh.remove_duplicated_triangles()
+            mesh.remove_non_manifold_edges()
+            try:
+                mesh = mesh.fill_holes()
+            except Exception:
+                pass
+        except Exception as ee:
+            _log(f"[surface-close] BPA also failed ({ee})", on_log)
+            return src
+
+    # 4) geschlossenes Mesh persistieren
+    closed_mesh_path = os.path.join(mesh_dir, "closed_mesh.ply")
+    o3d.io.write_triangle_mesh(closed_mesh_path, mesh)
+    _log(f"[surface-close] wrote: {closed_mesh_path}", on_log)
+
+    # 5) zurück sampeln (Punktwolke für dein Punkt-Texturing)
+    n_target = int(target_points)
+    try:
+        pcd_surf = mesh.sample_points_poisson_disk(number_of_points=n_target)
+    except Exception:
+        pcd_surf = mesh.sample_points_uniformly(number_of_points=n_target)
+    P_surf = np.asarray(pcd_surf.points, dtype=np.float32)
+
+    out = os.path.join(mesh_dir, "fused_points.ply")
+    save_point_cloud(P_surf, out, on_log=on_log, on_progress=on_progress)
+    _log(f"[surface-close] wrote: {out} ({P_surf.shape[0]} pts)", on_log)
+    return out
+
 
 # ------------------------- Öffentliche API --------------------------------
 
@@ -475,18 +671,24 @@ def reconstruct_mvs_depth_and_mesh(paths, K,
 
 def run_mvs_and_carve(paths, K, on_log=None, on_progress=None) -> str:
     """
-    Wrapper: Dense (sichtbare Sparse + Fill) + optional Carving.
+    Wrapper: Dense (sichtbare Sparse + Fill) + optional Carving + optional Surface-Close.
+    - Dense/Filling:  reconstruct_mvs_depth_and_mesh(...)
+    - Optional Carving: carve_points_like_texturing(...)
+    - Optional Surface-Close: close_surface_after_fill(...)  -> schließt Oberflächenlöcher
+    Rückgabe: Pfad zu mesh/fused_points.ply (ggf. nach Surface-Close ersetzt).
     """
+    # 1) Dense + Fill
     fused_ply = reconstruct_mvs_depth_and_mesh(paths, K, on_log, on_progress)
 
-    if str(os.getenv("CARVE_ENABLE", "true")).lower() in ("1","true","yes","on"):
+    # 2) Optional: Carving-Pass (Masken-basiert)
+    if str(os.getenv("CARVE_ENABLE", "true")).lower() in ("1", "true", "yes", "on"):
         root = paths.root if hasattr(paths, "root") else paths["root"]
         mesh_dir   = os.path.join(root, "mesh")
         frames_dir = os.path.join(root, "raw_frames")
         poses_npz  = os.path.join(root, "poses", "camera_poses.npz")
         masks_dir  = os.path.join(root, "features", "masks")
 
-        use_all = str(os.getenv("CARVE_USE_ALL_MASKS", "false")).lower() in ("1","true","yes","on")
+        use_all = str(os.getenv("CARVE_USE_ALL_MASKS", "false")).lower() in ("1", "true", "yes", "on")
         nviews  = int(float(os.getenv("CARVE_VIEWS", "24")))
         tau     = float(os.getenv("CARVE_TAU", "0.50"))
         dil     = int(float(os.getenv("CARVE_MASK_DILATE_PX", "2")))
@@ -496,4 +698,30 @@ def run_mvs_and_carve(paths, K, on_log=None, on_progress=None) -> str:
             use_all_masks=use_all, n_views=nviews, tau=tau, mask_dilate_px=dil,
             on_log=on_log, on_progress=on_progress
         )
+
+    # 3) Optional: „zweiter Gang“ – Surface schließen (Poisson + zurück sampeln)
+    if str(os.getenv("SURFACE_CLOSE_ENABLE", "false")).lower() in ("1", "true", "yes", "on"):
+        root = paths.root if hasattr(paths, "root") else paths["root"]
+        mesh_dir = os.path.join(root, "mesh")
+        try:
+            target_points = int(float(os.getenv("SURFACE_CLOSE_TARGET_POINTS", "1000000")))
+            poisson_depth = int(float(os.getenv("SURFACE_CLOSE_POISSON_DEPTH", "9")))
+            poisson_scale = float(os.getenv("SURFACE_CLOSE_POISSON_SCALE", "1.1"))
+
+            # erzeugt neue, geschlossene Punktwolke unter mesh/fused_points.ply
+            fused_ply = close_surface_after_fill(
+                mesh_dir,
+                target_points=target_points,
+                poisson_depth=poisson_depth,
+                poisson_scale=poisson_scale,
+                on_log=on_log, on_progress=on_progress
+            )
+
+            # sicherstellen, dass das Texturing die geschlossene Wolke nimmt
+            os.environ["TEXTURE_IN_PLY"] = "fused_points.ply"
+
+        except Exception as e:
+            if on_log:
+                on_log(f"[surface-close] failed -> keep original fused_points.ply ({e})")
+
     return fused_ply

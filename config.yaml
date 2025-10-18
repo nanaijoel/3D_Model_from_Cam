@@ -1,4 +1,5 @@
-# CONFIG.YAML — Full pipeline config (überarbeitet)
+# config.yaml
+# — volle Pipeline-Config mit neuen Schaltern für Pre-Carve & Keep-All-Sparse
 
 lowlight:
   enable: true
@@ -14,8 +15,8 @@ features:
   debug_every: 5
 
   lg:
-    detection_threshold: 0.0000045   # etwas sensibler
-    nms: 3                           # gleichmäßigere KP-Verteilung
+    detection_threshold: 0.0000045
+    nms: 3
     resize: 1024
     remove_borders: 2
     force_num: true
@@ -29,7 +30,7 @@ features:
     unsharp_amount: 1.3
     noise: false
     noise_std: 1.5
-    mask_dilate: 5                   # etwas sanfter als 6
+    mask_dilate: 5
 
   fill:
     enable: true
@@ -56,7 +57,7 @@ matching:
   retr_enable: true
   retr_k: 4096
   retr_sample_per_img: 3000
-  retr_topk: 32                 # höher, um weite Loops zu erwischen
+  retr_topk: 32
   retr_min_sim: 0.07
   neighbor_span: 6
 
@@ -65,7 +66,7 @@ masking:
   method: rembg
   overwrite_images: false
   params:
-    alpha_thr: 0.18              # etwas toleranter
+    alpha_thr: 0.18
     save_debug: true
 
 sfm:
@@ -88,7 +89,7 @@ mvs:
     ref_strategy: "step"
     ref_topk: 60
     ref_min_gap: 3
-    ref_step: 2                   # dichter als vorher
+    ref_step: 2
 
     # Seeds & Fill
     seed_radius: 2
@@ -98,34 +99,51 @@ mvs:
     fill_iters: 150
     mask_pad: 6
 
-    # Gap-Fill (deutlich dichter)
+    # Gap-Fill
     gap_fill_enable: true
     fill_max_gap: 4
     fill_depth_std: 0.03
     fill_depth_rel: 0.06
     fill_stride: 1
 
+    # (optional) nach dem Füllen nicht zu stark ausdünnen
+    fill_max_points: 3000000
+    voxel_after_fill: 0.0015
+
 carve:
   enable: true
   use_all_masks: false
   views: 24
-  tau: 0.50                 # toleranter, schont Rand/Füllpunkte
-  mask_dilate: 2            # kleine Pufferzone um Masken
+  tau: 0.50
+  mask_dilate: 2
 
 texturing:
   enable: true
-  mode: "auto"              # GUI setzt bei Bedarf "manual"
-  divisor: 12               # mehr Views -> dichtere Farbabdeckung
-  weight_power: 2.0         # weicherer 1/z-Falloff
+  mode: "auto"
+  divisor: 12
+  weight_power: 2.0
   use_masks: true
   mask_dilate: 2
-  backfill: "nearest"       # füllt graue Löcher aus
-  in_ply: fused_points.ply  # wird im Runner vor Schritt 10 auf "last_ply" gesetzt
+  backfill: "nearest"
+  in_ply: fused_points.ply
   out_ply: fused_textured_points.ply
 
-# Feineres Speichern / keine „groben Voxel“
 mesh:
-  downsample: 1             # 0 = aus
-  voxel_size: 0.0           # leer/0.0 = auto (fein). Beispiel fix: 0.001
+  downsample: 1
+  voxel_size: 0.0
   outlier_nb: 20
   outlier_std: 1.6
+
+surface_close:
+  enable: true
+  poisson_depth: -1
+  poisson_scale: 1.1
+  target_points: 800000
+
+
+# Neu: optionale Schalter für Pre-Carve & Sparse-Behalten
+carve_pre_sparse: true       # wenn du Pre-Carve in meshing.py einbaust
+carve_pre_views: 32
+carve_pre_tau: 0.70
+carve_pre_dilate: 2
+mvs_keep_all_sparse: true    # alle Sparse-Punkte behalten, Fill nur addieren
