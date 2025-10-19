@@ -55,11 +55,11 @@ matching:
   width_confidence: -1
   filter_threshold: 0.07
   retr_enable: true
-  retr_k: 4096
-  retr_sample_per_img: 3000
-  retr_topk: 32
-  retr_min_sim: 0.07
-  neighbor_span: 6
+  retr_k: 8192
+  retr_sample_per_img: 6000
+  retr_topk: 48
+  retr_min_sim: 0.05
+  neighbor_span: 10
 
 masking:
   enable: true
@@ -86,7 +86,7 @@ mvs:
     scale: 1.0
 
     # Referenz-Auswahl
-    ref_strategy: "step"
+    ref_strategy: "bestk"
     ref_topk: 60
     ref_min_gap: 3
     ref_step: 2
@@ -107,7 +107,7 @@ mvs:
     fill_stride: 1
 
     # (optional) nach dem Füllen nicht zu stark ausdünnen
-    fill_max_points: 3000000
+    fill_max_points: 4000000
     voxel_after_fill: 0.0015
 
 carve:
@@ -135,15 +135,14 @@ mesh:
   outlier_std: 1.6
 
 surface_close:
-  enable: true
+  enable: false
   poisson_depth: -1
   poisson_scale: 1.1
   target_points: 800000
 
 
-# Neu: optionale Schalter für Pre-Carve & Sparse-Behalten
-carve_pre_sparse: true       # wenn du Pre-Carve in meshing.py einbaust
+carve_pre_sparse: true
 carve_pre_views: 32
 carve_pre_tau: 0.70
 carve_pre_dilate: 2
-mvs_keep_all_sparse: true    # alle Sparse-Punkte behalten, Fill nur addieren
+mvs_keep_all_sparse: true

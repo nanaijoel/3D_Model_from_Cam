@@ -135,12 +135,12 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("MATCH_FILTER", ma.get("filter_threshold", 0.07))
     if "features" in ma:
         setenv("MATCH_FEATURES", str(ma["features"]).lower())
-    setenv("MATCH_RETR_ENABLE", pick_bool(ma.get("retr_enable", True)))
-    setenv("MATCH_RETR_K", pick_num(ma.get("retr_k", 4096)))
-    setenv("MATCH_RETR_SAMPLE_PER_IMG", pick_num(ma.get("retr_sample_per_img", 3000)))
-    setenv("MATCH_RETR_TOPK", pick_num(ma.get("retr_topk", 32)))
-    setenv("MATCH_RETR_MIN_SIM", pick_num(ma.get("retr_min_sim", 0.07)))
-    setenv("MATCH_NEIGHBOR_SPAN", pick_num(ma.get("neighbor_span", 6)))
+    setenv("RETR_ENABLE", pick_bool(ma.get("retr_enable", True)))
+    setenv("RETR_K", pick_num(ma.get("retr_k", 4096)))
+    setenv("RETR_SAMPLE_PER_IMG", pick_num(ma.get("retr_sample_per_img", 3000)))
+    setenv("RETR_TOPK", pick_num(ma.get("retr_topk", 32)))
+    setenv("RETR_MIN_SIM", pick_num(ma.get("retr_min_sim", 0.07)))
+    setenv("MATCH_NEIGHBOR_SPAN", pick_num(ma.get("neighbor_span", 10)))
 
     sfm = cfg.get("sfm", {}) or {}
     setenv("SFM_INIT_RATIO", pick_num(sfm.get("init_ratio", 0.5)))

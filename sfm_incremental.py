@@ -22,29 +22,29 @@ class SfMConfig:
     # PnP
     MIN_INLIERS_PNP: int = 120         # hard acceptance
     MIN_TRY_PNP: int = 60              # soft gate: try PnP from this many 2D-3D
-    PNP_ITERS: int = 12000
+    PNP_ITERS: int = 10000
     PNP_ERR_PX: float = 3.0
-    PNP_REPROJ_ACCEPT: float = 2.1
+    PNP_REPROJ_ACCEPT: float = 2.5
 
     # Triangulation (pairwise during expansion)
     TRI_MIN_CORR: int = 8
     TRI_REPROJ_MAX: float = 2.1
-    TRI_MIN_PARALLAX_DEG: float = 3.0
+    TRI_MIN_PARALLAX_DEG: float = 2.5
 
     # Local stereo seeding
-    SEED_SPAN: int = 3
-    SEED_MIN_INL: int = 40
+    SEED_SPAN: int = 4
+    SEED_MIN_INL: int = 32
     SEED_REPROJ: float = 2.0
 
     # Multiview point validation (promotion)
     POINT_PROMOTION_MIN_OBS: int = 3
-    POINT_MAX_MULTIVIEW_REPROJ: float = 2.0
-    POINT_MIN_MULTIVIEW_PARALLAX_DEG: float = 3.0
+    POINT_MAX_MULTIVIEW_REPROJ: float = 2.2
+    POINT_MIN_MULTIVIEW_PARALLAX_DEG: float = 2.5
     POINT_REQUIRE_POSITIVE_DEPTH_RATIO: float = 0.6
 
     # Low-parallax fallback
-    LOWPAR_FALLBACK_MIN_OBS: int = 6
-    LOWPAR_FALLBACK_MAX_MEDIAN_REPROJ: float = 1.6
+    LOWPAR_FALLBACK_MIN_OBS: int = 4
+    LOWPAR_FALLBACK_MAX_MEDIAN_REPROJ: float = 1.8
     LOWPAR_FALLBACK_MIN_POSDEPTH_RATIO: float = 0.6
 
     # Frame gating for creating new points
@@ -52,8 +52,8 @@ class SfMConfig:
 
     # Optional densify pass
     DENSIFY_ENABLE: bool = True
-    DENSIFY_MAX_SPAN: int = 20
-    DENSIFY_MIN_MATCHES: int = 50
+    DENSIFY_MAX_SPAN: int = 26
+    DENSIFY_MIN_MATCHES: int = 40
     DENSIFY_MIN_PARALLAX_DEG: float = 3.0
     DENSIFY_MAX_REPROJ: float = 2.0
 

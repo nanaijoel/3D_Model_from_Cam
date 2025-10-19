@@ -1,10 +1,11 @@
 import os
+import time
 from typing import List, Tuple, Optional, Dict
 
 import numpy as np
 import cv2 as cv
 import torch
-from sklearn.cluster import MiniBatchKMeans  # neu: BoW-Retrieval
+from sklearn.cluster import MiniBatchKMeans  # BoW-Retrieval
 
 PAIR = Tuple[int, int]
 
@@ -21,7 +22,6 @@ def _safe_load_npz(path: str) -> Dict[str, np.ndarray]:
         "des": d["des"].astype(np.float32),         # (N,D) oder (0,D)
         "shape": tuple(d["shape"].tolist())         # (H,W)
     }
-
     if "scores" in d.files:
         out["scores"] = d["scores"].astype(np.float32)
     return out
@@ -41,6 +41,8 @@ def _infer_features_name_from_dim(dim: int) -> Optional[str]:
 
 
 def _expected_dim_from_name(name: str) -> int:
+    # Hinweis: Für ALIKED gibt es 64-D und 128-D Varianten. Hier 128 beibehalten,
+    # weil _infer_features_name_from_dim(64) "aliked" liefert und wir das unten prüfen.
     return {"superpoint": 256, "disk": 128, "aliked": 128}[name]
 
 
@@ -177,15 +179,32 @@ def build_pairs(
     elif lg is None:
         raise RuntimeError("LightGlue not available and descriptors are not 128-D; cannot match.")
 
+    # ---------------- ENV helper + reproducibility ----------------
+    def _getenv(keys, default):
+        for k in keys:
+            v = os.getenv(k)
+            if v is not None:
+                return v
+        return str(default)
+
+    seed = int(float(_getenv(["MATCH_SEED"], -1)))
+    if seed >= 0:
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+
     # ---------------- Retrieval-Graph (BoW + Cosine) ----------------
-    retr_enable   = (os.getenv("RETR_ENABLE", "true").strip().lower() in ("1", "true", "yes", "on"))
-    retr_K        = int(float(os.getenv("RETR_K", "4096")))
-    retr_sample   = int(float(os.getenv("RETR_SAMPLE_PER_IMG", "3000")))
-    retr_topk     = int(float(os.getenv("RETR_TOPK", "12")))
-    retr_min_sim  = float(os.getenv("RETR_MIN_SIM", "0.0"))
+    retr_enable   = (_getenv(["MATCH_RETR_ENABLE","RETR_ENABLE"], "true").strip().lower() in ("1", "true", "yes", "on"))
+    retr_K        = int(float(_getenv(["MATCH_RETR_K","RETR_K"], 4096)))
+    retr_sample   = int(float(_getenv(["MATCH_RETR_SAMPLE_PER_IMG","RETR_SAMPLE_PER_IMG"], 3000)))
+    retr_topk     = int(float(_getenv(["MATCH_RETR_TOPK","RETR_TOPK"], 12)))
+    retr_min_sim  = float(_getenv(["MATCH_RETR_MIN_SIM","RETR_MIN_SIM"], 0.0))
+    retr_cache    = (_getenv(["MATCH_RETR_CACHE"], "1").strip().lower() in ("1","true","yes","on"))
 
     pair_list_retr: List[PAIR] = []
+    S = None  # Similarity-Matrix für spätere Sortierung / Mutual-Topk
+
     if retr_enable:
+        t_bow = time.time()
         _log(f"[match][retr] build BoW (K={retr_K}, sample/img={retr_sample})", on_log)
 
         # 1) subsample of descriptors across images
@@ -203,9 +222,44 @@ def build_pairs(
         if len(desc_sub) >= 1:
             X = np.vstack(desc_sub).astype(np.float32)
 
-            # 2) vocabulary
-            kmeans = MiniBatchKMeans(n_clusters=retr_K, batch_size=10000, n_init=1, verbose=False)
-            kmeans.fit(X)
+            # 2) vocabulary (mit Cache)
+            cache_dir = os.path.join(features_dir, "bow_cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            vfile = os.path.join(cache_dir, f"vocab_K{retr_K}_s{retr_sample}.npz")
+            centers = None
+            if retr_cache and os.path.isfile(vfile):
+                try:
+                    centers = np.load(vfile)["centers"].astype(np.float32)
+                    _log(f"[match][retr] load cached vocab -> {vfile}", on_log)
+                except Exception:
+                    centers = None
+
+            if centers is None:
+                kmeans = MiniBatchKMeans(
+                    n_clusters=retr_K,
+                    batch_size=20000,
+                    n_init=1,
+                    max_iter=60,
+                    random_state=(seed if seed >= 0 else None),
+                    verbose=False
+                )
+                kmeans.fit(X)
+                centers = kmeans.cluster_centers_.astype(np.float32)
+                if retr_cache:
+                    try:
+                        np.savez_compressed(vfile, centers=centers)
+                        _log(f"[match][retr] saved vocab cache -> {vfile}", on_log)
+                    except Exception:
+                        pass
+
+            # schnelles predict via argmin(||x-c||^2)
+            def _predict_centers(D: np.ndarray, C: np.ndarray) -> np.ndarray:
+                # ||x-c||^2 = ||x||^2 + ||c||^2 - 2 x·c
+                x2 = (D * D).sum(axis=1, keepdims=True)      # [n,1]
+                c2 = (C * C).sum(axis=1, keepdims=True).T    # [1,K]
+                sim = D @ C.T                                # [n,K]
+                dist2 = x2 + c2 - 2.0 * sim
+                return np.argmin(dist2, axis=1)
 
             # 3) BoW per image (TF-IDF + L2)
             B = []
@@ -215,7 +269,7 @@ def build_pairs(
                 if D.ndim != 2 or len(D) == 0:
                     B.append(np.zeros((retr_K,), np.float32))
                     continue
-                c = kmeans.predict(D.astype(np.float32))
+                c = _predict_centers(D.astype(np.float32), centers)
                 h, _ = np.histogram(c, bins=np.arange(retr_K + 1))
                 B.append(h.astype(np.float32))
             B = np.stack(B, axis=0)  # [N,K]
@@ -225,7 +279,7 @@ def build_pairs(
             B *= idf
             B /= (np.linalg.norm(B, axis=1, keepdims=True) + 1e-9)
 
-            # 4) cosine similarity → Top-K similar per image
+            # 4) cosine similarity - Top-K similar per image
             S = B @ B.T
             np.fill_diagonal(S, -1.0)
 
@@ -236,17 +290,39 @@ def build_pairs(
                         a, b = (i, j) if i < j else (j, i)
                         pair_list_retr.append((a, b))
 
+            # Mutual-Topk verstärken
+            mutual = []
+            if retr_topk >= 1:
+                for (a, b) in pair_list_retr:
+                    js_b = np.argsort(-S[b])[:retr_topk]
+                    if a in js_b:
+                        mutual.append((a, b))
+                pair_list_retr = list(set(pair_list_retr).union(mutual))
+
             pair_list_retr = sorted(list(set(pair_list_retr)))
             _log(f"[match][retr] candidate pairs: {len(pair_list_retr)}", on_log)
+            _log(f"[match][retr] BoW total {time.time() - t_bow:.2f}s", on_log)
         else:
             _log("[match][retr] skipped (no descriptors)", on_log)
 
     # --------------- Neighbor pairs (konfigurierbar) ---------------
-    span = int(float(os.getenv("MATCH_NEIGHBOR_SPAN", "5")))
+    span = int(float(_getenv(["MATCH_NEIGHBOR_SPAN"], 5)))
+    span_loop = int(float(_getenv(["MATCH_NEIGHBOR_SPAN_LOOP"], 8)))
     pair_list_ngb: List[PAIR] = []
     for i in range(N):
         for j in range(i + 1, min(N, i + 1 + span)):
             pair_list_ngb.append((i, j))
+
+    # Ring-Nachbarn (zyklisch) – garantiert Loop-Closure (0 <-> N-1)
+    if span_loop > 0:
+        ring = []
+        for i in range(N):
+            for d in range(1, span_loop + 1):
+                j = (i + d) % N
+                a, b = (i, j) if i < j else (j, i)
+                if a != b:
+                    ring.append((a, b))
+        pair_list_ngb = sorted(list(set(pair_list_ngb).union(ring)))
 
     # --------------- Union aus Retrieval ∪ Nachbarn ----------------
     if retr_enable and pair_list_retr:
@@ -256,10 +332,24 @@ def build_pairs(
         pair_list = pair_list_ngb
         _log(f"[match] using {len(pair_list)} neighbor pairs (span={span})", on_log)
 
+    # Nach Ähnlichkeit sortieren (falls S vorhanden)
+    if S is not None and len(pair_list) > 0:
+        pair_list.sort(key=lambda ab: -float(S[ab[0], ab[1]]))
+
+    # Globales Limit für Paare
+    max_pairs = int(float(_getenv(["MATCH_MAX_PAIRS"], 2400)))
+    if max_pairs > 0 and len(pair_list) > max_pairs:
+        _log(f"[match] cap pairs from {len(pair_list)} -> {max_pairs}", on_log)
+        pair_list = pair_list[:max_pairs]
+
     # ------------------------- Matching ----------------------------
     pairs_out: List[List[int]] = []
     matches_out: List[np.ndarray] = []
 
+    # Deckelung der KPs pro Bild für LightGlue
+    topk_kp = int(float(_getenv(["MATCH_TOPK_KP"], 12000)))
+
+    t_match = time.time()
     for (i, j) in pair_list:
         Fi = _safe_load_npz(paths[i])
         Fj = _safe_load_npz(paths[j])
@@ -275,17 +365,30 @@ def build_pairs(
             matches_out.append(np.empty((0, 2), np.int32))
             continue
         if d0.shape[1] != exp_dim or d1.shape[1] != exp_dim:
-            _log(f"[match] skip pair ({i},{j}): descriptor dim mismatch "
-                 f"({d0.shape[1]} vs {d1.shape[1]}, expected {exp_dim})", on_log)
-            pairs_out.append([i, j])
-            matches_out.append(np.empty((0, 2), np.int32))
-            continue
+            # toleranter ALIKED-Fall: falls 64-D, aber erwartet 128 (je nach Build)
+            if features_name == "aliked" and (d0.shape[1] == 64 and d1.shape[1] == 64):
+                pass
+            else:
+                _log(f"[match] skip pair ({i},{j}): descriptor dim mismatch "
+                     f"({d0.shape[1]} vs {d1.shape[1]}, expected {exp_dim})", on_log)
+                pairs_out.append([i, j])
+                matches_out.append(np.empty((0, 2), np.int32))
+                continue
 
-        # Scores
+        # Scores (für evtl. TopK-KP)
         s0 = Fi.get("scores", np.ones((len(k0),), np.float32))
         s1 = Fj.get("scores", np.ones((len(k1),), np.float32))
         H0, W0 = Fi["shape"]
         H1, W1 = Fj["shape"]
+
+        # Optional: pro Bild KPs/Descs auf TopK nach Score begrenzen (entlastet LG)
+        if topk_kp > 0:
+            if len(s0) > topk_kp:
+                idx0 = np.argpartition(-s0, topk_kp)[:topk_kp]
+                k0, d0, s0 = k0[idx0], d0[idx0], s0[idx0]
+            if len(s1) > topk_kp:
+                idx1 = np.argpartition(-s1, topk_kp)[:topk_kp]
+                k1, d1, s1 = k1[idx1], d1[idx1], s1[idx1]
 
         # If lightglue, use corresponding variables, else classic BF
         if lg is not None:
@@ -304,6 +407,8 @@ def build_pairs(
 
         pairs_out.append([i, j])
         matches_out.append(m)
+
+    _log(f"[match] LG total {time.time() - t_match:.2f}s", on_log)
 
     pairs_arr = np.array(pairs_out, dtype=np.int32)
 
