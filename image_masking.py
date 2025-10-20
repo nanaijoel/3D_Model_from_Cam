@@ -1,4 +1,4 @@
-# image_masking.py (generisch, ohne projektspezifische Heuristiken)
+
 import os
 from typing import List, Tuple, Optional, Dict
 import cv2 as cv
@@ -6,7 +6,6 @@ import numpy as np
 
 Mask = np.ndarray  # uint8, 0/255
 
-# ----------------- Helpers -----------------
 
 def _ensure_dir(d: str):
     os.makedirs(d, exist_ok=True)
@@ -45,12 +44,12 @@ def _postprocess_mask(m: Mask, open_k: int = 3, close_k: int = 5,
         m = _largest_cc(m)
     return m
 
-# ----------------- rembg backend -----------------
+# rembg backend
 
 _REMBG_SESS = None
 
 def _get_rembg_session(model_name: str = "isnet-general"):
-    """Lädt/mergt eine rembg-Session. Fallback auf 'u2net'."""
+    """Load rembg session. Fallback to 'u2net'."""
     global _REMBG_SESS
     if _REMBG_SESS is not None:
         return _REMBG_SESS
@@ -71,14 +70,12 @@ def _rembg_mask(
     alpha_matting: bool = True,
     fg_thr: int = 210,              # 0..255
     bg_thr: int = 20,               # 0..255
-    erode: int = 8,                 # 0..∞ (px)
-    base_size: int = 1000,          # für alpha_matting
-    only_mask: bool = False,        # wenn True: rembg liefert direkt die Binärmaske
-    post_process_mask_flag: bool = False  # rembg-eigener Postprozess (abhängig von Version)
+    erode: int = 8,                 # 0..infinite
+    base_size: int = 1000,          # for alpha_matting
+    only_mask: bool = False,
+    post_process_mask_flag: bool = False
 ) -> Mask:
-    """
-    Verwendet rembg.remove mit erweiterten Parametern. Gibt Binärmaske (0/255) zurück.
-    """
+
     try:
         from rembg import remove
         from PIL import Image
@@ -105,7 +102,6 @@ def _rembg_mask(
     try:
         pil_out = remove(pil_in, **kwargs)
     except TypeError:
-        # ältere rembg-Versionen kennen evtl. nicht alle Keys → minimaler Fallback
         kwargs_fallback = dict(
             session=session,
             alpha_matting=bool(alpha_matting),
@@ -121,18 +117,16 @@ def _rembg_mask(
 
     out_np = np.array(pil_out)
 
-    # Fall A: only_mask=True → out_np ist bereits 1-Kanal-Maske (0/255 oder 0/1)
     if only_mask and out_np.ndim == 2:
         m = out_np
         if m.dtype != np.uint8:
             m = (m > 0).astype(np.uint8) * 255
         else:
-            # falls 0/1
+
             if m.max() <= 1:
                 m = (m > 0).astype(np.uint8) * 255
         return _postprocess_mask(m, open_k=3, close_k=5)
 
-    # Fall B: RGBA → Alpha in Binärmaske
     if out_np.ndim == 3 and out_np.shape[2] == 4:
         alpha = out_np[:, :, 3].astype(np.float32) / 255.0
     else:
@@ -141,7 +135,6 @@ def _rembg_mask(
     m = (alpha >= float(alpha_thr)).astype(np.uint8) * 255
     return _postprocess_mask(m, open_k=3, close_k=5)
 
-# ----------------- SAM 2 (optional) -----------------
 
 _SAM2_CACHE = {"predictor": None}
 
@@ -189,7 +182,6 @@ def _sam2_mask(img_bgr: np.ndarray, keep: str = "largest") -> Mask:
     m = (masks_np[idx] > 0).astype(np.uint8) * 255
     return _postprocess_mask(m, open_k=2, close_k=4)
 
-# ----------------- Public API -----------------
 
 def build_mask(
     img_bgr: np.ndarray,
@@ -213,7 +205,7 @@ def build_mask(
     params = params or {}
     if method == "sam2":
         return _sam2_mask(img_bgr, keep=str(params.get("keep", "largest")))
-    # default: rembg mit erweiterten Optionen
+    # default: rembg with hardcoded parameters
     return _rembg_mask(
         img_bgr,
         alpha_thr=float(params.get("alpha_thr", 0.5)),
@@ -235,9 +227,7 @@ def preprocess_images(
     params: Optional[Dict] = None,
     save_debug: bool = True
 ) -> Tuple[List[str], List[str]]:
-    """
-    schreibt <basename>_mask.png in out_mask_dir
-    """
+
     _ensure_dir(out_mask_dir)
     mask_paths: List[str] = []
 

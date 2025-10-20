@@ -11,7 +11,7 @@ features:
   lg:
     detection_threshold: 0.0001 # threshold for LightGlue detector (lower → more keypoints)
     nms: 2                      # non-maximum suppression radius (pixels)
-    resize: 1536                # image resize before keypoint detection
+    resize: 1024                # image resize before keypoint detection
     remove_borders: 2           # ignore border region (pixels)
     force_num: true             # force fixed number of keypoints per image
 
@@ -57,6 +57,8 @@ mvs:
   params:
     device: cuda                # device for depth estimation (cuda/cpu)
     scale: 1.0                  # input image scaling factor (1.0 = full res)
+    keep_all_sparse: false
+
 
     # Frame selection
     ref_strategy: "bucket"      # reference frame selection strategy: 'bucket', 'bestk', or 'step'

@@ -147,6 +147,7 @@ def _apply_env_from_config(cfg: Dict[str, Any]) -> None:
     setenv("MVS_MASK_PAD", mp.get("mask_pad"))
     setenv("MVS_EXPORT_MESH", mp.get("export_mesh"))
     setenv("MVS_POISSON_DEPTH", mp.get("poisson_depth"))
+    setenv("MVS_KEEP_ALL_SPARSE", mp.get("keep_all_sparse"))
 
     cv = cfg.get("carve", {}) or {}
     setenv("CARVE_ENABLE", cv.get("enable"))

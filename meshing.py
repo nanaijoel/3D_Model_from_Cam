@@ -1,6 +1,7 @@
+# meshing.py
 from __future__ import annotations
 import os, glob
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import numpy as np
 import cv2 as cv
 
@@ -134,22 +135,14 @@ def _boundary_volume_fill_from_seeds(
     seed_mask:  np.ndarray,   # from _sparse_to_depth_seeds (if mask pixel = 1 --> Seed)
     sample_step_px: int = 3,  # "hole" pixel grid
     samples_per_pix: int = 8, # create points per "hole" pixel
-    px_sigma: float = 1.0,    # Bildraum-Jitter (Pixel) für (dx,dy)
-    z_sigma_rel: float = 0.01,# z-Jitter relative to z* (1% volume)
+    px_sigma: float = 1.0,    # (dx,dy) jitter in px
+    z_sigma_rel: float = 0.01,# z-jitter rel. to z*
     focus_bottom: bool = True,
-    focus_frac: float = 0.40, # focus on the lower part of the images
+    focus_frac: float = 0.40, # focus lower part
     z_bias_rel: float = 0.02,
     dy_bias_px: float = 0.8
 ):
-    """
-    Fills parts, where areas of the 2D masks aren't covered by the sparse.ply cloud
-    Reference to the nearest / closest point found to the "hole" pixel to estimate the depth.
-    Create a volumetric point cloud in this region.
 
-    Return:
-      Xw_fill : (M,3) world points
-      pix_idx : (M,2) (y,x) the specific image pixel (color sampling)
-    """
     H, W = mask_ref.shape[:2]
     seed_valid = (seed_mask > 0)
     holes = (mask_ref > 0) & (~seed_valid)
@@ -168,7 +161,6 @@ def _boundary_volume_fill_from_seeds(
     if ys.size == 0:
         return None, None
 
-    # 1) z* per "hole" pixel: next seed in the 2D image
     try:
         from scipy import ndimage as ndi
         inv = ~seed_valid
@@ -187,7 +179,6 @@ def _boundary_volume_fill_from_seeds(
         z_med = float(np.median(dv)) if dv.size > 0 else 0.5
         z_near[bad] = z_med
 
-    # 2) where is a part in mask which isn't covered by sparse: create points in volume (x,y,z*)
     S = max(1, int(samples_per_pix))
     fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
     Ccam = (-R_ref.T @ t_ref).reshape(3)
@@ -202,7 +193,7 @@ def _boundary_volume_fill_from_seeds(
         if not np.isfinite(z0) or z0 <= 1e-6:
             continue
         dx = rng.normal(0.0, px_sigma, size=S).astype(np.float32)
-        dy = rng.normal(dy_bias_px, px_sigma, size=S).astype(np.float32)  # nach unten bias
+        dy = rng.normal(dy_bias_px, px_sigma, size=S).astype(np.float32)  # bias nach unten
         dz = rng.normal(z_bias_rel * max(z0, 1e-3), z_sigma_rel * max(z0, 1e-3), size=S).astype(np.float32)
 
         z = np.maximum(z0 + dz, 1e-6)
@@ -247,6 +238,7 @@ def _sparse_to_depth_seeds(K, R_ref, t_ref, sparse_pts, mask_ref, seed_radius=2,
     X_cam = (R_ref @ (pts.T - C.reshape(3,1))).T  # Nx3
     Z = X_cam[:,2]
     u, v = _project(K, X_cam)
+    H, W = mask_ref.shape[:2]
     in_img = (u>=0)&(u<W)&(v>=0)&(v<H)&(Z>1e-6)
     if not np.any(in_img): return seed_depth, seed_mask
 
@@ -384,6 +376,184 @@ def _choose_ref_indices(N, scores, strategy: str, step: int, topk: int, min_gap:
     return chosen
 
 
+def _save_colored_ply_any(P, C, out_path):
+    _mkdir(os.path.dirname(out_path) or ".")
+    try:
+        import open3d as o3d
+        pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P.astype(np.float64)))
+        if C is not None and C.shape[0] == P.shape[0]:
+            pc.colors = o3d.utility.Vector3dVector((C[:, ::-1] / 255.0).astype(np.float64))  # BGR->RGB
+        o3d.io.write_point_cloud(out_path, pc)
+        return out_path
+    except Exception:
+        with open(out_path,"w") as f:
+            f.write("ply\nformat ascii 1.0\n")
+            f.write(f"element vertex {P.shape[0]}\n")
+            f.write("property float x\nproperty float y\nproperty float z\n")
+            if C is not None:
+                f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+            f.write("end_header\n")
+            if C is None:
+                for p in P: f.write(f"{p[0]} {p[1]} {p[2]}\n")
+            else:
+                for p,c in zip(P, C.astype(np.uint8)):
+                    f.write(f"{p[0]} {p[1]} {p[2]} {int(c[2])} {int(c[1])} {int(c[0])}\n")
+        return out_path
+
+def _max_consecutive_true_per_row(B: np.ndarray) -> np.ndarray:
+    if B.size == 0:
+        return np.zeros((B.shape[0],), dtype=np.int32)
+    N, V = B.shape
+    run = np.zeros((N, V), dtype=np.int32)
+    run[:, 0] = B[:, 0].astype(np.int32)
+    for j in range(1, V):
+        run[:, j] = (run[:, j-1] + 1) * B[:, j].astype(np.int32)
+    return run.max(axis=1)
+
+def _carve_points_with_masks(P, K, R_all, t_all, masks, depth_dir=None,
+                             mode="all", use_depth=False, depth_tol=0.03, chunk=400000, on_log=None):
+    V = len(masks); N = P.shape[0]
+    if V == 0 or N == 0:
+        return np.ones(N, np.bool_)
+
+    consec_N = int(float(os.getenv("CARVE_CONSEC_N", "3")))
+    min_views_keep = int(float(os.getenv("CARVE_MIN_VIEWS", "0")))  # 0 = aus
+
+    remove_mat = np.zeros((N, V), dtype=bool)
+    keep_mat   = np.zeros((N, V), dtype=bool)  # Sight inside mask
+
+    for vi in range(V):
+        m = masks[vi]
+        if m is None:
+            continue
+        H,W = m.shape[:2]
+        R = R_all[vi]; t = t_all[vi]
+        D = None
+        if use_depth and depth_dir:
+            p = os.path.join(depth_dir, f"depth_{vi:04d}.npy")
+            if os.path.isfile(p):
+                try: D = np.load(p)
+                except: D = None
+
+        Cc = (-R.T @ t).reshape(3)
+        for s in range(0, N, chunk):
+            e = min(N, s+chunk)
+            Q = P[s:e]
+            Xc = (R @ (Q.T - Cc.reshape(3,1))).T
+            z  = Xc[:,2]
+            u  = K[0,0]*Xc[:,0]/np.maximum(z,1e-9) + K[0,2]
+            v  = K[1,1]*Xc[:,1]/np.maximum(z,1e-9) + K[1,2]
+            ui = np.floor(u).astype(np.int32)
+            vi2= np.floor(v).astype(np.int32)
+            inside = (z>1e-6)&(ui>=0)&(ui<W)&(vi2>=0)&(vi2<H)
+
+            rem = ~inside
+            if np.any(inside):
+                ui = np.clip(ui,0,W-1); vi2 = np.clip(vi2,0,H-1)
+                m_inside = (m[vi2, ui] > 0)
+                if D is not None:
+                    d = D[vi2, ui]
+                    m_inside &= (z <= (d + depth_tol*(1.0 + d)))
+                rem_inside = ~m_inside
+
+                tmp = remove_mat[s:e, vi]
+                tmp2= keep_mat[s:e, vi]
+                tmp |= rem_inside
+                tmp2 |= m_inside
+                remove_mat[s:e, vi] = tmp
+                keep_mat[s:e, vi]   = tmp2
+            else:
+                remove_mat[s:e, vi] |= True
+
+    if mode == "consecutive":
+        max_run = _max_consecutive_true_per_row(remove_mat)
+        keep = (max_run < max(1, consec_N))
+        if min_views_keep > 0:
+            keep &= (keep_mat.sum(axis=1) >= min_views_keep)
+        return keep
+
+    counts = keep_mat.sum(axis=1).astype(np.int32)
+    if mode == "all":
+        return counts == V
+    if mode == "majority":
+        return counts >= int(np.ceil(V/2.0))
+    if mode == "any":
+        return counts >= 1
+    return counts >= int(np.ceil(V/2.0))
+
+def _carve_and_save_from_arrays(mesh_dir, frames_dir, poses_npz, masks_dir,
+                                P_list, C_list, on_log=None):
+
+    _log("[carve] in-memory carve start", on_log)
+    K = globals().get("GLOBAL_INTRINSICS_K", None)
+    if K is None:
+        raise RuntimeError("GLOBAL_INTRINSICS_K ist nicht gesetzt.")
+
+    P = np.concatenate(P_list, axis=0) if len(P_list) else np.zeros((0,3), np.float64)
+    C = (np.concatenate(C_list, axis=0) if (len(C_list) and all(c is not None for c in C_list))
+         else None)
+
+    _log(f"[carve] stacked (in-memory): {P.shape[0]} pts", on_log)
+
+    # optional: save raw (pre-carve) merged for debug
+    if os.getenv("MVS_SAVE_RAW_BEFORE_CARVE", "false").lower() in ("1","true","yes","on"):
+        raw_path = os.path.join(mesh_dir, "fused_points_raw.ply")
+        _save_colored_ply_any(P, C, raw_path)
+        _log(f"[carve] wrote pre-carve raw -> {raw_path}", on_log)
+
+    # Load poses & masks
+    R_all, t_all, _ = _load_poses_npz(poses_npz)
+    frame_files = _sorted_frames(frames_dir)
+    masks_all   = [_mask_for_frame(masks_dir, f) for f in frame_files]
+
+    use_all   = os.getenv("CARVE_USE_ALL_MASKS", "true").lower() in ("1","true","yes","on")
+    mode      = (os.getenv("CARVE_MODE", "consecutive") or "consecutive").strip().lower()
+    use_depth = os.getenv("CARVE_USE_DEPTH", "false").lower() in ("1","true","yes","on")
+    depth_tol = float(os.getenv("CARVE_DEPTH_TOL", "0.03"))
+    chunk     = int(float(os.getenv("CARVE_CHUNK", "400000")))
+    # defaults for „consecutive“
+    os.environ.setdefault("CARVE_CONSEC_N",   os.getenv("CARVE_CONSEC_N", "10"))
+    os.environ.setdefault("CARVE_MIN_VIEWS",  os.getenv("CARVE_MIN_VIEWS", "0"))
+
+    if use_all:
+        view_ids = list(range(min(len(frame_files), len(R_all))))
+    else:
+        view_ids = list(range(min(len(frame_files), len(R_all))))
+
+    masks = [masks_all[i] if 0 <= i < len(masks_all) else None for i in view_ids]
+    R_sel = np.array([R_all[i] for i in view_ids])
+    t_sel = np.array([t_all[i] for i in view_ids])
+    depth_dir = os.path.join(mesh_dir, "depth")
+
+    keep = _carve_points_with_masks(
+        P, K, R_sel, t_sel, masks,
+        depth_dir=depth_dir, mode=mode,
+        use_depth=use_depth, depth_tol=depth_tol,
+        chunk=chunk, on_log=on_log
+    )
+
+    Pk = P[keep]
+    Ck = (C[keep] if C is not None else None)
+    _log(f"[carve] after carving: {Pk.shape[0]} pts", on_log)
+
+    # optional downsample & save fused
+    out_path = os.path.join(mesh_dir, "fused_points.ply")
+    try:
+        if HAS_O3D:
+            pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(Pk))
+            if Ck is not None:
+                pcd.colors = o3d.utility.Vector3dVector((Ck[:, ::-1] / 255.0))
+            if Pk.shape[0] > 8000:
+                vox = max(1e-4, 0.6 * _median_nn_distance(Pk))
+                pcd = pcd.voxel_down_sample(voxel_size=float(vox))
+            o3d.io.write_point_cloud(out_path, pcd)
+        else:
+            _save_colored_ply_any(Pk, Ck, out_path)
+    finally:
+        _log(f"[carve] saved -> {out_path}", on_log)
+
+    return out_path
+
 
 def run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_dir,
                          on_log=None, on_progress=None):
@@ -408,6 +578,7 @@ def run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_di
     FILL_ITERS = int(float(os.getenv("MVS_FILL_ITERS", "150")))
     SAMPLE_MAX = int(float(os.getenv("MVS_SEED_SAMPLE", "200000")))
     EXPORT_MESH= os.getenv("MVS_EXPORT_MESH", "true").lower() == "true"
+    DEBUG_SAVE_PER_REF = os.getenv("MVS_DEBUG_SAVE_PER_REF", "false").lower() in ("1","true","yes","on")
 
     R_all, t_all, frame_idx = _load_poses_npz(poses_npz)
     frame_files = _sorted_frames(frames_dir)
@@ -479,14 +650,14 @@ def run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_di
         cv.imwrite(os.path.join(depth_dir, f"depth_{ridx:04d}.png"), vis)
         np.save(os.path.join(depth_dir, f"depth_{ridx:04d}.npy"), depth_full)
 
-        # Boundary volume fill
-        BV_ENABLE = str(os.getenv("MVS_BOUNDARY_FILL_ENABLE", "true")).lower() in ("1","true","yes","on")
+        # Boundary-volume fill
+        BV_ENABLE = os.getenv("MVS_BOUNDARY_FILL_ENABLE", "true").lower() in ("1","true","yes","on")
         if BV_ENABLE:
-            bv_step   = int(float(os.getenv("MVS_BVF_STEP_PX", "3")))   # Raster
-            bv_spp    = int(float(os.getenv("MVS_BVF_SAMPLES", "10")))  # Samples per pixel (stronger)
-            bv_px_sig = float(os.getenv("MVS_BVF_PX_SIGMA", "1.2"))     # (dx,dy) in pixel
-            bv_z_rel  = float(os.getenv("MVS_BVF_Z_SIGMA_REL", "0.015"))# dz relative to z*
-            bv_focus  = str(os.getenv("MVS_BVF_FOCUS_BOTTOM", "true")).lower() in ("1","true","yes","on")
+            bv_step   = int(float(os.getenv("MVS_BVF_STEP_PX", "3")))
+            bv_spp    = int(float(os.getenv("MVS_BVF_SAMPLES", "10")))
+            bv_px_sig = float(os.getenv("MVS_BVF_PX_SIGMA", "1.2"))
+            bv_z_rel  = float(os.getenv("MVS_BVF_Z_SIGMA_REL", "0.015"))
+            bv_focus  = os.getenv("MVS_BVF_FOCUS_BOTTOM", "true").lower() in ("1","true","yes","on")
             bv_frac   = float(os.getenv("MVS_BVF_FOCUS_FRAC", "0.40"))
             bv_zbias  = float(os.getenv("MVS_BVF_Z_BIAS_REL", "0.02"))
             bv_dybias = float(os.getenv("MVS_BVF_DY_BIAS_PX", "0.8"))
@@ -501,18 +672,13 @@ def run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_di
             )
             if Xw_fill is not None and Xw_fill.size > 0:
                 cols_fill = ref_img[pix_idx[:, 0], pix_idx[:, 1]]
-                if HAS_O3D:
-                    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(Xw_fill))
-                    pcd.colors = o3d.utility.Vector3dVector(cols_fill[:, ::-1] / 255.0)
-                    o3d.io.write_point_cloud(os.path.join(mesh_dir, f"points_ref_{ridx:04d}_fill.ply"), pcd)
-
                 all_pts.append(Xw_fill.astype(np.float32))
                 all_cols.append(cols_fill.astype(np.uint8))
                 _log(f"[bvf] ref={ridx} fill_points={Xw_fill.shape[0]} step={bv_step} spp={bv_spp} "
                      f"px_sigma={bv_px_sig} z_rel={bv_z_rel} z_bias={bv_zbias} dy_bias={bv_dybias} "
                      f"focus_bottom={bv_focus} frac={bv_frac}", on_log)
 
-        # Back-Projection (just masked part if masking true)
+        # Back-Projection
         ys, xs = np.where(ref_msk>0)
         if ys.size == 0: continue
         z = depth_full[ys, xs].astype(np.float32)
@@ -526,8 +692,7 @@ def run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_di
         Xw = (R_all[ridx].T @ x_cam.T + (-R_all[ridx].T @ t_all[ridx]).reshape(3,1)).T
         cols = ref_img[ys, xs]
 
-        # ref_points.ply for every pose choosen (optional)
-        if HAS_O3D:
+        if DEBUG_SAVE_PER_REF and HAS_O3D:
             pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(Xw))
             pcd.colors = o3d.utility.Vector3dVector(cols[:, ::-1] / 255.0)  # BGR->RGB
             o3d.io.write_point_cloud(os.path.join(mesh_dir, f"points_ref_{ridx:04d}.ply"), pcd)
@@ -536,13 +701,10 @@ def run_sparse_paint_gpu(mesh_dir, frames_dir, features_dir, poses_npz, masks_di
 
     _log("[ui] Done Sparse-Paint.", on_log)
 
-    # Carving with masks
-    if str(os.getenv("CARVE_ENABLE", "false")).lower() in ("1","true","yes","on"):
-        try:
-            out = merge_all_points_ref_and_carve(mesh_dir, frames_dir, masks_dir, poses_npz, on_log=on_log)
-            _log(f"[ui] Merge&Carve -> {out}", on_log)
-        except Exception as e:
-            _log(f"[carve] failed: {e}", on_log)
+    if os.getenv("CARVE_ENABLE", "false").lower() in ("1","true","yes","on"):
+        out = _carve_and_save_from_arrays(mesh_dir, frames_dir, poses_npz, masks_dir,
+                                          all_pts, all_cols, on_log=on_log)
+        _log(f"[ui] In-memory Merge&Carve -> {out}", on_log)
 
 
 # ENV wrapper
@@ -603,8 +765,6 @@ def reconstruct_mvs_depth_and_mesh_all(paths, K,
                          on_log=on_log, on_progress=on_progress)
 
 
-# Merge and carve
-
 def _read_points_ref_with_colors(ply_path):
     if not os.path.isfile(ply_path):
         return None, None
@@ -640,146 +800,20 @@ def _read_points_ref_with_colors(ply_path):
         C = np.asarray(cols, np.float64) if cols else None
         return P, C
 
-def _save_colored_ply_any(P, C, out_path):
-    _mkdir(os.path.dirname(out_path) or ".")
-    try:
-        import open3d as o3d
-        pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(P.astype(np.float64)))
-        if C is not None and C.shape[0] == P.shape[0]:
-            pc.colors = o3d.utility.Vector3dVector((C[:, ::-1] / 255.0).astype(np.float64))  # BGR->RGB
-        o3d.io.write_point_cloud(out_path, pc)
-        return out_path
-    except Exception:
-        with open(out_path,"w") as f:
-            f.write("ply\nformat ascii 1.0\n")
-            f.write(f"element vertex {P.shape[0]}\n")
-            f.write("property float x\nproperty float y\nproperty float z\n")
-            if C is not None:
-                f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
-            f.write("end_header\n")
-            if C is None:
-                for p in P: f.write(f"{p[0]} {p[1]} {p[2]}\n")
-            else:
-                for p,c in zip(P, C.astype(np.uint8)):
-                    f.write(f"{p[0]} {p[1]} {p[2]} {int(c[2])} {int(c[1])} {int(c[0])}\n")
-        return out_path
-
-def _max_consecutive_true_per_row(B: np.ndarray) -> np.ndarray:
-    """
-    B: bool array [N,V] (N points, V masks in chronological order).
-    Return: int array [N] = Length of longest True sequence per row.
-    """
-    if B.size == 0:
-        return np.zeros((B.shape[0],), dtype=np.int32)
-    N, V = B.shape
-    run = np.zeros((N, V), dtype=np.int32)
-    run[:, 0] = B[:, 0].astype(np.int32)
-    for j in range(1, V):
-        run[:, j] = (run[:, j-1] + 1) * B[:, j].astype(np.int32)
-    return run.max(axis=1)
-
-def _carve_points_with_masks(P, K, R_all, t_all, masks, depth_dir=None,
-                             mode="all", use_depth=False, depth_tol=0.03, chunk=400000, on_log=None):
-    """
-    P: Nx3 in world coordinates.
-    masks: List [len(views)] of 2D masks (or None).
-    mode: "all" (AND), "majority", "any", "consecutive"
-    use_depth: z <= depth(u,v) + tol*(1+depth)
-    """
-    V = len(masks); N = P.shape[0]
-    if V == 0 or N == 0:
-        return np.ones(N, np.bool_)
-
-    consec_N = int(float(os.getenv("CARVE_CONSEC_N", "3")))
-    min_views_keep = int(float(os.getenv("CARVE_MIN_VIEWS", "0")))  # 0 = aus
-
-    remove_mat = np.zeros((N, V), dtype=bool)
-    keep_mat   = np.zeros((N, V), dtype=bool)  # Sight inside mask
-
-    for vi in range(V):
-        m = masks[vi]
-        if m is None:
-            continue
-        H,W = m.shape[:2]
-        R = R_all[vi]; t = t_all[vi]
-        D = None
-        if use_depth and depth_dir:
-            p = os.path.join(depth_dir, f"depth_{vi:04d}.npy")
-            if os.path.isfile(p):
-                try: D = np.load(p)
-                except: D = None
-
-        Cc = (-R.T @ t).reshape(3)
-        for s in range(0, N, chunk):
-            e = min(N, s+chunk)
-            Q = P[s:e]
-            Xc = (R @ (Q.T - Cc.reshape(3,1))).T
-            z  = Xc[:,2]
-            u  = K[0,0]*Xc[:,0]/np.maximum(z,1e-9) + K[0,2]
-            v  = K[1,1]*Xc[:,1]/np.maximum(z,1e-9) + K[1,2]
-            ui = np.floor(u).astype(np.int32)
-            vi2= np.floor(v).astype(np.int32)
-            inside = (z>1e-6)&(ui>=0)&(ui<W)&(vi2>=0)&(vi2<H)
-
-            rem = ~inside
-            if np.any(inside):
-                ui = np.clip(ui,0,W-1); vi2 = np.clip(vi2,0,H-1)
-                m_inside = (m[vi2, ui] > 0)
-                if D is not None:
-                    d = D[vi2, ui]
-                    m_inside &= (z <= (d + depth_tol*(1.0 + d)))
-                rem_inside = ~m_inside
-
-                tmp = remove_mat[s:e, vi]
-                tmp2= keep_mat[s:e, vi]
-                tmp |= rem_inside
-                tmp2 |= m_inside
-                remove_mat[s:e, vi] = tmp
-                keep_mat[s:e, vi]   = tmp2
-            else:
-                remove_mat[s:e, vi] |= True
-
-    if mode == "consecutive":
-        # Only remove, if min. consec_N reached
-        max_run = _max_consecutive_true_per_row(remove_mat)
-        keep = (max_run < max(1, consec_N))
-        if min_views_keep > 0:
-            keep &= (keep_mat.sum(axis=1) >= min_views_keep)
-        return keep
-
-    # other tested modes - not used
-    counts = keep_mat.sum(axis=1).astype(np.int32)
-    if mode == "all":
-        return counts == V
-    if mode == "majority":
-        return counts >= int(np.ceil(V/2.0))
-    if mode == "any":
-        return counts >= 1
-    # fallback
-    return counts >= int(np.ceil(V/2.0))
-
 def merge_all_points_ref_and_carve(mesh_dir, frames_dir, masks_dir, poses_npz, on_log=None):
-    """
-    1) Load all points_ref_*.ply in mesh_dir and merge.
-    2) Carve fused point cloud with all / all selected masks, as configured with ENV
-       (CARVE_USE_ALL_MASKS, CARVE_MODE, CARVE_CONSEC_N, CARVE_MIN_VIEWS, CARVE_USE_DEPTH, CARVE_DEPTH_TOL).
-    3) Saves fused_points.ply
-    """
     _log("[carve] merge & carve start", on_log)
     K = globals().get("GLOBAL_INTRINSICS_K", None)
     if K is None:
         raise RuntimeError("GLOBAL_INTRINSICS_K ist nicht gesetzt.")
 
-    use_all   = str(os.getenv("CARVE_USE_ALL_MASKS", "true")).lower() in ("1", "true", "yes", "on")
+    use_all   = os.getenv("CARVE_USE_ALL_MASKS", "true").lower() in ("1", "true", "yes", "on")
     mode      = (os.getenv("CARVE_MODE", "consecutive") or "consecutive").strip().lower()
-    use_depth = str(os.getenv("CARVE_USE_DEPTH", "false")).lower() in ("1", "true", "yes", "on")
+    use_depth = os.getenv("CARVE_USE_DEPTH", "false").lower() in ("1", "true", "yes", "on")
     depth_tol = float(os.getenv("CARVE_DEPTH_TOL", "0.03"))
     chunk     = int(float(os.getenv("CARVE_CHUNK", "400000")))
-    # neu: Regeln für „consecutive“
     os.environ.setdefault("CARVE_CONSEC_N",   os.getenv("CARVE_CONSEC_N", "10"))
     os.environ.setdefault("CARVE_MIN_VIEWS",  os.getenv("CARVE_MIN_VIEWS", "0"))
 
-    # Load all  points_ref_*.ply, including *_fill.ply
     plys = sorted(glob.glob(os.path.join(mesh_dir, "points_ref_*.ply")))
     if not plys:
         raise RuntimeError("[carve] points_ref_*.ply not found.")
@@ -800,7 +834,6 @@ def merge_all_points_ref_and_carve(mesh_dir, frames_dir, masks_dir, poses_npz, o
     C = np.concatenate(C_list, axis=0) if all(c is not None for c in C_list) else None
     _log(f"[carve] stacked: {P.shape[0]} pts", on_log)
 
-    # Load masks and poses
     R_all, t_all, _ = _load_poses_npz(poses_npz)
     frame_files = _sorted_frames(frames_dir)
     masks_all   = [_mask_for_frame(masks_dir, f) for f in frame_files]
@@ -808,13 +841,12 @@ def merge_all_points_ref_and_carve(mesh_dir, frames_dir, masks_dir, poses_npz, o
     if use_all:
         view_ids = list(range(min(len(frame_files), len(R_all))))
     else:
-        # only use frames with existing points_ref_* files
         def _extract_view_id(p):
-            stem = os.path.splitext(os.path.basename(p))[0]  # e.g. "points_ref_0001" or "points_ref_0001_fill"
+            stem = os.path.splitext(os.path.basename(p))[0]
             parts = stem.split("_")
             if len(parts) >= 3 and parts[0] == "points" and parts[1] == "ref":
                 try:
-                    return int(parts[2])  # "0001" -> 1
+                    return int(parts[2])
                 except ValueError:
                     return None
             return None
@@ -827,7 +859,6 @@ def merge_all_points_ref_and_carve(mesh_dir, frames_dir, masks_dir, poses_npz, o
     t_sel = np.array([t_all[i] for i in view_ids])
     depth_dir = os.path.join(mesh_dir, "depth")
 
-    # Carving mode
     keep = _carve_points_with_masks(
         P, K, R_sel, t_sel, masks,
         depth_dir=depth_dir, mode=mode,
@@ -839,7 +870,6 @@ def merge_all_points_ref_and_carve(mesh_dir, frames_dir, masks_dir, poses_npz, o
     Ck = (C[keep] if C is not None else None)
     _log(f"[carve] after carving: {Pk.shape[0]} pts", on_log)
 
-    # optional downsampling
     out_path = os.path.join(mesh_dir, "fused_points.ply")
     try:
         if HAS_O3D:
