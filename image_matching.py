@@ -337,7 +337,7 @@ def build_pairs(
         pair_list.sort(key=lambda ab: -float(S[ab[0], ab[1]]))
 
     # Globales Limit für Paare
-    max_pairs = int(float(_getenv(["MATCH_MAX_PAIRS"], 2400)))
+    max_pairs = int(float(_getenv(["MATCH_MAX_PAIRS"], 1400)))
     if max_pairs > 0 and len(pair_list) > max_pairs:
         _log(f"[match] cap pairs from {len(pair_list)} -> {max_pairs}", on_log)
         pair_list = pair_list[:max_pairs]

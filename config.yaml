@@ -1,5 +1,4 @@
-# config.yaml
-# — volle Pipeline-Config mit neuen Schaltern für Pre-Carve & Keep-All-Sparse
+
 
 lowlight:
   enable: true
@@ -85,35 +84,31 @@ mvs:
     device: cuda
     scale: 1.0
 
-    # Referenz-Auswahl
     ref_strategy: "bestk"
     ref_topk: 60
     ref_min_gap: 3
     ref_step: 2
 
-    # Seeds & Fill
     seed_radius: 2
     seed_min: 200
     seed_sample: 200000
     beta: 4.0
-    fill_iters: 150
+    fill_iters: 200
     mask_pad: 6
 
-    # Gap-Fill
     gap_fill_enable: true
-    fill_max_gap: 4
+    fill_max_gap: 10
     fill_depth_std: 0.03
     fill_depth_rel: 0.06
     fill_stride: 1
 
-    # (optional) nach dem Füllen nicht zu stark ausdünnen
     fill_max_points: 4000000
     voxel_after_fill: 0.0015
 
 carve:
   enable: true
   use_all_masks: false
-  views: 24
+  views: 32
   tau: 0.50
   mask_dilate: 2
 
@@ -143,6 +138,6 @@ surface_close:
 
 carve_pre_sparse: true
 carve_pre_views: 32
-carve_pre_tau: 0.70
+carve_pre_tau: 0.5
 carve_pre_dilate: 2
 mvs_keep_all_sparse: true

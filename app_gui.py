@@ -94,7 +94,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("3D Model from Camera Video")
         self.resize(1000, 600)
 
-        self.base_dir = os.path.abspath(".")
+        self.base_dir = os.path.abspath("")
         self.video_path = ""
         self.last_ply = ""
         self.project_root = ""
